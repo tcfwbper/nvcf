@@ -33,7 +33,7 @@ was not re-checked against the code.
 | You are | Read, in order |
 |---|---|
 | New to nvsnap | [START-HERE](START-HERE.md), [glossary](GLOSSARY.md), [architecture](ARCHITECTURE.md), [gpushare](design/GPUSHARE.md) |
-| Installing or operating it | [Install](operate/INSTALL.md), [pull secrets](operate/PULL-SECRETS.md), the chart's [values](../deploy/helm/nvsnap/values.yaml), [reference](REFERENCE.md) |
+| Installing or operating it | [Install](operate/INSTALL.md), [pull secrets](operate/PULL-SECRETS.md), [metrics and history](operate/METRICS.md), the chart's [values](../deploy/helm/nvsnap/values.yaml), [reference](REFERENCE.md) |
 | Changing the code | [Developing](operate/DEVELOPING.md), [architecture](ARCHITECTURE.md), the design note for the area you touch, [CONTRIBUTING](../CONTRIBUTING.md) |
 | Reviewing a claim or a number | [RESULTS](RESULTS.md), then [ARCHITECTURE §0](ARCHITECTURE.md#0-evidence-levels) for what each capability's evidence is |
 
@@ -42,7 +42,7 @@ was not re-checked against the code.
 | Page | Answers | Status |
 |---|---|---|
 | [START-HERE.md](START-HERE.md) | What nvsnap is, in five minutes, with three measured numbers | Current, 2026-10-21 |
-| [RESULTS.md](RESULTS.md) | Every measured number, with date, hardware, build and source | Current, 2026-10-21 |
+| [RESULTS.md](RESULTS.md) | Every measured number, with date, hardware, build and source | Current, 2026-11-07 |
 | [GLOSSARY.md](GLOSSARY.md) | What each nvsnap word means, including the storage tiers L1–L4, and which words are retired | Current, 2026-10-21 |
 | [REFERENCE.md](REFERENCE.md) | Every `nvsnap.io/*` annotation and label, environment variable and agent route | Generated from the code; CI fails when it is stale |
 | [figures/README.md](figures/README.md) | Every architecture figure, the script that draws it, the style it follows, and how to regenerate it | Current, 2026-10-21 |
@@ -59,6 +59,7 @@ was not re-checked against the code.
 |---|---|---|
 | [INSTALL.md](operate/INSTALL.md) | The one install guide (Helm): prerequisites, the values that decide behaviour, turning nvsnap off, upgrade, troubleshooting | Current, 2026-10-21 |
 | [PULL-SECRETS.md](operate/PULL-SECRETS.md) | Registry credentials for the agent and the pods it creates | Current, 2026-10-21 |
+| [METRICS.md](operate/METRICS.md) | The capture and restore history: metrics, summary log lines, events, and how to keep them | Current, 2026-11-02 |
 | [DEVELOPING.md](operate/DEVELOPING.md) | Build, deploy, capture, validate, merge | Current, 2026-10-21 |
 | [Chart README](../deploy/helm/nvsnap/README.md) | What each chart template renders; chart development | Current, 2026-10-21 |
 
@@ -71,6 +72,13 @@ the column below is that status, corrected where the code disagrees.
 |---|---|---|
 | [GPUSHARE.md](design/GPUSHARE.md) | How multi-GPU workloads are checkpointed: the gpushare shim, its chunk store, limits, validation | Integration section checked 2026-10-21; predates the rootfs-diff archive and placeholder model landings |
 | [STOP-THE-WORLD-CAPTURE.md](design/STOP-THE-WORLD-CAPTURE.md) | Why an instance is frozen as a whole for a capture, and how | Built (`internal/agent/group_freeze.go`) |
+| [CRIU-CAPTURE-FALLBACK.md](design/CRIU-CAPTURE-FALLBACK.md) | What happens when a CRIU capture fails: one attempt per agent release, every member's error kept, MPTCP refused before the freeze | Partly built (§3 of the note) |
+| [RAILS-FETCH-CONCURRENCY.md](design/RAILS-FETCH-CONCURRENCY.md) | How rails transfers run concurrently: one rails pod per node that serves and fetches, source ranking, small checkpoints over HTTP | Built (`internal/agent/rails_fetch.go`, `rails_serve.go`, `rails_jobs.go`) |
+| [RESTORE-POD-ADDRESS.md](design/RESTORE-POD-ADDRESS.md) | How a restored pod keeps its captured address, and the guards against an address another pod holds | Built, behind `agent.restoreCapturedAddress` (`internal/agent/restore_address.go`) |
+| [RESTORE-CLOCK-GPU-RELOAD.md](design/RESTORE-CLOCK-GPU-RELOAD.md) | How a restored process's clocks are kept consistent across the GPU reload | In use; §6 proposed |
+| [RESTORE-FETCH-LOAD-OVERLAP.md](design/RESTORE-FETCH-LOAD-OVERLAP.md) | How fetching a checkpoint could overlap with loading it during a restore | Proposed |
+| [FUNCTION-CACHE-STATUS.md](design/FUNCTION-CACHE-STATUS.md) | Which functions are cached: the records name their function version, nvsnap-server keeps one `NvsnapFunction` per version, readable with `view` | Built (`internal/fnstatus`, `internal/server/function_status.go`) |
+| [GPU-FAULT-PROBE.md](design/GPU-FAULT-PROBE.md) | Why a pod's failure on a faulty GPU is not counted against nvsnap: the probe, what it decides, what it cannot tell | Built (`internal/agent/gpu_probe.go`) |
 | [VERSIONED-NODE-BUNDLE.md](design/VERSIONED-NODE-BUNDLE.md) | How the node bundle (CRIU, gpushare, helper) is versioned so upgrades do not break running pods | Built (`internal/webhook/bundle_mount.go` `BundleVersionsDir`) |
 | [helm-shared-model-volume.md](design/helm-shared-model-volume.md) | One model volume per model per cluster, and the cache set | Built and verified (as the doc states) |
 | [helm-chart-cache-election.md](design/helm-chart-cache-election.md) | One downloader per hash when a chart starts many workers | Built and verified (as the doc states) |
@@ -86,6 +94,7 @@ the column below is that status, corrected where the code disagrees.
 |---|---|---|
 | [BENCHMARK.md](results/BENCHMARK.md) | Measured restore times with phase breakdowns: single-GPU CRIU (July 2026), cachedir (June 2026), page-cache prewarm (September 2026) | Record |
 | [PDF-BENCH-RESULTS.md](results/PDF-BENCH-RESULTS.md) | Where `scripts/test-bench.sh` appends its cold / warm / restore rows | Empty until the next run |
+| [KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | How long a Kimi-K3 group restore over 2 GB300 nodes took, step by step: fetch over rails, CRIU, GPU load, clock wait | Record |
 
 ## Using the API
 

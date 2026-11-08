@@ -8,7 +8,9 @@ go_library(
         "bundle_mount.go",
         "cache_volume.go",
         "cachedir.go",
+        "capture_hold.go",
         "cert.go",
+        "criu_fallback.go",
         "criu_group.go",
         "criu_identity.go",
         "criu_restore.go",
@@ -26,6 +28,7 @@ go_library(
         "mount_prep_init.go",
         "mutate.go",
         "reader_steps.go",
+        "request_metrics.go",
         "rootfs_l2_mount.go",
         "rootfs_l2_overlay.go",
         "server.go",
@@ -34,8 +37,10 @@ go_library(
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook",
     visibility = ["//src/compute-plane-services/nvsnap:__subpackages__"],
     deps = [
+        "//src/compute-plane-services/nvsnap/internal/capturehold",
         "//src/compute-plane-services/nvsnap/internal/checkpointstore",
         "//src/compute-plane-services/nvsnap/internal/election",
+        "//src/compute-plane-services/nvsnap/internal/metrics",
         "//src/compute-plane-services/nvsnap/internal/modelid",
         "//src/compute-plane-services/nvsnap/internal/modelvolume",
         "//src/compute-plane-services/nvsnap/internal/rootfsonly",
@@ -53,11 +58,14 @@ go_library(
 go_test(
     name = "webhook_test",
     srcs = [
+        "admission_metrics_test.go",
         "admission_test.go",
         "admitted_config_test.go",
         "cachedir_noshim_test.go",
         "cachedir_test.go",
+        "capture_hold_test.go",
         "criu_companion_test.go",
+        "criu_fallback_test.go",
         "criu_group_test.go",
         "criu_identity_test.go",
         "criu_restore_test.go",
@@ -73,6 +81,7 @@ go_test(
         "model_volume_test.go",
         "mutate_test.go",
         "reader_steps_test.go",
+        "request_metrics_test.go",
         "rootfs_l2_mount_test.go",
         "rootfs_l2_overlay_test.go",
         "server_test.go",
@@ -80,11 +89,14 @@ go_test(
     ],
     embed = [":webhook"],
     deps = [
+        "//src/compute-plane-services/nvsnap/internal/capturehold",
         "//src/compute-plane-services/nvsnap/internal/checkpointstore",
         "//src/compute-plane-services/nvsnap/internal/election",
+        "//src/compute-plane-services/nvsnap/internal/metrics",
         "//src/compute-plane-services/nvsnap/internal/modelid",
         "//src/compute-plane-services/nvsnap/internal/modelvolume",
         "//src/compute-plane-services/nvsnap/internal/rootfsonly",
+        "@com_github_prometheus_client_golang//prometheus",
         "@com_github_sirupsen_logrus//:logrus",
         "@io_k8s_api//admission/v1:admission",
         "@io_k8s_api//apps/v1:apps",
@@ -97,4 +109,14 @@ go_test(
         "@io_k8s_client_go//kubernetes/fake",
         "@io_k8s_client_go//testing",
     ],
+)
+
+# Sources read by internal/agent's TestAgentRBACCoversItsClientCalls.
+filegroup(
+    name = "go_srcs",
+    srcs = glob(
+        ["*.go"],
+        exclude = ["*_test.go"],
+    ),
+    visibility = ["//src/compute-plane-services/nvsnap/internal/agent:__pkg__"],
 )

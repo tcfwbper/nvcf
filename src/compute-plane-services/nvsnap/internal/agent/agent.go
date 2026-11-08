@@ -39,6 +39,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
+	k8sevents "k8s.io/client-go/tools/record"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
@@ -65,6 +66,10 @@ type Config struct {
 	// CRIUGhostLimit bounds, in bytes, the contents of one deleted file a
 	// dump saves (criu --ghost-limit); 0 is defaultGhostLimit.
 	CRIUGhostLimit int64
+	// RestoreCapturedAddress gives a restored pod the captured pod address
+	// on its loopback, translated at its edge, when no other pod uses it
+	// (restore_address.go).
+	RestoreCapturedAddress bool
 	// CheckpointHostDir is the host filesystem path that backs CheckpointDir
 	// inside the agent container. The capture-write writer Job consumes
 	// CaptureSource.SrcPath as a host path (joined with /host), so the
@@ -172,6 +177,11 @@ type Config struct {
 
 	// ModelVolume enables the write-once model volume for Helm functions.
 	ModelVolume ModelVolumeConfig
+
+	// Rails is the rails tier of EnsureLocal: checkpoint copies between
+	// nodes over their RDMA NICs with bedrock-peer (rails_fetch.go). Off
+	// unless Rails.Image is set.
+	Rails RailsConfig
 
 	// Replication is the opt-in cross-cluster replication config (the L4
 	// tier). See docs/design/cross-cluster-replication.md. When
@@ -322,6 +332,13 @@ type Agent struct {
 	// webhook's SpecCacheURI); nil when the webhook is off.
 	specCacheURI    func(*corev1.Pod) (string, bool)
 	criuRestoreOnce sync.Once
+	// railsRunning holds the cancelled rails fetches that may still write
+	// into their checkpoint directories, by checkpoint (rails_fetch.go).
+	railsRunning sync.Map
+	// railsFetches counts the fetches this node's rails pod runs
+	// (railsFetchStarted).
+	railsFetchMu sync.Mutex
+	railsFetches int
 	// checkpointing holds the pods being checkpointed (namespace/pod).
 	checkpointing sync.Map
 
@@ -376,6 +393,13 @@ type Agent struct {
 	// enabled; populated by startRootfsCapture before the webhook
 	// server starts.
 	kubeClient kubernetes.Interface
+
+	// gpuProducts caches node name -> GPU product (lifecycle_metrics.go).
+	gpuProducts sync.Map
+	// events records what pods' captures, restores and starts did on the
+	// pods (lifecycle_metrics.go); made once the kube client is.
+	eventsOnce sync.Once
+	events     k8sevents.EventRecorder
 
 	// peerLoad counts this agent's in-flight peer fetches per peer
 	// URL. Used by EnsureLocal to pick the least-loaded peer when
@@ -532,6 +556,9 @@ func New(cfg Config) (*Agent, error) {
 // Run starts the agent
 func (a *Agent) Run(ctx context.Context) error {
 	metrics.RegisterAgent()
+	// Every agent exports nvsnap_build_info, whatever its capture method,
+	// so a missing series means an agent is not scraped.
+	a.publishBuildInfo()
 	// A capture this agent was holding pods for ended with its last run.
 	a.recoverPodHolds(a.log.WithField("subsys", "pod-hold"))
 	// So did a dump it was running: replace what it may have left stopped.
@@ -738,6 +765,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.log.WithError(err).Error("CRIU auto-restore failed to start; CRIU captures will not restore into new pods")
 	}
 	a.startGPUShareStoreReaper(ctx)
+	a.sweepRailsPods(ctx)
+	a.startRailsServeReaper(ctx)
 	if a.modelVolume != nil {
 		// Completes writer volumes and binds them into pending readers on
 		// this node (docs/design/helm-shared-model-volume.md).
@@ -873,7 +902,7 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	metrics.ActiveOperations.WithLabelValues("restore").Inc()
 	start := time.Now()
 
-	result, err := a.Restore(r.Context(), req)
+	result, err := a.restoreProbed(r.Context(), req)
 
 	metrics.ActiveOperations.WithLabelValues("restore").Dec()
 	duration := time.Since(start).Seconds()
@@ -882,7 +911,7 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metrics.RestoreTotal.WithLabelValues("failed", workload, "default").Inc()
 		a.log.WithError(err).Error("Restore failed")
-		http.Error(w, fmt.Sprintf("restore failed: %v", err), http.StatusInternalServerError)
+		writeRestoreFailure(w, err)
 		return
 	}
 

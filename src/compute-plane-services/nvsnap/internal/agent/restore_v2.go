@@ -213,6 +213,13 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// handle exchange of the resume).
 	var sess *restoreSession
 	if group.Session != "" {
+		// Its GPU launches must wait until every rank has resumed: a rank
+		// that launched first could write to a GPU not bound yet. A tool
+		// that cannot hold them (a bundle from before the gate) is refused
+		// here, before CRIU runs, rather than resumed ungated.
+		if gs != nil && !gpushareHoldGateSupported(tools.gpuToolText()) {
+			return nil, fmt.Errorf("gpushare: the GPU tool of node bundle %s cannot hold the GPU launches of a group restore until every rank has resumed (it has no --hold-gate and open); refusing the restore", tools.version)
+		}
 		if group.InetAddrMap != "" && !criuSupportsNetMigration(a.agentCRIUHelp()) {
 			return nil, errors.New("criu-v2: the agent's CRIU has no --inet-addr-map/net-unlock")
 		}
@@ -229,12 +236,20 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		gs != nil, directIO, group.InetAddrMap, resolveCRIUPluginDir(a.config.CRIUPath, log))
 	args = append(args, stdioInheritFDs(pidnsCapture)...)
 	// The restore does not count as time the restored tasks ran
-	// (restore_clock.go).
-	if criuSupportsTimensBudget(a.agentCRIUHelp()) {
-		budget := restoreClockBudget(checkpointDir)
-		args = append(args, "--timens-budget", strconv.FormatInt(budget.Milliseconds(), 10))
-		log.WithField("budget", budget.Round(time.Second).String()).Info("criu-v2: the restored clocks continue from the dump once the restore has taken its budget")
+	// (restore_clock.go). With a GPU reload, that is the whole restore up to
+	// the GPU resume: every task stays stopped until the clocks are there
+	// (restore_clock_gpu.go).
+	clockThroughGPU := gs != nil && clockThroughGPUSupported(a.agentCRIUHelp(), tools.gpuToolText())
+	if clockArgs, budget := restoreClockArgs(checkpointDir, criuSupportsTimensBudget(a.agentCRIUHelp()), clockThroughGPU); clockArgs != nil {
+		args = append(args, clockArgs...)
+		msg := "criu-v2: the restored clocks continue from the dump once the restore has taken its budget"
+		if clockThroughGPU {
+			msg = "criu-v2: the restored clocks continue from the dump when the GPU processes resume"
+		}
+		log.WithField("budget", budget.Round(time.Second).String()).Info(msg)
 	}
+	criuStart := time.Now()
+	times := &rankTimes{}
 	// What the helper hands CRIU: the placeholder's root and network
 	// namespace, its listening sockets (bound in its own mount namespace)
 	// and its stdout and stderr.
@@ -313,13 +328,20 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		return nil, fmt.Errorf("criu-v2 restore: %w (output: %s; restore.log tail: %s)", err, strings.TrimSpace(string(out)), tail)
 	}
 	criuSpan.End()
-	if spent, ok := recordRestoreClock(checkpointDir); ok {
-		log.WithField("criuRestore", spent.Round(time.Millisecond).String()).Info("criu-v2: recorded the restore's length for the next one's clock budget")
+	times.add("criu", time.Since(criuStart))
+	// Through a GPU reload the whole restore is recorded at the GPU resume
+	// (continueTasks), not CRIU's part of it.
+	if !clockThroughGPU {
+		if spent, ok := recordRestoreClock(checkpointDir); ok {
+			log.WithField("criuRestore", spent.Round(time.Millisecond).String()).Info("criu-v2: recorded the restore's length for the next one's clock budget")
+		}
 	}
 	if group.InetAddrMap != "" {
 		// Before the unlock: a connection to a peer outside the group goes
 		// to an address of the captured instance (criu_companion.go).
-		resetDeadPeers(hostPID, keepAddresses("", group.InetAddrMap), log)
+		// The pod's own captured address stays a peer when the pod kept
+		// it (restore_address.go).
+		resetDeadPeers(hostPID, keepAddresses(metadata.SourcePodIP, group.InetAddrMap), log)
 		if err := natInstanceAddresses(hostPID, group.InetAddrMap, log); err != nil {
 			return nil, fmt.Errorf("criu-v2: lead the instance's captured addresses to its restored pods: %w", err)
 		}
@@ -329,8 +351,48 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	if sess != nil {
 		fabricDir = sess.containerDir
 	}
-	// resumeGPU reloads the restored processes' GPU memory (gpushare).
-	resumeGPU := func() error {
+	// resumeGPU reloads the restored processes' GPU memory (gpushare);
+	// holdGate keeps their GPU launches waiting until gpushareOpen. toolPID
+	// is the pid the resume tool entered, once it ran, for gpushareOpen.
+	toolPID := 0
+	var clockAt int64
+	// clockWait is how long the GPU resume waited for the dumped clock:
+	// not part of the restore's work, so not of the next one's budget.
+	var clockWait time.Duration
+	if clockThroughGPU {
+		var err error
+		if clockAt, err = dumpedMonotonic(ctx, checkpointDir); err != nil {
+			return nil, fmt.Errorf("criu-v2: read the dumped clock the restored tasks resume at: %w", err)
+		}
+	}
+	// continueTasks resumes the restored tasks the GPU resume did not, once
+	// it has: CRIU left them all stopped for the clocks (clockThroughGPU).
+	continueTasks := func() error {
+		if !clockThroughGPU {
+			return nil
+		}
+		b, err := criuWork.readFile(timensResumePIDsFile, fabricInLimit)
+		if err != nil {
+			return fmt.Errorf("criu-v2: read the tasks to resume: %w", err)
+		}
+		pids, err := parseTimensResumePIDs(b)
+		if err != nil {
+			return fmt.Errorf("criu-v2: read the tasks to resume: %w", err)
+		}
+		n, err := continueRestoredTasks(procBase, toolPID, hostPID, pids, gs.PIDs)
+		if err != nil {
+			return fmt.Errorf("criu-v2: resume the restored tasks: %w", err)
+		}
+		spent := time.Since(criuStart) - clockWait
+		if err := recordRestoreSpan(checkpointDir, spent); err != nil {
+			log.WithError(err).Warn("criu-v2: cannot record the restore's length; the next one estimates its clock budget")
+		}
+		log.WithFields(logrus.Fields{"tasks": n, "restoreSpan": spent.Round(time.Millisecond).String()}).
+			Info("criu-v2: the restored tasks resumed with their clocks at the dumped values; recorded the restore's length for the next one's clock budget")
+		return nil
+	}
+	resumeGPU := func(holdGate bool) error {
+		defer func(t0 time.Time) { times.add("gpu", time.Since(t0)) }(time.Now())
 		_, gsSpan := tracing.Tracer().Start(ctx, "restore.gpushare_resume")
 		gpuMap := gs.StorePath + "/" + gpushareGPUMapFile
 		resumePID := hostPID
@@ -361,9 +423,12 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 				return fmt.Errorf("gpushare resume: hand the fabric session to the restored processes' user: %w", err)
 			}
 		}
+		toolPID = resumePID
 		// Run to its end under its own deadline: cut off by the agent
 		// stopping, it would leave the tree stopped without its GPU memory.
-		if err := gpushareResumeWithGPUsOf(context.WithoutCancel(ctx), resumePID, hostPID, gs.PIDs, gpuMap, fabricDir, log); err != nil {
+		waited, err := gpushareResumeWithGPUsOf(context.WithoutCancel(ctx), resumePID, hostPID, gs.PIDs, gpuMap, fabricDir, holdGate, clockAt, log)
+		clockWait = waited
+		if err != nil {
 			gsSpan.RecordError(err)
 			gsSpan.SetStatus(codes.Error, "gpushare resume failed")
 			gsSpan.End()
@@ -379,8 +444,17 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		// without GPU state are restored only once every rank has, so an
 		// etcd among them does not count the reload against its leases
 		// (gpushare_group_restore.go).
+		//
+		// Its GPU launches are held until every pod of the instance has
+		// resumed (gpushareOpen). The unlock below is that point: a pod
+		// reports restored only after its resume, and the unlock comes once
+		// every pod has. On any other outcome they stay held
+		// (openHeldGPUOnUnlock).
 		if gs != nil {
-			if err := resumeGPU(); err != nil {
+			if err := resumeGPU(true); err != nil {
+				return nil, err
+			}
+			if err := continueTasks(); err != nil {
 				return nil, err
 			}
 		}
@@ -388,11 +462,13 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		// sends: hold the lock until the driver says so, then release it in
 		// this pod's network namespace.
 		verdict, err := sess.awaitUnlock(ctx, log)
-		if err != nil {
+		if err := openHeldGPUOnUnlock(group.Session, verdict, err, func() error {
+			if gs == nil {
+				return nil
+			}
+			return gpushareOpen(context.WithoutCancel(ctx), toolPID, gs.PIDs, log)
+		}); err != nil {
 			return nil, err
-		}
-		if verdict != "unlock" {
-			return nil, fmt.Errorf("criu-v2: group restore %s aborted: another pod of the instance failed to restore; this pod stays locked until it is deleted", group.Session)
 		}
 		if group.InetAddrMap != "" {
 			if err := netUnlock(ctx, hostPID, checkpointDir, log); err != nil {
@@ -400,13 +476,21 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 			}
 		}
 	} else if gs != nil {
-		if err := resumeGPU(); err != nil {
+		if err := resumeGPU(false); err != nil {
+			return nil, err
+		}
+		if err := continueTasks(); err != nil {
 			return nil, err
 		}
 	}
 
 	duration := time.Since(startTime).Seconds()
 	log.WithField("duration", fmt.Sprintf("%.2fs", duration)).Info("criu-v2: restore completed")
+	if ci := metadata.CatalogInfo; ci != nil && ci.GPUCount > 0 {
+		// A rank's restore, for history; a companion is not a GPU workload.
+		times.add("rank", time.Since(startTime))
+		observeRankRestore(ci.GPUType, a.placeholderRanks(ctx, group.Namespace, group.Pod), times)
+	}
 
 	return &RestoreResult{
 		NewContainerID: placeholderInfo.ID,

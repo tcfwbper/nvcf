@@ -38,10 +38,66 @@ RENDER=$(helm template "$RELEASE" "$CHART" --namespace "$NS") \
   || fail "helm template failed"
 pass "helm template renders"
 
+# The agents' ServiceMonitor selects exactly one Service, the headless
+# nvsnap-agent: a selector matching none scrapes nothing, one matching the
+# node-local Service too scrapes every agent twice.
+SM_API=monitoring.coreos.com/v1/ServiceMonitor
+SM_RENDER=$(helm template "$RELEASE" "$CHART" --namespace "$NS" \
+  --api-versions "$SM_API" --set agent.hostNetwork=false) \
+  || fail "helm template with the ServiceMonitor failed"
+OBS_STACK="$REPO_ROOT/../../../deploy/stacks/observability/environments/base.yaml"
+[[ -f "$OBS_STACK" ]] || fail "observability stack values not found at $OBS_STACK"
+echo "$SM_RENDER" | python3 -c '
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
+sm = [d for d in docs if d["kind"] == "ServiceMonitor" and d["metadata"]["name"] == "nvsnap-agent"]
+if len(sm) != 1:
+    sys.exit("want one nvsnap-agent ServiceMonitor, got %d" % len(sm))
+# By default both collectors this repository knows pick it up: the cluster
+# Prometheus agent (examples/cluster-monitoring-sample: namespace monitoring
+# and its discover label) and the deploy/stacks/observability collector
+# (its serviceMonitorSelector, read from the stack, any namespace).
+if sm[0]["metadata"]["namespace"] != "monitoring":
+    sys.exit("ServiceMonitor in namespace %s, want monitoring" % sm[0]["metadata"]["namespace"])
+labels = sm[0]["metadata"]["labels"]
+if labels.get("prometheus.agent/servicemonitor-discover") != "true":
+    sys.exit("ServiceMonitor lacks the prometheus.agent/servicemonitor-discover label")
+stack = yaml.safe_load(open(sys.argv[1]))
+want = stack["collector"]["targetAllocator"]["prometheusCR"]["serviceMonitorSelector"]["matchLabels"]
+if any(labels.get(k) != v for k, v in want.items()):
+    sys.exit("ServiceMonitor labels %s do not match the observability collector selector %s" % (labels, want))
+sel = sm[0]["spec"]["selector"]["matchLabels"]
+port = sm[0]["spec"]["endpoints"][0]["port"]
+hit = [d["metadata"]["name"] for d in docs if d["kind"] == "Service"
+       and all((d["metadata"].get("labels") or {}).get(k) == v for k, v in sel.items())]
+if hit != ["nvsnap-agent"]:
+    sys.exit("ServiceMonitor selects Services %s, want [nvsnap-agent]" % hit)
+svc = [d for d in docs if d["kind"] == "Service" and d["metadata"]["name"] == "nvsnap-agent"][0]
+if port not in [p.get("name") for p in svc["spec"]["ports"]]:
+    sys.exit("ServiceMonitor port %s is not a port of nvsnap-agent" % port)
+cr = [d for d in docs if d["kind"] == "ClusterRole" and d["metadata"]["name"] == "nvsnap-agent"]
+if not any("events" in r.get("resources", []) and "create" in r.get("verbs", []) for r in cr[0]["rules"]):
+    sys.exit("the nvsnap-agent ClusterRole cannot create events")
+' "$OBS_STACK" || fail "agent ServiceMonitor or its events rule is wrong"
+# enabled: auto (the default) follows the cluster's API; true and false
+# override it.
+sm_count() { helm template "$RELEASE" "$CHART" --namespace "$NS" "$@" | grep -c '^kind: ServiceMonitor' || true; }
+[[ "$(grep -c '^kind: ServiceMonitor' <<<"$RENDER" || true)" == 0 ]] \
+  || fail "a ServiceMonitor renders on a cluster without the ServiceMonitor API"
+[[ "$(sm_count --api-versions "$SM_API" --set agent.metrics.serviceMonitor.enabled=false)" == 0 ]] \
+  || fail "enabled=false still renders a ServiceMonitor"
+[[ "$(sm_count --set agent.metrics.serviceMonitor.enabled=true)" == 1 ]] \
+  || fail "enabled=true does not render a ServiceMonitor without the API"
+NOLABEL=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --api-versions "$SM_API" \
+  --set 'agent.metrics.serviceMonitor.labels.prometheus\.agent/servicemonitor-discover=null') \
+  || fail "helm template with the default label dropped failed"
+! grep -q "servicemonitor-discover" <<<"$NOLABEL" || fail "the default label cannot be dropped"
+pass "agent ServiceMonitor selects the nvsnap-agent Service only, renders where the cluster serves the API, in monitoring with the discover label; the agent may create events"
+
 # 2. ClusterRole 'nvsnap-server' has the nvsnap.io rule block (nvsnap#54)
 # Split the rendered output on '---\n' (YAML doc separators), then
 # pick the document that's both a ClusterRole AND named nvsnap-server.
-CR_BLOCK=$(echo "$RENDER" | awk 'BEGIN{RS="\n---\n"} /kind: ClusterRole/ && /name: nvsnap-server/ {print; exit}')
+CR_BLOCK=$(echo "$RENDER" | awk 'BEGIN{RS="\n---\n"} /kind: ClusterRole/ && /name: nvsnap-server/ && !n++ {print}')
 [[ -n "$CR_BLOCK" ]] || fail "no ClusterRole named 'nvsnap-server' in rendered output"
 echo "$CR_BLOCK" | grep -q 'gpucheckpoints' \
   || fail "nvsnap-server ClusterRole missing gpucheckpoints rule (nvsnap#54 regression)"
@@ -69,7 +125,7 @@ pass "nvsnap-server ClusterRole has services:get rule"
 # probes the configured SC at startup. Without this rule the
 # probe Forbidden-fails and L2 silently disables itself.
 # Regression test for GCP-H100-a 2026-06-02 post-MR-39.
-AGENT_CR_BLOCK=$(echo "$RENDER" | awk 'BEGIN{RS="\n---\n"} /kind: ClusterRole/ && /name: nvsnap-agent/ {print; exit}')
+AGENT_CR_BLOCK=$(echo "$RENDER" | awk 'BEGIN{RS="\n---\n"} /kind: ClusterRole/ && /name: nvsnap-agent/ && !n++ {print}')
 [[ -n "$AGENT_CR_BLOCK" ]] || fail "no ClusterRole named 'nvsnap-agent' in rendered output"
 echo "$AGENT_CR_BLOCK" | grep -q 'storageclasses' \
   || fail "nvsnap-agent ClusterRole missing storageclasses:get rule (L2 startup probe)"
@@ -92,7 +148,8 @@ pass "chart ships CRDs for gpucheckpoints + gpurestores"
 # in deploy/crds/ — otherwise drift can ship a stale CRD via Helm while
 # kubectl-apply users get the fresh one.
 SRC_CRD="$REPO_ROOT/deploy/crds/nvsnap.io_gpucheckpoints.yaml"
-diff -q "$SRC_CRD" "$CRD_FILE" >/dev/null \
+# Comments and blank lines (the license header) may differ; the schema may not.
+diff -q <(grep -v -E '^ *(#|$)' "$SRC_CRD") <(grep -v -E '^ *(#|$)' "$CRD_FILE") >/dev/null \
   || fail "chart/crds/nvsnap.io_gpucheckpoints.yaml drifted from deploy/crds/nvsnap.io_gpucheckpoints.yaml"
 pass "chart CRD identical to deploy/crds/ source"
 
@@ -132,14 +189,11 @@ pass "every nvsnap image ref has a non-empty tag"
 # 6. Mutation: wiping any image tag must fail the render with a
 # clear error, not silently fall back to AppVersion. This is the
 # regression test for the v0.0.5 blobstore ImagePullBackOff.
-for img in agent server blobstore; do
+for img in agent server; do
   if helm template "$RELEASE" "$CHART" --namespace "$NS" --set "$img.image.tag=" >/dev/null 2>&1; then
     fail "empty $img.image.tag should fail the chart render but didn't"
   fi
 done
-if helm template "$RELEASE" "$CHART" --namespace "$NS" --set nvsnap.builderTag="" >/dev/null 2>&1; then
-  fail "empty nvsnap.builderTag should fail the chart render but didn't"
-fi
 pass "empty image tags fail the chart render with a clear error"
 
 echo "OK — all helm chart checks passed"

@@ -1,0 +1,56 @@
+{{- $sm := .Values.agent.metrics.serviceMonitor }}
+{{- $on := toString $sm.enabled }}
+{{- if and .Values.agent.enabled (or (eq $on "true") (and (eq $on "auto") (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor"))) }}
+{{- /* Guard first: a disabled feature must emit nothing at all (see grafana-dashboard.yaml). */ -}}
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The agents' /metrics for the cluster's Prometheus (docs/operate/METRICS.md):
+# served on the API port, without authentication.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nvsnap-agent
+  {{- /* A namespace the cluster lacks would fail the install: use the
+       release's instead. lookup answers only against a live cluster; under
+       helm template or a GitOps renderer it finds nothing, not even
+       kube-system, and the configured namespace stands. The release's own
+       namespace is used without a lookup. A lookup the installer may not
+       make fails the install; an installer that may create the agent's
+       ClusterRole (agent-rbac.yaml grants get on namespaces) may make it,
+       unless it creates roles through the escalate verb alone: such an
+       installer sets namespace "" (the release's). */}}
+  {{- $smNS := $sm.namespace | default .Release.Namespace }}
+  {{- if and (ne $smNS .Release.Namespace) (lookup "v1" "Namespace" "" "kube-system") (not (lookup "v1" "Namespace" "" $smNS)) }}{{ $smNS = .Release.Namespace }}{{ end }}
+  namespace: {{ $smNS }}
+  labels:
+    {{- include "nvsnap.agent.labels" . | nindent 4 }}
+    {{- range $k, $v := $sm.labels }}
+    {{ $k }}: {{ $v | toString | quote }}
+    {{- end }}
+spec:
+  # The headless agent Service alone: the node-local one has the same
+  # agent labels and would scrape every agent twice.
+  selector:
+    matchLabels:
+      nvsnap.io/metrics: agent
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace | quote }}]
+  endpoints:
+    - port: http-api
+      path: /metrics
+      interval: {{ $sm.interval }}
+{{- end }}

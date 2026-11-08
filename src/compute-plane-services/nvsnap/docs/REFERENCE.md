@@ -50,10 +50,14 @@ where the files column says.
 | `nvsnap.io/cache-volume` | `CacheVolumeAnnotation` (internal/webhook/cache_volume.go)<br>`cacheVolumeAnnotation` (internal/agent/modelvolume_controller.go) | Names the emptyDir volume holding the cache. |
 | `nvsnap.io/capture` | `CaptureLabel` (internal/webhook/mutate.go)<br>`DefaultCaptureLabel` (internal/rootfsonly/watcher.go)<br>`rootfsCaptureLabel` (internal/server/server.go) | Is the pod-label key the agent watches for capture candidates. |
 | `nvsnap.io/capture-hash` | `CMAnnotationHash` (internal/checkpointstore/cmregistry.go) | Is the full sha256 hex; annotations have a per-object 256KiB total cap so 64 chars is fine. |
+| `nvsnap.io/capture-method` | `CaptureMethodAnnotation` (internal/webhook/criu_fallback.go) | Names how a pod of a CRIU cluster is captured when it is not by CRIU: "cachedir" for a fallback pod. |
+| `nvsnap.io/capture-settled` | inline: internal/capturehold/capturehold.go |  |
+| `nvsnap.io/checkpoint` | `railsAnnoCheckpoint` (internal/agent/rails_fetch.go) |  |
 | `nvsnap.io/checkpoint-on-warm` | `CheckpointOnWarmAnnotation` (internal/podtimings/podtimings.go) | Is the annotation key NVCA's Hook A stamps for Cold pods so Hook B's reconciler knows to capture them after readiness. |
 | `nvsnap.io/ckpt-size` | `annCkptSize` (internal/server/manifests.go) |  |
 | `nvsnap.io/cold-start` | `ColdStartAnnotation` (internal/election/election.go) | Is stamped on a follower whose leader failed; the pod is recreated by its controller and re-admitted. |
 | `nvsnap.io/criu-capture` | `criuCaptureAnnotation` (internal/agent/criu_group.go) | Opts a multi-pod instance into the capture. |
+| `nvsnap.io/criu-cold-started` | `ColdStartedAnnotation` (internal/webhook/criu_restore.go) | Marks a placeholder whose restore failed and that the agent started cold in place, with the time it did. |
 | `nvsnap.io/criu-group` | `CRIUGroupAnnotation` (internal/webhook/criu_group.go) | Names the group record a placeholder restores from; CRIUGroupOrdinalAnnotation and CRIUGroupSizeAnnotation place it in the instance. |
 | `nvsnap.io/criu-group-companion` | `CRIUGroupCompanionAnnotation` (internal/webhook/criu_group.go) | Marks a placeholder that restores a companion of the instance: a pod without GPUs that its GPU ranks were connected to (an etcd, a NATS), captured and restored with them. |
 | `nvsnap.io/criu-group-ordinal` | `CRIUGroupOrdinalAnnotation` (internal/webhook/criu_group.go) |  |
@@ -65,7 +69,10 @@ where the files column says.
 | `nvsnap.io/demo-name` | `annDemoName` (internal/server/manifests.go) |  |
 | `nvsnap.io/desc` | `annDesc` (internal/server/manifests.go) |  |
 | `nvsnap.io/election-id` | `ElectionIDAnnotation` (internal/election/election.go) | On the leader pod is the id the webhook minted at admission and used as the Lease holder. |
-| `nvsnap.io/function-version-id` | `FunctionVersionIDAnnotation` (internal/podtimings/podtimings.go) | Is the annotation key NVCA's Hook A stamps with the function-version id so downstream tools can group + summarize without re-deriving from labels. |
+| `nvsnap.io/fallback-capture` | `FallbackCaptureAnnotation` (internal/webhook/criu_fallback.go) | Names the cachedir capture a fallback pod is seeded from; the agent on its node fetches it. |
+| `nvsnap.io/fallback-reason` | `FallbackReasonAnnotation` (internal/webhook/criu_fallback.go) | Is the group record state that made the pod fall back; the agent captures the cachedir of a pod that carries it. |
+| `nvsnap.io/function-id` | `LabelFunction` (internal/fnstatus/fnstatus.go) |  |
+| `nvsnap.io/function-version-id` | `FunctionVersionIDAnnotation` (internal/podtimings/podtimings.go)<br>`LabelFunctionVersion` (internal/fnstatus/fnstatus.go) | Is the annotation key NVCA's Hook A stamps with the function-version id so downstream tools can group + summarize without re-deriving from labels. |
 | `nvsnap.io/gated` | `GatedLabel` (internal/election/election.go) | Is "true" while a follower holds the scheduling gate. |
 | `nvsnap.io/gpus` | `annGPUs` (internal/server/manifests.go) |  |
 | `nvsnap.io/gpushare` | `GPUShareAnnotation` (internal/webhook/gpushare.go) | Opts a pod in. |
@@ -93,12 +100,18 @@ where the files column says.
 | `nvsnap.io/model-staging-volume` | `StagingAnnotation` (internal/modelvolume/modelvolume.go) | On a Block-mode download Job names the emptyDir volume the download landed in; the agent on the Job's node copies it into the sized claim. |
 | `nvsnap.io/model-uri` | `IdentityAnnotation` (internal/modelvolume/modelvolume.go) | Is the full model URI. |
 | `nvsnap.io/mount-holder` | inline: internal/checkpointstore/mount_holder.go |  |
-| `nvsnap.io/namespace` | `labelNamespace` (internal/checkpointstore/promoter_shared.go) |  |
+| `nvsnap.io/namespace` | `LabelNamespace` (internal/fnstatus/fnstatus.go)<br>`labelNamespace` (internal/checkpointstore/promoter_shared.go) |  |
 | `nvsnap.io/path` | `annPath` (internal/server/manifests.go) |  |
 | `nvsnap.io/per-capture` | inline: internal/checkpointstore/percapture_pvc.go, internal/checkpointstore/promoter_shared.go, internal/checkpointstore/promoter_snapshot.go |  |
 | `nvsnap.io/port` | `annPort` (internal/server/manifests.go) |  |
+| `nvsnap.io/rails-fetching` | `railsAnnoFetching` (internal/agent/rails_serve.go) | Marks a serve pod running fetches of its own node: the node is ranked as a source after idle ones (railsSources). |
+| `nvsnap.io/rails-for` | `railsLabelFor` (internal/agent/rails_fetch.go) |  |
+| `nvsnap.io/rails-serves` | `railsLabelServes` (internal/agent/rails_serve.go) | Names, on a serve pod, the node it serves. |
+| `nvsnap.io/rails-sources` | `railsAnnoSources` (internal/agent/rails_serve.go) | Lists, on a fetch pod, the nodes it reads from (railsLabelValue of each, comma-separated). |
+| `nvsnap.io/rails-wanted-until` | `railsAnnoWantedUntil` (internal/agent/rails_serve.go) | Keeps a serve pod until a fetcher that is waiting for it has created its fetch pod. |
 | `nvsnap.io/restore-failure-threshold` | inline: internal/manifests/restore.go |  |
 | `nvsnap.io/restore-from` | `RestoreFromAnnotation` (internal/podtimings/podtimings.go)<br>`RestoreFromAnnotation` (internal/webhook/mutate.go) | Is the annotation key NVCA's Hook A stamps to tell NvSnap's restore webhook which checkpoint to inject. |
+| `nvsnap.io/restored` | inline: internal/webhook/criu_restore.go |  |
 | `nvsnap.io/role` | `RoleAnnotation` (internal/election/election.go)<br>`ViewRoleLabel` (internal/modelvolume/modelvolume.go) | Records the admission decision: leader, follower or restore. |
 | `nvsnap.io/short-hash` | `CMLabelShortHash` (internal/checkpointstore/cmregistry.go) | Is the 32-char short hash (128 bits), suitable for label selectors. |
 | `nvsnap.io/source-engine` | `LabelSourceEngine` (internal/checkpointstore/cmregistry.go) | Is the engine type ("vllm", "sglang", "trtllm", "nim"). |
@@ -106,6 +119,7 @@ where the files column says.
 | `nvsnap.io/source-namespace` | `LabelSourceNamespace` (internal/checkpointstore/cmregistry.go) | Identifies the originating pod's namespace. |
 | `nvsnap.io/source-pv` | `SourcePVLabel` (internal/modelvolume/modelvolume.go) | On a read-only view names the primary it was minted from, so liveness and retirement work per generation. |
 | `nvsnap.io/target-node` | `TargetNodeAnnotation` (internal/webhook/mutate.go) | Overrides the auto-pin to manifest.CapturedOnNodes. |
+| `nvsnap.io/tenant` | `LabelTenant` (internal/fnstatus/fnstatus.go) |  |
 | `nvsnap.io/v1alpha1` | inline: internal/server/server.go |  |
 | `nvsnap.io/volume-bytes` | `BytesAnnotation` (internal/modelvolume/modelvolume.go) | On a primary PV is the byte count of the tree it holds, measured at completion. |
 | `nvsnap.io/wait-for-cache` | `GateName` (internal/election/election.go) | Is the schedulingGates entry a follower carries until the capture for its hash is promoted. |
@@ -141,6 +155,7 @@ binary.
 | `NVSNAP_DEFAULT_CAPTURE_PATH` | yes | internal/agent/checkpoint.go, internal/agent/nim_backend.go |
 | `NVSNAP_DISABLE_CUDA` |  | internal/agent/checkpoint.go |
 | `NVSNAP_FSSTORE_PATH` |  | cmd/agent/main.go |
+| `NVSNAP_GPUSHARE_RESUME_DIAG` |  | internal/agent/gpushare.go |
 | `NVSNAP_L2_FETCH_WORKERS` |  | internal/agent/l2_copy.go |
 | `NVSNAP_L2_NAMESPACE` | yes | cmd/agent/main.go |
 | `NVSNAP_L2_SNAPSHOT_CLASS` | yes | cmd/agent/main.go |
@@ -162,6 +177,8 @@ binary.
 | `NVSNAP_PREP_POLL` |  | cmd/nvsnap-mount-prep/main.go |
 | `NVSNAP_PREWARM` |  | cmd/agent/main.go, cmd/nvsnap-helper/main.go, cmd/nvsnap-rootfs-restore/prewarm.go |
 | `NVSNAP_PREWARM_DIR` |  | cmd/nvsnap-rootfs-restore/main.go |
+| `NVSNAP_RAILS_IMAGE` |  | cmd/agent/main.go |
+| `NVSNAP_RAILS_NAMESPACE` |  | cmd/agent/main.go |
 | `NVSNAP_REPLAY_EMPTYDIR_MAX_BYTES` |  | internal/agent/replay_mounts.go |
 | `NVSNAP_REPLAY_MOUNTS` |  | internal/agent/replay_mounts.go |
 | `NVSNAP_REPLICATION_HOME_BUCKET` | yes | cmd/agent/main.go |

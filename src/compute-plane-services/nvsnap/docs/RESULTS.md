@@ -14,6 +14,7 @@ not name it.
 **Contents**
 
 - [CRIU with gpushare (multi-GPU)](#criu-with-gpushare-multi-gpu)
+- [CRIU with gpushare, group restore across 2 nodes](#criu-with-gpushare-group-restore-across-2-nodes)
 - [CRIU, single GPU](#criu-single-gpu)
 - [cachedir](#cachedir)
 - [Records](#records)
@@ -36,6 +37,25 @@ checkpoint byte for byte in every case.
 | Qwen2.5-14B-Instruct, TP=8 across 2 nodes (4x GB300 each), in place | Suspend and resume with the fabric map | 5 of 6 cycles matched the baseline; the sixth merged a stale handle list (a test-driver error) |
 | 1T-parameter MoE, TP=8 across 2 nodes, about 266 GB of GPU memory per rank, in place | Suspend and resume with the fabric map | 3 of 3 cycles matched the baseline |
 | Qwen2.5-7B-Instruct, TP=4, 4x H100, driver 580.126.16 | CRIU dump, restore into a new pod | Answered as before (with NVLS and symmetric-memory all-reduce off for driver 580) |
+
+## CRIU with gpushare, group restore across 2 nodes
+
+Source: [results/KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md), read from the
+agent logs. Kimi-K3 on vLLM, TP=8 across 2 pods, 2 nodes with 4x GB300 each, 2026-10-24. Agent
+`v0.2.76-mv194`. Driver: not recorded. Where the two nodes differ, both values are given.
+
+| Restore | What was measured | Result |
+|---|---|---|
+| Verify restore, the checkpoint's first | CRIU start to GPU resume, less the clock wait | 72.8 s and 72.7 s |
+| same | Wait for the dumped clock | 50.5 s and 49.9 s |
+| same | GPU memory remap per process | 3.3 s to 7.6 s |
+| Scale-out onto 2 nodes without the checkpoint | Fetch over rails, 781 GiB | 66 s from start to complete in the log (58.8 s and 13.27 GiB/s as the fetch tool reports it) |
+| same | CRIU restore | about 2 s |
+| same | CRIU start to both ranks' GPU memory loaded | about 42 s |
+| same | CRIU start to GPU resume, less the clock wait | 55.4 s and 55.5 s |
+| same | Wait for the dumped clock | 29.8 s and 29.7 s |
+| same | GPU memory remap per process | 3.0 s to 3.4 s |
+| same | Restore, as the agent reports it | 95.8 s on each node |
 
 ## CRIU, single GPU
 
@@ -75,6 +95,7 @@ Time to ready, cold and restored. nvsnap build: not recorded.
 |---|---|
 | [results/BENCHMARK.md](results/BENCHMARK.md) | The tables above with their phase breakdowns and method; the page-cache prewarm A/B (September 2026) |
 | [results/PDF-BENCH-RESULTS.md](results/PDF-BENCH-RESULTS.md) | Where `scripts/test-bench.sh` appends its cold / warm / restore rows; empty until the next run |
+| [results/KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | Kimi-K3 group restores on 2 nodes with 4x GB300 each (2026-10-24): clock budgets and waits, fetch, CRIU and GPU-load times, remap times |
 | [design/GPUSHARE.md](design/GPUSHARE.md#validation) | gpushare validation |
 | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) | Model volume results (H100, NVMesh, September 2026) |
 | [design/helm-chart-cache-election.md](design/helm-chart-cache-election.md) | Election results (H100, NVMesh, 2026-09-25) |

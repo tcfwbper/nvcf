@@ -53,9 +53,22 @@ rules:
     # to trigger kubelet to mount the PVC, then deletes it after the
     # in-process file-tree copy finishes.
     verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  # pods/status (patch): a restored placeholder's readiness waits on the
+  # nvsnap.io/restored condition, which the agent sets once the restore is
+  # done (internal/agent/restored_condition.go).
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["patch"]
+  # configmaps (patch): the function identity labels on capture records
+  # (internal/agent/record_identity.go).
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # events (create, patch): what a pod's restore or start did, on the pod
+  # (internal/agent/lifecycle_metrics.go).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]

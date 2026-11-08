@@ -65,6 +65,9 @@ const (
 	// The tool treats any verdict but "go" as "retry" and gives up at its
 	// own timeout, rolling the workload back.
 	fabricVerdictAbort = "abort"
+	// fabricVerdictUnlock tells a restored rank that every pod of its
+	// instance has resumed.
+	fabricVerdictUnlock = "unlock"
 
 	fabricPollInterval = 200 * time.Millisecond
 )
@@ -266,7 +269,7 @@ func waitFabricVerdictFile(ctx context.Context, s *fabricSessionDir, name string
 	for {
 		if b, err := s.read(name, fabricSmallLimit); err == nil {
 			v := strings.TrimSpace(string(b))
-			if v == "unlock" || v == fabricVerdictAbort {
+			if v == fabricVerdictUnlock || v == fabricVerdictAbort {
 				return v, nil
 			}
 			return "", fmt.Errorf("group restore: unexpected verdict %q", v)
@@ -942,7 +945,7 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 	replace := false
 	for _, m := range res.Members {
 		if m.Error != "" {
-			failed = append(failed, m.Namespace+"/"+m.PodName+": "+m.Error)
+			failed = append(failed, memberFailure(m.Namespace+"/"+m.PodName, m.Error))
 			replace = replace || sourceMustBeReplacedText(m.Error)
 		}
 	}
@@ -954,7 +957,7 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 		a.deleteMembers(context.WithoutCancel(ctx), req.Members, uids, log)
 	}
 	if len(failed) > 0 {
-		return res, fmt.Errorf("group checkpoint %s: %d of %d members failed: %s", session, len(failed), len(res.Members), strings.Join(failed, "; "))
+		return res, membersFailed("group checkpoint", session, len(res.Members), failed)
 	}
 	return res, nil
 }

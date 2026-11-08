@@ -67,6 +67,8 @@ type GroupRestoreMemberResult struct {
 	NewIP        string         `json:"newIp,omitempty"`
 	Result       *RestoreResult `json:"result,omitempty"`
 	Error        string         `json:"error,omitempty"`
+	// GPUFaults are the faulty GPUs the member's restore failed on.
+	GPUFaults []gpuFault `json:"gpuFaults,omitempty"`
 }
 
 // GroupRestoreResult reports a group restore.
@@ -265,6 +267,9 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 			res.Members[i].Result = r
 			if err != nil {
 				res.Members[i].Error = err.Error()
+				if f := onFaultyGPU(err); f != nil {
+					res.Members[i].GPUFaults = f.Faults
+				}
 			}
 			finished[i] = true
 		}()
@@ -313,7 +318,7 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 	var failed []string
 	for _, m := range res.Members {
 		if m.Error != "" {
-			failed = append(failed, m.Pod+": "+m.Error)
+			failed = append(failed, memberFailure(m.Pod, m.Error))
 		}
 	}
 	if len(failed) == 0 {
@@ -337,7 +342,17 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 			res.DeletedPods = append(res.DeletedPods, name)
 		}
 	}
-	return res, &groupRestoreFailure{fmt.Errorf("group restore %s: %d of %d members failed: %s", res.Session, len(failed), len(res.Members), strings.Join(failed, "; "))}
+	failure := &groupRestoreFailure{err: membersFailed("group restore", res.Session, len(res.Members), failed)}
+	var faults []gpuFault
+	for _, m := range res.Members {
+		faults = append(faults, m.GPUFaults...)
+	}
+	if len(faults) > 0 {
+		// One rank on a faulty GPU fails the others with it: the whole
+		// failure is the GPU's.
+		failure.fault = &gpuFaultError{Faults: faults, cause: failure.err}
+	}
+	return res, failure
 }
 
 // addressCollision is a placement the instance cannot restore into: a
@@ -354,13 +369,22 @@ func (e *addressCollision) Error() string {
 }
 
 // groupRestoreFailure is a group restore that ran and failed: the
-// checkpoints themselves are suspect. Any other error of groupRestore
-// (a pod without an IP, a fetch that did not finish) says nothing about
-// them.
-type groupRestoreFailure struct{ err error }
+// checkpoints themselves are suspect, unless it ran on a faulty GPU
+// (fault). Any other error of groupRestore (a pod without an IP, a fetch
+// that did not finish) says nothing about them.
+type groupRestoreFailure struct {
+	err   error
+	fault *gpuFaultError
+}
 
 func (e *groupRestoreFailure) Error() string { return e.err.Error() }
-func (e *groupRestoreFailure) Unwrap() error { return e.err }
+
+func (e *groupRestoreFailure) Unwrap() []error {
+	if e.fault != nil {
+		return []error{e.err, e.fault}
+	}
+	return []error{e.err}
+}
 
 // allRefusedAsRestored reports whether every member refused the restore
 // because its pod already runs a GPU workload.
@@ -408,21 +432,30 @@ func (a *Agent) awaitTargetPods(ctx context.Context, members []GroupRestoreMembe
 	}
 }
 
-// fetchCheckpointMetadata makes a checkpoint local on the agent at base and
-// reads its metadata there.
-func fetchCheckpointMetadata(ctx context.Context, client *http.Client, base, id string) (*CheckpointMetadata, error) {
+// ensureLocalOn asks the agent at base to make checkpoint id local on its
+// node, and waits for it.
+func ensureLocalOn(ctx context.Context, client *http.Client, base, id string) error {
 	ereq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/checkpoints/"+url.PathEscape(id)+"/ensure-local", http.NoBody)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	eresp, err := client.Do(ereq)
 	if err != nil {
-		return nil, fmt.Errorf("ensure-local: %w", err)
+		return fmt.Errorf("ensure-local: %w", err)
 	}
 	b, _ := io.ReadAll(io.LimitReader(eresp.Body, 512))
-	eresp.Body.Close()
+	_ = eresp.Body.Close()
 	if eresp.StatusCode != http.StatusNoContent && eresp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ensure-local: %s: %s", eresp.Status, strings.TrimSpace(string(b)))
+		return fmt.Errorf("ensure-local: %s: %s", eresp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
+// fetchCheckpointMetadata makes a checkpoint local on the agent at base and
+// reads its metadata there.
+func fetchCheckpointMetadata(ctx context.Context, client *http.Client, base, id string) (*CheckpointMetadata, error) {
+	if err := ensureLocalOn(ctx, client, base, id); err != nil {
+		return nil, err
 	}
 	mreq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/checkpoints/"+url.PathEscape(id)+"/file?path=metadata.json", http.NoBody)
 	if err != nil {
@@ -468,7 +501,7 @@ func postRestore(ctx context.Context, client *http.Client, base string, req Rest
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, gpuFaultFromHeader(resp.Header.Get(gpuFaultHeader), fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b))))
 	}
 	var r RestoreResult
 	if err := json.Unmarshal(b, &r); err != nil {

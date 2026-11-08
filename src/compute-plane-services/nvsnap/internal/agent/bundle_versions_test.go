@@ -12,13 +12,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -110,6 +113,50 @@ func TestBundleTarRoundTrip(t *testing.T) {
 	}
 }
 
+// A fetched version digests the same as the served one under the agent's
+// umask: modes it would strip (group write on 0775) are kept, so the
+// fetch passes the recorded digest.
+func TestBundleTarKeepsModesPastUmask(t *testing.T) {
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	src := bundleAgent(t)
+	stageVersion(t, src, "bbbb", 0)
+	dir := filepath.Join(src.bundleVersionsDir(), "bbbb")
+	if err := os.Mkdir(filepath.Join(dir, "plugins"), 0o775); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"cuda-checkpoint", "plugins/cuda_plugin.so"} {
+		if err := os.WriteFile(filepath.Join(dir, p), []byte(p), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{"plugins", "cuda-checkpoint", "plugins/cuda_plugin.so"} {
+		if err := os.Chmod(filepath.Join(dir, p), 0o775); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := bundleDigest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := writeBundleTar(&buf, dir); err != nil {
+		t.Fatal(err)
+	}
+	dst := t.TempDir()
+	if err := readBundleTar(&buf, dst); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"plugins", "cuda-checkpoint", "plugins/cuda_plugin.so"} {
+		if st, err := os.Stat(filepath.Join(dst, p)); err != nil || st.Mode().Perm() != 0o775 {
+			t.Errorf("%s: mode %v %v, want 0775", p, st.Mode().Perm(), err)
+		}
+	}
+	if got, err := bundleDigest(dst); err != nil || got != want {
+		t.Errorf("fetched digest %s %v, want the served one %s", got, err, want)
+	}
+}
+
 // A symlink the stream creates cannot carry a later entry outside the
 // bundle.
 func TestReadBundleTarConfinesSymlinks(t *testing.T) {
@@ -133,6 +180,55 @@ func TestReadBundleTarConfinesSymlinks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outside, "planted.so")); err == nil {
 		t.Fatal("a file landed outside the bundle")
+	}
+}
+
+// A link the stream makes inside the bundle is not followed by a later
+// entry: "x -> ." and then a directory "x" would otherwise change the mode
+// of the extraction root itself. A link no later entry goes through is
+// kept.
+func TestReadBundleTarRefusesEntriesThroughLinks(t *testing.T) {
+	for name, entries := range map[string][]tar.Header{
+		"directory through a link": {{Name: "x", Typeflag: tar.TypeSymlink, Linkname: "."}, {Name: "x", Mode: 0o777, Typeflag: tar.TypeDir}},
+		"file under a link":        {{Name: "d", Mode: 0o755, Typeflag: tar.TypeDir}, {Name: "x", Typeflag: tar.TypeSymlink, Linkname: "d"}, {Name: "x/f", Mode: 0o644, Typeflag: tar.TypeReg}},
+	} {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for i := range entries {
+			if err := tw.WriteHeader(&entries[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		dst := t.TempDir()
+		if err := os.Chmod(dst, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := readBundleTar(&buf, dst); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+			t.Errorf("%s: %v, want it refused", name, err)
+		}
+		if st, _ := os.Stat(dst); st.Mode().Perm() != 0o700 {
+			t.Errorf("%s: the extraction root became %v", name, st.Mode().Perm())
+		}
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, h := range []tar.Header{{Name: "lib", Mode: 0o755, Typeflag: tar.TypeDir}, {Name: "lib/link", Typeflag: tar.TypeSymlink, Linkname: "../x.so"}} {
+		if err := tw.WriteHeader(&h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dst := t.TempDir()
+	if err := readBundleTar(&buf, dst); err != nil {
+		t.Fatalf("a plain link was refused: %v", err)
+	}
+	if l, err := os.Readlink(filepath.Join(dst, "lib", "link")); err != nil || l != "../x.so" {
+		t.Errorf("link %q %v", l, err)
 	}
 }
 
@@ -194,4 +290,40 @@ func TestValidBundleID(t *testing.T) {
 		}
 	}
 	_ = webhook.BundleMeta
+}
+
+// TestPublishBuildInfo: every agent exports nvsnap_build_info, with the
+// bundle it serves or "unknown" before one is installed, so a missing
+// series means an agent is not scraped (docs/operate/METRICS.md).
+func TestPublishBuildInfo(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(metrics.BuildInfo)
+	buildInfo := func() map[string]float64 {
+		t.Helper()
+		mfs, err := reg.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]float64{}
+		for _, mf := range mfs {
+			for _, m := range mf.GetMetric() {
+				got[m.GetLabel()[0].GetValue()] = m.GetGauge().GetValue()
+			}
+		}
+		return got
+	}
+
+	a := bundleAgent(t)
+	a.publishBuildInfo()
+	if got := buildInfo(); len(got) != 1 || got["unknown"] != 1 {
+		t.Fatalf("nvsnap_build_info before a bundle = %v, want {unknown: 1}", got)
+	}
+	stageVersion(t, a, "c0", 0)
+	if err := os.WriteFile(filepath.Join(a.bundleRoot(), "current-bundle"), []byte("c0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.publishBuildInfo()
+	if got := buildInfo(); len(got) != 1 || got["c0"] != 1 {
+		t.Fatalf("nvsnap_build_info with bundle c0 = %v, want {c0: 1}", got)
+	}
 }
