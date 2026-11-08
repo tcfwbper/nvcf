@@ -205,7 +205,9 @@ metadata:
   labels:
     {{- include "nvsnap.server.labels" . | nindent 4 }}
 spec:
-  type: {{ .Values.server.service.type }}
+  # The server's API deletes checkpoints and labels pods: it gets no
+  # address outside the cluster. server.service.type is not read.
+  type: ClusterIP
   selector:
     {{- include "nvsnap.server.selectorLabels" . | nindent 4 }}
   ports:

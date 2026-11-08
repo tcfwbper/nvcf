@@ -24,7 +24,7 @@ is described in [ARCHITECTURE.md](../ARCHITECTURE.md#1-what-nvsnap-is-and-what-a
 - [Troubleshooting](#troubleshooting)
   - [Agent pods stuck in `ImagePullBackOff`](#agent-pods-stuck-in-imagepullbackoff)
   - [Agent DaemonSet shows 0/0, or pods stuck in `Pending`](#agent-daemonset-shows-00-or-pods-stuck-in-pending)
-  - [nvsnap-server external IP is `<pending>` forever](#nvsnap-server-external-ip-is-pending-forever)
+  - [Reaching nvsnap-server](#reaching-nvsnap-server)
   - [Restored pods start cold](#restored-pods-start-cold)
 - [Where things live after install](#where-things-live-after-install)
 <!-- /toc -->
@@ -99,7 +99,6 @@ pod is prepared for capture or restore, and every pod starts cold.
 | `agent.election.enabled` | `false` | One downloader per hash when a chart starts many workers (cachedir only) |
 | `agent.l2.storageClass` | | The StorageClass of the per-checkpoint volume pair; empty keeps checkpoints on their nodes |
 | `agent.auth.enabled`, `agent.auth.mode` | `false`, `permissive` | Bearer-token checks on the agent API. Turn on, run `permissive` until no unauthenticated calls are counted, then `required` |
-| `server.service.type` | `LoadBalancer` | `ClusterIP` for port-forward access |
 
 ## Turning nvsnap off for some or all pods
 
@@ -119,6 +118,16 @@ helm upgrade nvsnap deploy/helm/nvsnap --namespace nvsnap-system --reuse-values
 
 The agent DaemonSet rolls one node at a time. An instance capture does not
 start while agents run different revisions.
+
+Before this chart version the server's Service was a `LoadBalancer` by
+default (`server.service.type`). It is now always `ClusterIP`, and
+`server.service.type` is not read. The upgrade turns an existing load
+balancer into a `ClusterIP` Service: the cloud deletes the load balancer
+and its address stops answering. Kubernetes drops the Service's node ports
+on that change. Reach the server with `kubectl port-forward` afterwards
+([Reaching nvsnap-server](#reaching-nvsnap-server)). A
+`server.service.type` that `--reuse-values` carries over changes nothing;
+the install notes say it is not read.
 
 ## Uninstall
 
@@ -150,11 +159,14 @@ kubectl get nodes -L nvidia.com/gpu.present,cloud.google.com/gke-gpu,feature.nod
 Replace `agent.nodeAffinity` (and, for tainted nodes, `agent.tolerations`)
 with ones that match your GPU nodes, in a values file passed with `-f`.
 
-### nvsnap-server external IP is `<pending>` forever
+### Reaching nvsnap-server
 
-The cluster has no LoadBalancer controller. Use
-`--set server.service.type=ClusterIP` and
+The server's Service is always `ClusterIP`, so it has no address outside the
+cluster: its API deletes checkpoints and labels pods. Use
 `kubectl -n nvsnap-system port-forward svc/nvsnap-server 8080:8080`.
+The chart has no option for a load balancer; an operator who needs the
+server reachable from elsewhere exposes it themselves, with their own
+authentication in front.
 
 ### Restored pods start cold
 

@@ -144,14 +144,15 @@ grep -q 'name: gpurestores.nvsnap.io' "$CRD_FILE" \
   || fail "CRD file missing gpurestores.nvsnap.io"
 pass "chart ships CRDs for gpucheckpoints + gpurestores"
 
-# 4. The chart's CRD file must be byte-identical to the canonical source
-# in deploy/crds/ — otherwise drift can ship a stale CRD via Helm while
-# kubectl-apply users get the fresh one.
+# 4. The chart's CRD file must match the canonical source in deploy/crds/
+# — otherwise drift can ship a stale CRD via Helm while kubectl-apply
+# users get the fresh one. Comments and blank lines are ignored: the
+# chart copy carries the license header.
 SRC_CRD="$REPO_ROOT/deploy/crds/nvsnap.io_gpucheckpoints.yaml"
 # Comments and blank lines (the license header) may differ; the schema may not.
 diff -q <(grep -v -E '^ *(#|$)' "$SRC_CRD") <(grep -v -E '^ *(#|$)' "$CRD_FILE") >/dev/null \
   || fail "chart/crds/nvsnap.io_gpucheckpoints.yaml drifted from deploy/crds/nvsnap.io_gpucheckpoints.yaml"
-pass "chart CRD identical to deploy/crds/ source"
+pass "chart CRD matches deploy/crds/ source"
 
 # 4b. GPUCheckpoint CRD must declare every status field nvsnap-server writes,
 # else K8s silently drops unknown fields and the hash never reaches the
@@ -195,5 +196,51 @@ for img in agent server; do
   fi
 done
 pass "empty image tags fail the chart render with a clear error"
+
+# 7. The server API gets no address outside the cluster: its Service is
+# ClusterIP whatever server.service.type says, including a LoadBalancer
+# that --reuse-values carries over from an older chart, and NOTES says the
+# value is not read.
+svc_type() {
+  awk 'BEGIN{RS="\n---\n"} /kind: Service\n/ && /name: nvsnap-server\n/ {print; exit}' \
+    | sed -n 's/^  type: //p'
+}
+[[ "$(svc_type <<<"$RENDER")" == ClusterIP ]] \
+  || fail "nvsnap-server Service is not ClusterIP by default"
+for t in LoadBalancer NodePort; do
+  OUT=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set "server.service.type=$t") \
+    || fail "the chart should render with a leftover server.service.type=$t"
+  [[ "$(svc_type <<<"$OUT")" == ClusterIP ]] \
+    || fail "server.service.type=$t made the nvsnap-server Service other than ClusterIP"
+done
+# NOTES.txt, rendered without a cluster: helm template does not print it,
+# so a copy of the chart renders it into a ConfigMap.
+notes_render() {
+  local tmp out rc
+  tmp=$(mktemp -d)
+  cp -r "$CHART" "$tmp/chart"
+  cp "$CHART/templates/NOTES.txt" "$tmp/chart/notes-render.txt"
+  printf '%s\n' 'apiVersion: v1' 'kind: ConfigMap' 'metadata:' '  name: notes-render' 'data:' '  notes: |' \
+    '{{- tpl (.Files.Get "notes-render.txt") . | nindent 4 }}' >"$tmp/chart/templates/notes-render.yaml"
+  out=$(helm template "$RELEASE" "$tmp/chart" --namespace "$NS" --show-only templates/notes-render.yaml "$@" 2>&1)
+  rc=$?
+  rm -rf "$tmp"
+  echo "$out"
+  return $rc
+}
+NOTES=$(notes_render --set server.service.type=LoadBalancer) \
+  || fail "NOTES does not render with server.service.type=LoadBalancer: $NOTES"
+grep -q 'server.service.type=LoadBalancer is no longer read' <<<"$NOTES" \
+  || fail "NOTES does not say a leftover server.service.type is not read"
+grep -q 'nvsnap-server (REST API + UI, port 8080, type ClusterIP)' <<<"$NOTES" \
+  || fail "NOTES does not give nvsnap-server's type as ClusterIP when server.service.type=LoadBalancer"
+NOTES=$(notes_render) || fail "NOTES does not render: $NOTES"
+grep -q 'nvsnap-server (REST API + UI, port 8080, type ClusterIP)' <<<"$NOTES" \
+  || fail "NOTES does not give nvsnap-server's type as ClusterIP"
+grep -q 'port-forward svc/nvsnap-server' <<<"$NOTES" \
+  || fail "NOTES does not say how to reach nvsnap-server"
+grep -q 'is no longer read' <<<"$NOTES" \
+  && fail "NOTES warns about server.service.type when it is not set"
+pass "nvsnap-server is ClusterIP whatever server.service.type says"
 
 echo "OK — all helm chart checks passed"

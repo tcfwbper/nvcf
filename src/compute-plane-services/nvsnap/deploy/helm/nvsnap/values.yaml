@@ -579,10 +579,10 @@ server:
     accessMode: ReadWriteOnce
 
   service:
-    # ClusterIP, NodePort, or LoadBalancer. LoadBalancer is the only
-    # type that gets you a stable external IP on managed K8s, at the
-    # cost of needing a cloud-provider LB.
-    type: LoadBalancer
+    # The Service is always ClusterIP: the server's API deletes
+    # checkpoints and labels pods, so it gets no address outside the
+    # cluster. Reach it with
+    # `kubectl -n nvsnap-system port-forward svc/nvsnap-server 8080`.
     port: 8080
 
   resources:
@@ -785,9 +785,8 @@ jaeger:
   storage:
     type: memory
 
-  # Query/UI service. ClusterIP by default — operators expose via
-  # `kubectl port-forward svc/nvsnap-jaeger-query 16686:16686` or
-  # bump this to LoadBalancer for a public-IP demo.
+  # Query/UI service. ClusterIP by default — operators reach it with
+  # `kubectl port-forward svc/nvsnap-jaeger-query 16686:16686`.
   provisionDataStore:
     cassandra: false
     elasticsearch: false
@@ -893,7 +892,7 @@ prometheus:
 #   - via the NvSnap single-pane proxy (recommended): the nvsnap-server
 #     UI's "Observability → Dashboards" link points at
 #     /observability/grafana/, which proxies to this service. One
-#     external IP for everything. grafana.ini below tells Grafana to
+#     port-forward for everything. grafana.ini below tells Grafana to
 #     serve under the sub-path so its own internal URLs resolve.
 #   - directly: kubectl port-forward svc/nvsnap-grafana 3000:80
 grafana:
