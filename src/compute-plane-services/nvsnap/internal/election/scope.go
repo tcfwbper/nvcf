@@ -91,7 +91,9 @@ func hasGPU(n *corev1.Node) bool {
 // can only widen the nodes counted.
 func Admits(pod *corev1.Pod, node *corev1.Node) bool {
 	for k, v := range pod.Spec.NodeSelector {
-		if node.Labels[k] != v {
+		// The label must be there: a missing key does not match an empty
+		// value, as the scheduler reads a selector.
+		if got, has := node.Labels[k]; !has || got != v {
 			return false
 		}
 	}

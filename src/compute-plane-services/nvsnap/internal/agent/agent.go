@@ -341,6 +341,10 @@ type Agent struct {
 	railsFetches int
 	// checkpointing holds the pods being checkpointed (namespace/pod).
 	checkpointing sync.Map
+	// companionMu serializes mounting a bundle version on its companion
+	// directory with releasing and removing it (companion_tools.go), so
+	// two mounts are never stacked there and none outlives the version.
+	companionMu sync.Mutex
 
 	config     Config
 	log        *logrus.Logger

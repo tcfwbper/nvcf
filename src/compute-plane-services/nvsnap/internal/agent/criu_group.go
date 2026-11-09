@@ -116,6 +116,9 @@ const (
 	criuCaptureAnnotation = "nvsnap.io/criu-capture"
 )
 
+// groupWarmupWait is the warmup captureGroup waits; tests shorten it.
+var groupWarmupWait = criuGroupWarmup
+
 func criuGroupConfigMapName(key string) string { return criuGroupConfigMapPrefix + key }
 
 // recordUsable reports a group record whose checkpoints may be restored:
@@ -440,7 +443,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(criuGroupWarmup):
+	case <-time.After(groupWarmupWait):
 	}
 	pods, err := a.kubeClient.CoreV1().Pods(leader.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -477,6 +480,27 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 	}
 	companions, companionContainers, err := a.discoverCompanions(ctx, ranks, log)
+	if errors.Is(err, errAgentNotYet) {
+		// As agentsSettled below: an agent rollout ends. Bounded: an agent
+		// that does not come (a node it cannot run on for a reason the
+		// placement does not show) must not hold the instance.
+		first, _ := c.agentWaitSince.LoadOrStore(leader.UID, time.Now())
+		if time.Since(first.(time.Time)) < agentArrivalWait {
+			log.WithError(err).Info("CRIU group capture: waiting for the node agents to settle")
+			return true
+		}
+		c.observeRefusal(ctx, "", leader, len(ranks), fmt.Sprintf("no nvsnap agent came after %s: %v", agentArrivalWait, err), log)
+		return false
+	}
+	c.agentWaitSince.Delete(leader.UID)
+	var noAgent *companionWithoutAgentError
+	if errors.As(err, &noAgent) {
+		// Decided before anything waits on that node's agent, which does
+		// not exist, so the instance's held pods serve at once. Counted
+		// for this instance only: no record.
+		c.observeRefusal(ctx, "", leader, len(ranks), noAgent.Error(), log)
+		return false
+	}
 	if err != nil {
 		log.WithError(err).Warn("CRIU group capture: skipped; a companion of the instance cannot be captured")
 		return false
@@ -551,6 +575,10 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 	}
 	if b := blocking(findings); len(b) > 0 {
+		if c.companionBundlesPending(leader, companions, b, time.Now()) {
+			log.Info("CRIU group capture: waiting for a companion's node bundle to be fetched and mounted on its node")
+			return true
+		}
 		log.WithField("blocking", len(b)).Warn("CRIU group capture: skipped; the preflight found what would fail it")
 		if why := configurationRefusal(b); why != "" {
 			c.recordRefusal(ctx, key, scope, uris, len(ranks), leader, why, log)
@@ -1073,6 +1101,14 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			if waitErr == nil {
 				break
 			}
+			// A placeholder on a node no agent will run on is never
+			// restored (a pod without GPUs on a CPU node): the restore does
+			// not run, and the instance starts cold now rather than after
+			// the wait.
+			if stray := c.placeholderWithoutAgent(ctx, pods.Items, leader, key); stray != nil {
+				c.failGroup(ctx, leader, key, false, stray, log)
+				return
+			}
 		} else {
 			waitErr = err
 		}
@@ -1147,6 +1183,35 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 		return // the agent stops before the restore ran
 	}
 	c.failGroup(ctx, leader, key, errors.As(err, new(*groupRestoreFailure)), err, log)
+}
+
+// placeholderWithoutAgent is why a placeholder of leader's instance (group
+// key) cannot be restored where it was scheduled: a node no nvsnap agent
+// runs on or will (withoutAgent). nil when there is none, or when it cannot
+// tell (the wait decides then).
+func (c *criuAutoRestorer) placeholderWithoutAgent(ctx context.Context, pods []corev1.Pod, leader *corev1.Pod, key string) error {
+	var agents map[string]bool
+	for i := range pods {
+		p := &pods[i]
+		if p.DeletionTimestamp != nil || p.Spec.NodeName == "" || p.Annotations[webhook.CRIUGroupAnnotation] != key ||
+			p.Annotations[webhook.CRIURestoreAnnotation] == "" || !groupMember(leader, p) {
+			continue
+		}
+		if agents == nil {
+			var err error
+			if agents, err = c.a.agentNodeNames(ctx); err != nil {
+				return nil
+			}
+		}
+		if agents[p.Spec.NodeName] {
+			continue
+		}
+		var none *companionWithoutAgentError
+		if err := c.a.withoutAgent(ctx, p); errors.As(err, &none) {
+			return fmt.Errorf("%w: placeholder %s: %w", errCheckpointUnavailable, p.Name, err)
+		}
+	}
+	return nil
 }
 
 // replaceColliding deletes the target pods of an address collision so their

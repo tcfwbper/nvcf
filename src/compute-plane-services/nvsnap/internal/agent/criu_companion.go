@@ -117,11 +117,31 @@ func (a *Agent) discoverCompanions(ctx context.Context, ranks []*corev1.Pod, log
 	}
 	slices := sl.Items
 	found := matchCompanions(peers, pods.Items, svcs.Items, slices, ranks)
+	// A pod without GPUs may run on a node no nvsnap agent runs on (a CPU
+	// node a helm chart's CPU-only pod is sent to): nothing there can be
+	// asked or dumped, so it is never asked.
+	agents, err := a.agentNodeNames(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list the node agents: %w", err)
+	}
+	for _, p := range found {
+		if !agents[p.Spec.NodeName] {
+			return nil, nil, a.withoutAgent(ctx, p)
+		}
+	}
 	if len(found) > 0 {
 		reach := companionAddresses(found, svcs.Items, slices)
 		peersOf := map[string][]string{}
+		var unasked []*corev1.Pod
 		for _, p := range companionCandidates(pods.Items, ranks) {
 			if found[p.Name] != nil || p.Status.PodIP == "" || p.Spec.NodeName == "" {
+				continue
+			}
+			if !agents[p.Spec.NodeName] {
+				if err := a.withoutAgent(ctx, p); !errors.As(err, new(*companionWithoutAgentError)) {
+					return nil, nil, err // an agent is on its way there: asked once it runs
+				}
+				unasked = append(unasked, p)
 				continue
 			}
 			base, err := a.peerAgentURL(ctx, p.Spec.NodeName)
@@ -138,6 +158,30 @@ func (a *Agent) discoverCompanions(ctx context.Context, ranks []*corev1.Pod, log
 		}
 		for name, p := range clientsOf(reach, peersOf, pods.Items) {
 			found[name] = p
+		}
+		// Whether a pod on a node without an agent connects to the
+		// instance's companions is read from the companions' side: only a
+		// client of theirs keeps the instance from being captured.
+		if len(unasked) > 0 {
+			seen, err := a.companionPeersBothWays(ctx, found)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, p := range unasked {
+				// Its own address, or its node's: where a client's
+				// connection is source-NATed (kube-proxy masqueradeAll, a
+				// CNI's SNAT) or the client uses the node's network, the
+				// companion sees the node's address.
+				addrs, err := a.nodeAddresses(ctx, p.Spec.NodeName)
+				if err != nil {
+					return nil, nil, fmt.Errorf("node %s of pod %s: %w", p.Spec.NodeName, p.Name, err)
+				}
+				for _, ip := range append(podIPs(p), addrs...) {
+					if seen[ip] {
+						return nil, nil, &companionWithoutAgentError{pod: p.Name, node: p.Spec.NodeName}
+					}
+				}
+			}
 		}
 	}
 	instance := companionAddresses(found, svcs.Items, slices)
@@ -476,6 +520,10 @@ func (a *Agent) peersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func fetchPeers(ctx context.Context, base, ns, pod, container string, both bool) ([]string, error) {
+	// A node agent that does not answer must not stall the capture that
+	// asks, and the instance it holds.
+	ctx, cancel := context.WithTimeout(ctx, peersTimeout)
+	defer cancel()
 	u := fmt.Sprintf("%s/v1/pods/%s/%s/peers?container=%s", base, url.PathEscape(ns), url.PathEscape(pod), url.QueryEscape(container))
 	if both {
 		u += "&direction=both"
@@ -650,4 +698,84 @@ func (a *Agent) instanceServiceAliases(ctx context.Context, members []*corev1.Po
 		return ""
 	}
 	return serviceAliases(svcs.Items, slices.Items, members)
+}
+
+// companionWithoutAgentError is a pod of the instance (a companion, or a
+// client of one) on a node no nvsnap agent runs on: it can be neither asked
+// for its connections nor dumped, so the instance is not captured.
+type companionWithoutAgentError struct{ pod, node string }
+
+func (e *companionWithoutAgentError) Error() string {
+	return "companion " + e.pod + " runs on node " + e.node + ", where no nvsnap agent runs"
+}
+
+// agentNodeNames are the nodes an nvsnap agent pod is bound to.
+func (a *Agent) agentNodeNames(ctx context.Context) (map[string]bool, error) {
+	pods, err := a.kubeClient.CoreV1().Pods(a.criuFailedNamespace()).List(ctx, metav1.ListOptions{LabelSelector: agentLabelSelector})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for i := range pods.Items {
+		if n := pods.Items[i].Spec.NodeName; n != "" {
+			out[n] = true
+		}
+	}
+	return out, nil
+}
+
+// companionPeersBothWays are the addresses the companions found hold
+// connections with, in either direction, as their nodes' agents report.
+func (a *Agent) companionPeersBothWays(ctx context.Context, found map[string]*corev1.Pod) (map[string]bool, error) {
+	seen := map[string]bool{}
+	for _, f := range found {
+		base, err := a.peerAgentURL(ctx, f.Spec.NodeName)
+		if err != nil {
+			return nil, fmt.Errorf("pod %s: %w", f.Name, err)
+		}
+		for i := range f.Spec.Containers {
+			name := f.Spec.Containers[i].Name
+			ips, err := fetchPeers(ctx, base, f.Namespace, f.Name, name, true)
+			if err != nil {
+				return nil, fmt.Errorf("pod %s: container %s: connections: %w", f.Name, name, err)
+			}
+			for _, ip := range ips {
+				seen[ip] = true
+			}
+		}
+	}
+	return seen, nil
+}
+
+// nodeAddresses is the addresses of node name, as its status lists them.
+func (a *Agent) nodeAddresses(ctx context.Context, name string) ([]string, error) {
+	n, err := a.kubeClient.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(n.Status.Addresses))
+	for _, ad := range n.Status.Addresses {
+		if ad.Type == corev1.NodeInternalIP || ad.Type == corev1.NodeExternalIP {
+			out = append(out, ad.Address)
+		}
+	}
+	return out, nil
+}
+
+// peersTimeout bounds one ask of a node agent for a pod's connections.
+var peersTimeout = 30 * time.Second
+
+// withoutAgent is why pod, on a node with no nvsnap agent pod, holds up the
+// capture: a node the agent's placement covers gets one (a rollout, a new
+// node), and the capture is tried again (errAgentNotYet); on any other node
+// none ever runs (companionWithoutAgentError).
+func (a *Agent) withoutAgent(ctx context.Context, pod *corev1.Pod) error {
+	eligible, err := a.nodeInAgentPlacement(ctx, pod.Spec.NodeName)
+	if err != nil {
+		return fmt.Errorf("node %s of pod %s: %w", pod.Spec.NodeName, pod.Name, err)
+	}
+	if eligible {
+		return fmt.Errorf("pod %s on node %s: %w", pod.Name, pod.Spec.NodeName, errAgentNotYet)
+	}
+	return &companionWithoutAgentError{pod: pod.Name, node: pod.Spec.NodeName}
 }

@@ -48,6 +48,9 @@ func helperMount() corev1.VolumeMount { return modelvolume.HelperMount() }
 type AgentPlacement struct {
 	NodeSelector map[string]string    `json:"nodeSelector,omitempty"`
 	NodeAffinity *corev1.NodeAffinity `json:"nodeAffinity,omitempty"`
+	// Tolerations are the agent's; a node with a taint they do not
+	// tolerate gets no agent. Not added to the pods the webhook places.
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
 // onAgentNodes returns the pod's nodeSelector with the agent's added, and

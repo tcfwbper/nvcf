@@ -90,3 +90,58 @@ the volume, is left without it and is not captured or restored.
 - During an agent rollout, a pod admitted by an upgraded agent may be
   scheduled to a node whose agent has not staged the new version yet; it starts
   once that node's agent has (the kubelet retries the mount).
+- A companion (a pod without GPUs a capture may dump) may be scheduled to a
+  node no agent runs on, such as a CPU node NVCA sends a helm chart's CPU-only
+  pod to. How each step handles that:
+  - **Scheduling and mount** (`companionBundleTools`,
+    `internal/webhook/tools_mount.go`): the companion mounts not the version
+    itself but its companion directory, `<root>/companion/versions/<id>`,
+    which the kubelet creates empty where it is missing (`DirectoryOrCreate`).
+    Its scheduling is left as it is. The mount asks for no propagation: a
+    container runtime refuses to start a container whose `HostToContainer`
+    mount source is on a private mount, which a node no agent runs on may
+    have.
+  - **Agent node, companion starts after** (`attachReadOnly`,
+    `ensureCompanionTools`, `syncCompanionTools`,
+    `internal/agent/companion_tools.go`): the agent mounts each staged version
+    on its companion directory, read-only from the moment it is attached
+    (`open_tree`, `mount_setattr`, `move_mount`; Linux 5.12 or later), at
+    start, on each node sweep, and for a companion pending on the node before
+    it starts. The check and the mount, and the reaper's release and removal
+    of a version (`removeBundleVersion`), run under one lock, so mounts are
+    never stacked and none outlives its version.
+  - **Agent node, companion started first** (`injectReadOnly`,
+    `ensureCompanionToolsIn`): an agent rollout or a failed fetch can leave a
+    running companion with an empty directory. When a capture checks it, the
+    agent clones the version read-only, enters the companion's mount
+    namespace from a thread of its own, attaches it at `/criu-bundle`, and
+    returns that thread to its own namespace (`attachInNamespace`).
+    Only a companion in the initial user namespace, without `CAP_SYS_ADMIN`,
+    whose mount namespace the initial user namespace owns, gets it: any other
+    could make the mount writable, and is not captured or restored anyway.
+  - **Fetch** (`companionBundleWait`, `companionBundlesPending`): a version
+    not on the node yet is fetched by the node sweep, and a capture of its
+    instance waits up to 5 minutes for it before the instance is not
+    captured. Before, such a companion stayed Pending, and its instance
+    unready, until the fetch succeeded.
+  - **Capture** (`withoutAgent` in `internal/agent/criu_companion.go`;
+    `nodeInAgentPlacement`, `agentArrivalWait`): the capture's checks are unchanged:
+    the pod's `/criu-bundle` must be a staged version, read-only. A companion
+    on a node no agent runs on runs without the tools, and its instance is not
+    captured (reason `no_agent`). So is an instance where a pod on such a node
+    is connected to one of its companions, as the companion's agent sees it:
+    from the pod's address, or from its node's (a source-NATed connection, or
+    the node's network). A pod there that no companion is connected to does
+    not matter. A node the agent's placement covers (its node selector and
+    affinity, and its tolerations with those every DaemonSet pod gets) but
+    whose agent pod is not running (an agent rollout, a new node) is not such
+    a node: the capture is tried again for up to 5 minutes, after which the
+    instance is not captured (reason `no_agent`).
+  - **Restore** (`placeholderWithoutAgent`, `internal/agent/criu_group.go`):
+    a companion's restore placeholder mounts the version itself, as a GPU
+    rank's does, which every agent version restores from (an agent rollout
+    runs both). It is a pod that runs nothing until it is restored. One
+    scheduled to a node no agent runs on or will (by its placement) cannot
+    start or be restored there: the agent driving the restore ends it as not
+    run as soon as it sees that, rather than after the group's placeholder
+    wait, so the checkpoints stay usable and the instance is started cold.

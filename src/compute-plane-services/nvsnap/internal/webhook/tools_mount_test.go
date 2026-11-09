@@ -5,9 +5,11 @@ package webhook
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // toolsVolumeOf is the pod's bundle tools volume, nil when it has none.
@@ -21,16 +23,34 @@ func toolsVolumeOf(pod *corev1.Pod) *corev1.Volume {
 }
 
 // checkToolsMount fails unless container c mounts version's bundle
-// read-only at BundleToolsMountPath.
+// read-only at BundleToolsMountPath: a GPU pod from the staged version
+// itself, which it waits for (Directory).
 func checkToolsMount(t *testing.T, what string, pod *corev1.Pod, c int, version string) {
 	t.Helper()
+	checkToolsVolume(t, what, pod, c, "/bundle/versions/"+version, corev1.HostPathDirectory, nil)
+}
+
+// checkCompanionToolsMount: a pod without GPUs from the companion directory
+// of version, created where it is missing (a node with no agent), with no
+// mount propagation, which a node whose filesystem is a private mount
+// would refuse to start the container with.
+func checkCompanionToolsMount(t *testing.T, what string, pod *corev1.Pod, c int, version string) {
+	t.Helper()
+	checkToolsVolume(t, what, pod, c, "/bundle/companion/versions/"+version, corev1.HostPathDirectoryOrCreate, nil)
+}
+
+func checkToolsVolume(t *testing.T, what string, pod *corev1.Pod, c int, path string, typ corev1.HostPathType, prop *corev1.MountPropagationMode) {
+	t.Helper()
 	v := toolsVolumeOf(pod)
-	if v == nil || v.HostPath == nil || v.HostPath.Path != "/bundle/versions/"+version {
-		t.Fatalf("%s: tools volume %+v, want the hostPath of version %s", what, v, version)
+	if v == nil || v.HostPath == nil || v.HostPath.Path != path || v.HostPath.Type == nil || *v.HostPath.Type != typ {
+		t.Fatalf("%s: tools volume %+v, want hostPath %s of type %s", what, v, path, typ)
 	}
 	vm := mountAt(pod.Spec.Containers[c], BundleToolsMountPath)
 	if vm == nil || vm.Name != bundleToolsVolume || !vm.ReadOnly {
-		t.Errorf("%s: container %s mount at %s = %+v, want the tools volume read-only", what, pod.Spec.Containers[c].Name, BundleToolsMountPath, vm)
+		t.Fatalf("%s: container %s mount at %s = %+v, want the tools volume read-only", what, pod.Spec.Containers[c].Name, BundleToolsMountPath, vm)
+	}
+	if (prop == nil) != (vm.MountPropagation == nil) || (prop != nil && *vm.MountPropagation != *prop) {
+		t.Errorf("%s: mount propagation %v, want %v", what, vm.MountPropagation, prop)
 	}
 }
 
@@ -67,20 +87,29 @@ func TestBundleTools_PodsOwnUseIsLeftAlone(t *testing.T) {
 	}
 }
 
-// A companion a capture may dump gets the bundle in every container; a pod
-// no capture dumps gets nothing.
+// A companion a capture may dump gets the bundle's companion directory in
+// every container, which exists on any node, so it starts wherever it is
+// scheduled, and its scheduling is left as it is; a pod no capture dumps
+// gets nothing.
 func TestCompanionToolsPatches(t *testing.T) {
 	candidate := false
 	m := &Mutator{HostBundleRoot: "/bundle", BundleID: "v7",
 		CaptureCandidate: func(context.Context, *corev1.Pod) bool { return candidate }}
-	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "etcd", Image: "etcd"}, {Name: "metrics", Image: "m"}}}}
+	sel := map[string]string{"pool": "any"}
+	aff := &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{
+		{Weight: 1, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "k", Operator: corev1.NodeSelectorOpExists}}}}}}}
+	pod := &corev1.Pod{Spec: corev1.PodSpec{NodeSelector: sel, Affinity: aff,
+		Containers: []corev1.Container{{Name: "etcd", Image: "etcd"}, {Name: "metrics", Image: "m"}}}}
 	if p := m.companionToolsPatches(context.Background(), pod); p != nil {
 		t.Errorf("a pod no capture dumps was patched: %v", p)
 	}
 	candidate = true
 	got := applyPatches(t, pod, m.companionToolsPatches(context.Background(), pod))
-	checkToolsMount(t, "companion", got, 0, "v7")
-	checkToolsMount(t, "companion", got, 1, "v7")
+	checkCompanionToolsMount(t, "companion", got, 0, "v7")
+	checkCompanionToolsMount(t, "companion", got, 1, "v7")
+	if !reflect.DeepEqual(got.Spec.NodeSelector, sel) || !reflect.DeepEqual(got.Spec.Affinity, aff) || got.Spec.Tolerations != nil {
+		t.Errorf("the companion's scheduling changed: selector %v, affinity %+v, tolerations %v", got.Spec.NodeSelector, got.Spec.Affinity, got.Spec.Tolerations)
+	}
 	if p := m.companionToolsPatches(context.Background(), gpushareTestPod(true, nil)); p != nil {
 		t.Error("a GPU pod got the companion placement (gpusharePatches places its tools)")
 	}
@@ -93,22 +122,33 @@ func TestCRIURestore_MountsTheRecordedTools(t *testing.T) {
 	man.SourcePodMeta[BundleMeta] = "v3"
 	m := criuMutator(t, man)
 	m.HostBundleRoot, m.BundleID = "/bundle", "v7"
-	pod := criuFunctionPod()
-	patches, err := m.criuRestorePatches(pod, "abc123__20261008-101010", man)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := applyPatches(t, pod, mergePatchPlan(patches))
-	placeholder := -1
-	for i := range got.Spec.Containers {
-		if mountAt(got.Spec.Containers[i], BundleToolsMountPath) != nil {
-			placeholder = i
+	for _, gpu := range []bool{true, false} {
+		pod := criuFunctionPod()
+		what := "a rank's placeholder"
+		if gpu {
+			pod.Spec.Containers[1].Resources.Limits = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}
+		} else {
+			what = "a companion's placeholder"
 		}
+		patches, err := m.criuRestorePatches(pod, "abc123__20261008-101010", man)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := applyPatches(t, pod, mergePatchPlan(patches))
+		placeholder := -1
+		for i := range got.Spec.Containers {
+			if mountAt(got.Spec.Containers[i], BundleToolsMountPath) != nil {
+				placeholder = i
+			}
+		}
+		if placeholder < 0 {
+			t.Fatalf("%s has no tools", what)
+		}
+		// A companion's placeholder as a rank's: the version itself, which
+		// every agent version restores from. One scheduled where no agent
+		// runs is not restored; the agent starts its instance cold.
+		checkToolsMount(t, what, got, placeholder, "v3")
 	}
-	if placeholder < 0 {
-		t.Fatal("the placeholder has no tools")
-	}
-	checkToolsMount(t, "placeholder", got, placeholder, "v3")
 
 	own := criuFunctionPod()
 	own.Spec.Volumes = append(own.Spec.Volumes, corev1.Volume{Name: "x", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
@@ -143,5 +183,18 @@ func TestMutate_UndeclaredMount(t *testing.T) {
 	own.Spec.Containers[0].VolumeMounts = append(own.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: helperVolumeName, MountPath: "/x"})
 	if why := undeclaredMount(own); why != "" {
 		t.Errorf("a pod that declares the volume itself refused: %s", why)
+	}
+}
+
+// A companion's version counts as in use by PodBundleIDs as it parsed
+// paths before companion directories existed (the "/versions/<id>" suffix
+// alone), so an agent rolled back to such a version keeps it on the node.
+func TestPodBundleIDs_Companion(t *testing.T) {
+	m := &Mutator{HostBundleRoot: "/bundle", BundleID: "v7",
+		CaptureCandidate: func(context.Context, *corev1.Pod) bool { return true }}
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "etcd", Image: "etcd"}}}}
+	got := applyPatches(t, pod, m.companionToolsPatches(context.Background(), pod))
+	if ids := PodBundleIDs(got); len(ids) != 1 || ids[0] != "v7" {
+		t.Errorf("PodBundleIDs = %v, want [v7]", ids)
 	}
 }

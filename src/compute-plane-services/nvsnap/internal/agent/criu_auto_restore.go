@@ -80,11 +80,20 @@ func criuReservePIDArgs(hostPID int) []string {
 // criuAutoRestorer restores CRIU checkpoints into the placeholder pods on
 // this node.
 type criuAutoRestorer struct {
-	a         *Agent
-	attempted sync.Map // pod UID -> struct{}
-	goneSince sync.Map // restored pod UID -> when its engine was first seen gone
-	verdicts  sync.Map // pod UID, checkpoint, group key -> why its restore is refused ("" admitted); restore_trust.go
-	seenReady sync.Map // pod UID -> struct{}: seen Ready, so its failures are not a failed start (criu_fallback.go)
+	a *Agent
+	// bundleWaitSince: leader pod UID -> when its capture first found a
+	// companion's node bundle missing (companionBundlesPending).
+	bundleWaitSince sync.Map
+	// agentWaitSince: leader pod UID -> when its capture first found a
+	// node of the instance whose agent is not running yet.
+	agentWaitSince sync.Map
+	// fetchBundle fetches a bundle version from a peer; nil: the agent's
+	// own (tests stub it).
+	fetchBundle func(ctx context.Context, id string) error
+	attempted   sync.Map // pod UID -> struct{}
+	goneSince   sync.Map // restored pod UID -> when its engine was first seen gone
+	verdicts    sync.Map // pod UID, checkpoint, group key -> why its restore is refused ("" admitted); restore_trust.go
+	seenReady   sync.Map // pod UID -> struct{}: seen Ready, so its failures are not a failed start (criu_fallback.go)
 	// captureDecided: leader pod UID -> struct{}: whether its instance is
 	// captured is settled (captured, failed or refused), so it is not
 	// held out of service for it (capture_hold.go).

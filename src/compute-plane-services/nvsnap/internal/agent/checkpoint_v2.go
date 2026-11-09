@@ -249,7 +249,11 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	root := filepath.Join(procBase, strconv.Itoa(hostPID), "root")
 
 	// 1. The tools run from the node bundle mounted read-only in the
-	// container (bundle_tools.go), never from a copy in its filesystem.
+	// container (bundle_tools.go), never from a copy in its filesystem. A
+	// companion lacking them has them mounted into it (companion_tools.go).
+	if err := a.ensureCompanionToolsIn(procBase, hostPID); err != nil {
+		log.WithError(err).Warn("node bundle: cannot mount the tools into a pod without GPUs")
+	}
 	tools, err := bundleToolsOf(procBase, hostPID, a.bundleVersionsDir())
 	if err != nil {
 		return nil, fmt.Errorf("criu-v2: %w", err)

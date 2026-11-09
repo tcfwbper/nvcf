@@ -170,7 +170,12 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 	}
 	fs := processFindings(procBase, pids, pod, container, a.ghostLimit())
 	// The capture runs its tools from the node bundle mounted in the
-	// container, and only there (bundle_tools.go).
+	// container, and only there (bundle_tools.go). A companion that started
+	// before its version was mounted here has it mounted into it, when the
+	// version is staged on this node (companion_tools.go).
+	if err := a.ensureCompanionToolsIn(procBase, int(info.PID)); err != nil {
+		a.log.WithError(err).WithField("pod", ns+"/"+pod).Warn("node bundle: cannot mount the tools into a pod without GPUs yet; its capture waits for them")
+	}
 	if _, err := bundleToolsOf(procBase, int(info.PID), a.bundleVersionsDir()); err != nil {
 		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
 	}
@@ -578,6 +583,7 @@ func (a *Agent) instancePreflightHandler(w http.ResponseWriter, r *http.Request)
 type mountEntry struct {
 	point    string
 	readOnly bool
+	root     string // the mounted directory, within its filesystem
 }
 
 // readMountinfo reads the mount points of a mount namespace; nil when it
@@ -598,7 +604,7 @@ func readMountinfo(path string) []mountEntry {
 		for _, o := range strings.Split(f[5], ",") {
 			ro = ro || o == "ro"
 		}
-		out = append(out, mountEntry{point: unescapeMountinfo(f[4]), readOnly: ro})
+		out = append(out, mountEntry{point: unescapeMountinfo(f[4]), readOnly: ro, root: unescapeMountinfo(f[3])})
 	}
 	return out
 }

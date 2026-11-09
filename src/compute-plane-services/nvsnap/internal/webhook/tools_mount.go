@@ -80,11 +80,17 @@ func bundleToolsConflict(pod *corev1.Pod) string {
 // a companion of an instance (CaptureCandidate) the node bundle, in every
 // container: which one the capture dumps is decided when it runs. GPU pods
 // get it with the gpushare placement (gpusharePatches).
+//
+// A companion may be scheduled to a node no nvsnap agent runs on (a CPU
+// node a helm chart's CPU-only pod is sent to), where no bundle is staged.
+// So it mounts the companion directory of the version (companionBundleTools),
+// which exists everywhere, and its scheduling is left as it is; where an
+// agent runs, the agent mounts the staged version on that directory.
 func (m *Mutator) companionToolsPatches(ctx context.Context, pod *corev1.Pod) []PatchOp {
 	if gpuRequest(pod) > 0 || m.CaptureCandidate == nil || !m.CaptureCandidate(ctx, pod) {
 		return nil
 	}
-	vol, mount, ok := m.bundleTools(pod, m.BundleID)
+	vol, mount, ok := m.companionBundleTools(pod, m.BundleID)
 	if !ok {
 		return nil
 	}
@@ -93,6 +99,26 @@ func (m *Mutator) companionToolsPatches(ctx context.Context, pod *corev1.Pod) []
 		patches = append(patches, addContainerMounts(i, &pod.Spec.Containers[i], []corev1.VolumeMount{mount})...)
 	}
 	return patches
+}
+
+// companionBundleTools is bundleTools for a pod without GPUs: the companion
+// directory of version id, created empty where it is missing (a node no
+// agent runs on). It asks nothing of the node: no propagation, which the
+// runtime refuses to start a container with where the directory's
+// filesystem is a private mount. On a node an agent runs on, the version
+// is mounted on the directory before the pod starts, or, if the pod
+// started first, into the pod's own mount namespace (the agent's
+// companion_tools.go). The agent checks it is that version, read-only,
+// before it runs a tool there (bundle_tools.go).
+func (m *Mutator) companionBundleTools(pod *corev1.Pod, id string) (vol corev1.Volume, mount corev1.VolumeMount, ok bool) {
+	vol, mount, ok = m.bundleTools(pod, id)
+	if !ok {
+		return vol, mount, false
+	}
+	orCreate := corev1.HostPathDirectoryOrCreate
+	vol.HostPath = &corev1.HostPathVolumeSource{Path: m.companionBundleDir(id), Type: &orCreate}
+	mount.MountPropagation = nil
+	return vol, mount, true
 }
 
 // mountAtPath reports whether any container of the pod (init, regular,

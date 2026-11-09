@@ -179,7 +179,7 @@ spec:
             - --webhook-cert=/etc/nvsnap/webhook/tls.crt
             - --webhook-key=/etc/nvsnap/webhook/tls.key
             # The download Job requests no GPU; it runs on the agent's nodes.
-            - {{ printf "--webhook-agent-placement=%s" (dict "nodeSelector" .Values.agent.nodeSelector "nodeAffinity" .Values.agent.nodeAffinity | toJson) | quote }}
+            - {{ printf "--webhook-agent-placement=%s" (dict "nodeSelector" .Values.agent.nodeSelector "nodeAffinity" .Values.agent.nodeAffinity "tolerations" .Values.agent.tolerations | toJson) | quote }}
             {{- with .Values.webhook.dynamoNamespace }}
             - --webhook-dynamo-namespace={{ . }}
             {{- end }}
@@ -340,9 +340,13 @@ spec:
           volumeMounts:
             # The node bundle root: the agent reads the current bundle
             # version, fetches a version a restore needs, and removes
-            # unused ones (docs/design/VERSIONED-NODE-BUNDLE.md).
+            # unused ones (docs/design/VERSIONED-NODE-BUNDLE.md). It mounts
+            # each staged version, read-only, on its companion directory:
+            # Bidirectional, so that mount reaches the host and the pods
+            # without GPUs that mount that directory.
             - name: host-bundle
               mountPath: {{ .Values.agent.l2.hostBundleRoot | default "/var/lib/containerd/nvsnap-bundle" | quote }}
+              mountPropagation: Bidirectional
             - name: checkpoints
               mountPath: /var/lib/nvsnap/checkpoints
             {{- if .Values.agent.podCacheDir }}

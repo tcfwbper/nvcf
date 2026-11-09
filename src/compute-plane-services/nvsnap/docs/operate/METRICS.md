@@ -49,7 +49,8 @@ Labels:
 - `ranks`: the instance's GPU ranks, bucketed `1`, `2-4`, `5-8`, `9-16`,
   `17+`; companions (etcd, NATS) are not ranks.
 - `reason`: the class of a failure or refusal: `mptcp`, `rdma`, `gpushare`,
-  `fetch`, `timeout`, `criu`, `other`.
+  `fetch`, `timeout`, `criu`, `other`; `no_agent` for an instance refused
+  because a companion of it runs on a node no nvsnap agent runs on.
 - `source`: where a checkpoint fetched to a node came from: `rails`, `peer`,
   `fsstore`, `volume` (`unknown` for a fetch that found no source). A
   checkpoint already on the node is no fetch.

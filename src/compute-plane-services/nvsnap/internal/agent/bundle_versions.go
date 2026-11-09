@@ -137,8 +137,8 @@ func (a *Agent) reapBundleVersions(pods []corev1.Pod, now time.Time) {
 		if !strings.HasPrefix(e.Name(), ".") && keep[e.Name()] {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
-			a.log.WithError(err).WithField("bundle", e.Name()).Warn("node reaper: cannot remove an unused bundle version")
+		if err := a.removeBundleVersion(e.Name()); err != nil {
+			a.log.WithError(err).WithField("bundle", e.Name()).Warn("node reaper: cannot remove an unused bundle version; keeping it")
 			continue
 		}
 		a.log.WithField("bundle", e.Name()).Info("node reaper: removed an unused bundle version")
@@ -358,8 +358,16 @@ func tarPerm(mode int64) os.FileMode {
 // ensurePlaceholderBundles fetches the bundle versions a pod scheduled to
 // this node mounts and the node lacks: the pod cannot start without them
 // (a restore placeholder mounts the version its checkpoint recorded).
+//
+// A companion (a pod without GPUs a capture may dump) starts without them,
+// its tools directory empty (companion_tools.go): its version is fetched
+// and mounted while it runs too, retried on its later events, so that it
+// can be captured once that succeeds.
 func (c *criuAutoRestorer) ensurePlaceholderBundles(ctx context.Context, pod *corev1.Pod) {
-	if pod.Spec.NodeName != c.a.config.NodeName || pod.Status.Phase != corev1.PodPending {
+	if pod.Spec.NodeName != c.a.config.NodeName || pod.DeletionTimestamp != nil {
+		return
+	}
+	if pod.Status.Phase != corev1.PodPending && !mountsAnyCompanionTools(pod) {
 		return
 	}
 	for _, id := range webhook.PodBundleIDs(pod) {
@@ -367,6 +375,7 @@ func (c *criuAutoRestorer) ensurePlaceholderBundles(ctx context.Context, pod *co
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(c.a.bundleVersionsDir(), id)); err == nil {
+			c.ensureCompanionToolsFor(pod, id)
 			continue
 		}
 		key := "bundle/" + id
@@ -376,12 +385,30 @@ func (c *criuAutoRestorer) ensurePlaceholderBundles(ctx context.Context, pod *co
 		go func(id string) {
 			defer c.attempted.Delete(key) // a later event retries a failure
 			log := c.a.log.WithFields(logrus.Fields{"bundle": id, "pod": pod.Namespace + "/" + pod.Name})
-			if err := c.a.fetchBundle(ctx, id); err != nil {
+			fetch := c.fetchBundle
+			if fetch == nil {
+				fetch = c.a.fetchBundle
+			}
+			if err := fetch(ctx, id); err != nil {
 				log.WithError(err).Warn("cannot fetch the bundle version a pod needs; it waits")
 				return
 			}
 			log.Info("fetched the bundle version a pod needs from a peer")
+			c.ensureCompanionToolsFor(pod, id)
 		}(id)
+	}
+}
+
+// ensureCompanionToolsFor mounts version id on its companion directory when
+// pod, a pod without GPUs scheduled here, mounts that directory: before it
+// starts, rather than at the next node sweep.
+func (c *criuAutoRestorer) ensureCompanionToolsFor(pod *corev1.Pod, id string) {
+	if !mountsCompanionTools(pod, id) {
+		return
+	}
+	if err := c.a.ensureCompanionTools(id); err != nil {
+		c.a.log.WithError(err).WithFields(logrus.Fields{"bundle": id, "pod": pod.Namespace + "/" + pod.Name}).
+			Warn("node bundle: cannot mount the version a pod without GPUs needs; it is not captured until it is")
 	}
 }
 

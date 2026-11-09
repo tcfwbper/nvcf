@@ -83,6 +83,7 @@ func TestAdmits(t *testing.T) {
 		{"no constraints", &corev1.Pod{}, true},
 		{"selector matches", &corev1.Pod{Spec: corev1.PodSpec{NodeSelector: map[string]string{"zone": "a"}}}, true},
 		{"selector differs", &corev1.Pod{Spec: corev1.PodSpec{NodeSelector: map[string]string{"zone": "b"}}}, false},
+		{"empty-valued selector on an absent label", &corev1.Pod{Spec: corev1.PodSpec{NodeSelector: map[string]string{"rack": ""}}}, false},
 		{"In", withTerms(term(req("zone", corev1.NodeSelectorOpIn, "a", "b"))), true},
 		{"In misses", withTerms(term(req("zone", corev1.NodeSelectorOpIn, "b"))), false},
 		{"NotIn", withTerms(term(req("zone", corev1.NodeSelectorOpNotIn, "b"))), true},
