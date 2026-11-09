@@ -18,7 +18,9 @@ limitations under the License.
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -652,6 +654,25 @@ func extractK8sEvent(ctx context.Context, lr *logsv1.LogRecord, options ...extra
 	return event, nil
 }
 
+// CloudEvent bodies are stored as bytes, which JSON encodes as base64. Decode
+// JSON objects and arrays on reads so existing records need no migration.
+// Leave other strings and binary payloads unchanged.
+func decodeEventBody(body any) any {
+	s, ok := body.(string)
+	if !ok {
+		return body
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return body
+	}
+	decoded = bytes.TrimSpace(decoded)
+	if len(decoded) == 0 || (decoded[0] != '{' && decoded[0] != '[') || !json.Valid(decoded) {
+		return body
+	}
+	return json.RawMessage(decoded)
+}
+
 // extractCloudEvent converts a CloudEvent into our internal EventV3 format
 // CloudEvents extensions are mapped via mapstructure to:
 //   - namespace (required), or functionVersionId, which is stored as the namespace
@@ -1258,6 +1279,8 @@ func (s *Server) GetEventsV3(w http.ResponseWriter, r *http.Request) {
 				details = EventDetails{}
 			}
 		}
+
+		details.Body = decodeEventBody(details.Body)
 
 		// Apply the optional generic attribute filter.
 		if !attributeMatches(details, attributeKey, attributeValue) {

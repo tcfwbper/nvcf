@@ -130,6 +130,7 @@ func (s *Server) GetAccountEventsV3(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		details.Body = decodeEventBody(details.Body)
 		if !attributeMatches(details, attributeKey, attributeValue) {
 			continue
 		}

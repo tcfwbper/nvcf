@@ -197,7 +197,9 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, out any
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 		return fmt.Errorf("event ledger returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(out); err != nil {
 		return fmt.Errorf("decoding event ledger response: %w", err)
 	}
 	return nil

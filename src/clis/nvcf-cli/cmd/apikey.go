@@ -665,7 +665,7 @@ func runListAPIKeys(cmd *cobra.Command, args []string) error {
 	nvctClient := apikeys.NewClient(nvctAPIKeysConfig(config, ""))
 	eventLedgerClient := apikeys.NewClient(eventLedgerAPIKeysConfig(config, ""))
 
-	var keys []listedAPIKey
+	keys := make([]listedAPIKey, 0)
 
 	functionKeys, err := nvcfClient.ListAPIKeys(ctx)
 	if err != nil {

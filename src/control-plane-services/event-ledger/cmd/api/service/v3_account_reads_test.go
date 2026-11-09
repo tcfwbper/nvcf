@@ -131,6 +131,31 @@ func accountVars(nca, function, version string) map[string]string {
 	return map[string]string{"ncaId": nca, "functionId": function, "functionVersionId": version}
 }
 
+func TestGetAccountEventsV3_DecodesStoredCloudEventBody(t *testing.T) {
+	const payload = `{"logMessage":"container in restart loop","sequence":9007199254740993}`
+	db := newAccountReadsDB(t)
+	details, err := json.Marshal(EventDetails{Body: []byte(payload)})
+	require.NoError(t, err)
+	row := accountRow{accountTestVersion, "instance_id=pod-1", accountTestNca, accountTestFunction}
+	db.eventRows[row] = []data_access.EventV3Record{{
+		EventName: "InstanceDestroyed", Source: "nvidia-spot", Details: details, Timestamp: time.Now(),
+	}}
+	w := serveAccountRead(t, db, "events", "?instance_id=pod-1",
+		accountVars(accountTestNca, accountTestFunction, accountTestVersion))
+	require.Equal(t, http.StatusOK, w.Code)
+	var response struct {
+		Events []struct {
+			Details struct {
+				Body json.RawMessage `json:"body"`
+			} `json:"details"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Events, 1)
+	assert.JSONEq(t, payload, string(response.Events[0].Details.Body))
+	assert.Contains(t, w.Body.String(), "9007199254740993")
+}
+
 func TestGetAccountEventsV3(t *testing.T) {
 	const podQuery = "?instance_id=pod-1"
 

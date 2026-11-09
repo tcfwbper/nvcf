@@ -19,6 +19,7 @@ package eventledger
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -90,6 +91,17 @@ func TestListEventsDecodesStructuredBody(t *testing.T) {
 	body, ok := got.Events[0].Details.Body.(map[string]interface{})
 	require.True(t, ok, "expected a structured body, got %T", got.Events[0].Details.Body)
 	assert.Equal(t, "Normal", body["type"])
+}
+
+func TestListEventsPreservesJSONNumberPrecision(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"events":[{"details":{"body":{"sequence":9007199254740993}}}]}`))
+	}, "")
+	got, err := c.ListEvents(context.Background(), "fv-1", EventsContext{}, EventsAttribute{})
+	require.NoError(t, err)
+	raw, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"sequence":9007199254740993`)
 }
 
 func TestListEventsSendsResourceAndAttributeFilter(t *testing.T) {
