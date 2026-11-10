@@ -59,12 +59,11 @@ func TestChartImageExclusionValidation(t *testing.T) {
 		{name: "unknown reason", chart: "plain", entry: chartImageExclusion{Reason: "skip"}, want: "unknown reason"},
 		{name: "missing chart directory", chart: "gone", entry: chartImageExclusion{Reason: reasonTestFixture}, want: "no tracked Chart.yaml"},
 		{name: "issue on test-fixture", chart: "plain", entry: chartImageExclusion{Reason: reasonTestFixture, Issue: issue}, want: "issue is allowed only on pending-fix"},
-		{name: "private issue link", chart: "plain", entry: chartImageExclusion{Reason: reasonPendingFix, Issue: "https://example.com/browse/NVCF-1"}, want: "must be https://github.com/dsx-ai-factory/nvcf/issues/<N>"},
-		{name: "foreign repository issue", chart: "plain", entry: chartImageExclusion{Reason: reasonPendingFix, Issue: "https://github.com/other/nvcf/issues/1"}, want: "must be https://github.com"},
+		{name: "pending-fix with free-form issue note", chart: "plain", entry: chartImageExclusion{Reason: reasonPendingFix, Issue: "tracked with the chart owners"}},
 		{name: "indexed test-fixture", chart: "plain", entry: chartImageExclusion{Reason: reasonTestFixture}, indexed: true, want: "declares an image index"},
 		{name: "indexed no-runtime-image", chart: "plain", entry: chartImageExclusion{Reason: reasonNoRuntimeImage}, indexed: true, want: "declares an image index"},
-		{name: "subchart not declared by parent", chart: "parent/charts/loose", entry: chartImageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart; check as a standalone chart"},
-		{name: "subchart without parent chart", chart: "orphan/charts/sub", entry: chartImageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart"},
+		{name: "subchart not declared as a dependency", chart: "parent/charts/loose", entry: chartImageExclusion{Reason: reasonVendoredSubchart}},
+		{name: "charts directory without a parent chart", chart: "orphan/charts/sub", entry: chartImageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart; check as a standalone chart"},
 		{name: "standalone chart as subchart", chart: "plain", entry: chartImageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

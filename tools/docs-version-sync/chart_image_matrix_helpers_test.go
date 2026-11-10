@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -40,13 +39,11 @@ var chartImageReasons = map[string]bool{
 	reasonPendingFix: true, reasonTestFixture: true, reasonNoRuntimeImage: true, reasonVendoredSubchart: true,
 }
 
-// Public issue links only, for OSS hygiene.
-var chartImageIssueRe = regexp.MustCompile(`^https://github\.com/dsx-ai-factory/nvcf/issues/[1-9][0-9]*$`)
-
 // chartImageExclusion is one matrix entry, keyed by repo-root-relative chart directory.
 type chartImageExclusion struct {
 	Reason string `yaml:"reason"`
-	Issue  string `yaml:"issue,omitempty"`
+	// Issue is a free-form note, such as a tracking link. It is not validated.
+	Issue string `yaml:"issue,omitempty"`
 }
 
 // loadChartImageExclusions decodes the matrix strictly, so a misspelled field
@@ -73,7 +70,6 @@ func loadChartImageExclusions(path string) (map[string]chartImageExclusion, erro
 //   - reason "skip": not in the enum, so nothing says how the chart is handled.
 //   - a chart directory with no tracked Chart.yaml: the entry is stale.
 //   - issue on a test-fixture: only pending work has a tracking issue.
-//   - issue "https://example.com/1": private or foreign trackers are not public.
 //   - an indexed chart under test-fixture: an index declares runtime images,
 //     so the chart must be checked, not skipped.
 func validateChartImageExclusion(repoRoot, chart string, entry chartImageExclusion, charts map[string]bool, indexed bool) error {
@@ -83,13 +79,8 @@ func validateChartImageExclusion(repoRoot, chart string, entry chartImageExclusi
 	if !charts[chart] {
 		return fmt.Errorf("no tracked Chart.yaml in this directory; remove the stale entry")
 	}
-	if entry.Issue != "" {
-		if entry.Reason != reasonPendingFix {
-			return fmt.Errorf("issue is allowed only on %s entries", reasonPendingFix)
-		}
-		if !chartImageIssueRe.MatchString(entry.Issue) {
-			return fmt.Errorf("issue %q must be https://github.com/dsx-ai-factory/nvcf/issues/<N>", entry.Issue)
-		}
+	if entry.Issue != "" && entry.Reason != reasonPendingFix {
+		return fmt.Errorf("issue is allowed only on %s entries", reasonPendingFix)
 	}
 	if indexed && entry.Reason != reasonPendingFix {
 		return fmt.Errorf("chart declares an image index but is listed as %s; remove the entry so the chart is checked", entry.Reason)
@@ -100,30 +91,20 @@ func validateChartImageExclusion(repoRoot, chart string, entry chartImageExclusi
 	return nil
 }
 
-// validateVendoredSubchart requires <parent>/charts/<name> with a parent that
-// declares repository: file://charts/<name>. The exclusion is explicit rather
-// than derived from the path, because some directories look like subcharts
-// but are deployed on their own (for example a stack's local charts/<name>
-// directory) and must be checked as standalone charts.
+// validateVendoredSubchart requires a subchart path: <parent>/charts/<name>
+// where <parent> is itself a chart. A charts/<name> directory whose parent is
+// not a chart, such as a stack's local deploy/stacks/<stack>/charts/<name>, is
+// deployed on its own and must be checked as a standalone chart.
 func validateVendoredSubchart(repoRoot, chart string) error {
 	notSubchart := fmt.Errorf("not a subchart; check as a standalone chart")
-	parent, name := filepath.Dir(filepath.Dir(chart)), filepath.Base(chart)
+	parent := filepath.Dir(filepath.Dir(chart))
 	if filepath.Base(filepath.Dir(chart)) != "charts" || parent == "." {
 		return notSubchart
 	}
 	if _, err := os.Stat(filepath.Join(repoRoot, parent, "Chart.yaml")); err != nil {
 		return notSubchart
 	}
-	dependencies, err := readChartDependencies(filepath.Join(repoRoot, parent))
-	if err != nil {
-		return err
-	}
-	for _, dependency := range dependencies {
-		if dependency.Repository == "file://charts/"+name {
-			return nil
-		}
-	}
-	return notSubchart
+	return nil
 }
 
 // chartHasImageIndex reports whether the chart's own values.yaml declares

@@ -15,10 +15,12 @@
 #   no-runtime-image   Renders no image in its defaults or any CI values
 #                      scenario in tools/ci/helm-chart-values.yaml. Confirmed
 #                      by rendering.
-#   vendored-subchart  Vendored as <parent>/charts/<name>, where the parent
-#                      declares repository: file://charts/<name>. Skipped.
+#   vendored-subchart  Lives at <parent>/charts/<name>, where <parent> is
+#                      itself a chart. Skipped.
 #
-# issue (optional, pending-fix only): https://github.com/dsx-ai-factory/nvcf/issues/<N>
+# issue (optional, pending-fix only): a free-form note, such as a tracking
+# link. It is not validated. This file is public, so keep private tracker IDs
+# and URLs out of it.
 #
 # A chart with an image index may only be listed as pending-fix. Indirect
 # images (arguments, environment, injected agents) are visible only through

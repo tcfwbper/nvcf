@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,30 +91,48 @@ func TestImageFormatResolution(t *testing.T) {
 	}
 }
 
-// TestImageFormatOverridesRoundTrip writes each format's override fields over
-// a fixture default and requires the format to resolve the target, so reading
-// and writing a format cannot drift apart.
+// TestImageFormatOverridesRoundTrip merges each format's override fields over
+// a fixture default the way Helm coalesces an ordinary values file (fields the
+// override omits keep their defaults) and requires the format to resolve the
+// target, so reading and writing a format cannot drift apart. Defaults that
+// set a digest or a full reference must not survive the override: a kept
+// digest would render "<tag>@<new>@<old>", and a kept NATS fullImageName or
+// digest would still take precedence.
 func TestImageFormatOverridesRoundTrip(t *testing.T) {
-	formats := map[string]string{"standard": "server.image", "nats": "nats.container.image", "cert-manager": "cert-manager.image"}
-	defaults := "server:\n  image: {registry: r.example, repository: server, tag: v1}\n" +
-		"nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1}\n" +
-		"cert-manager:\n  imageRegistry: quay.io\n  image: {name: controller, tag: v1}\n"
-	for name, path := range formats {
-		t.Run(name, func(t *testing.T) {
-			snapshot := imageCatalogFixture(t, "thirdPartyImages: {image: "+path+"}\n"+defaults)
+	oldDigest := "sha256:" + strings.Repeat("c", 64)
+	for _, test := range []struct {
+		name, format, path, defaults string
+	}{
+		{"standard tag", "standard", "server.image", "server:\n  image: {registry: r.example, repository: server, tag: v1}\n"},
+		{"standard digest only", "standard", "server.image", "server:\n  image: {registry: r.example, repository: server, digest: " + oldDigest + "}\n"},
+		{"standard tag and digest", "standard", "server.image", "server:\n  image: {registry: r.example, repository: server, tag: v1, digest: " + oldDigest + "}\n"},
+		{"nats tag", "nats", "nats.container.image", "nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1}\n"},
+		{"nats digest", "nats", "nats.container.image", "nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1, digest: " + oldDigest + "}\n"},
+		{"nats full reference", "nats", "nats.container.image", "nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1, fullImageName: r.example/nats:old}\n"},
+		{"cert-manager inherited tag", "cert-manager", "cert-manager.image", "cert-manager:\n  imageRegistry: quay.io\n  image: {name: controller}\n"},
+		{"cert-manager tag and digest", "cert-manager", "cert-manager.image", "cert-manager:\n  imageRegistry: quay.io\n  image: {name: controller, registry: legacy.example, tag: v1, digest: " + oldDigest + "}\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := imageCatalogFixture(t, "thirdPartyImages: {image: "+test.path+"}\n"+test.defaults)
 			images, err := resolveChartImageCatalog(snapshot)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if images[0].Format.name != name {
-				t.Fatalf("path %s selected format %s", path, images[0].Format.name)
+			if images[0].Format.name != test.format {
+				t.Fatalf("path %s selected format %s", test.path, images[0].Format.name)
 			}
-			setImageValues(snapshot.Values, path, images[0].Format.override("mirror.example:5000", "renamed/image", "v1", fixtureDigest))
+			node, err := imageCatalogValue(snapshot.Values, test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for key, value := range images[0].Format.override("mirror.example:5000", "renamed/image", "v2", fixtureDigest) {
+				node[key] = value
+			}
 			overridden, err := resolveChartImageCatalog(snapshot)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := "mirror.example:5000/renamed/image:v1@" + fixtureDigest; overridden[0].Reference != want {
+			if want := "mirror.example:5000/renamed/image:v2@" + fixtureDigest; overridden[0].Reference != want {
 				t.Fatalf("override resolved %s, want %s", overridden[0].Reference, want)
 			}
 		})
@@ -138,6 +157,38 @@ func TestImageFormatRequiresDeclaredDependency(t *testing.T) {
 		if _, err := imageFormatFor(key+".image", map[string]bool{key: true}); err != nil {
 			t.Errorf("declared %s rejected: %v", key, err)
 		}
+	}
+}
+
+// TestImageFormatKeyErrorWinsOverDeclarationErrors keeps a malformed index
+// entry from masking an undeclared format key on a pending-fix chart. Each
+// case pairs the key error on "server" with a declaration error that sorts
+// or is walked first, and requires the chart's final outcome to fail the run
+// rather than count as an expected failure.
+func TestImageFormatKeyErrorWinsOverDeclarationErrors(t *testing.T) {
+	const natsImage = "nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1}\n"
+	for _, test := range []struct{ name, index string }{
+		{"empty path", "thirdPartyImages: {aa: \"\", server: nats.container.image}\n"},
+		{"non-string path", "thirdPartyImages: {aa: [x], server: nats.container.image}\n"},
+		{"duplicate identity", "ownedImages: {server: nats.container.image}\nthirdPartyImages: {server: nats.container.image}\n"},
+		{"category is not a map", "thirdPartyImages: [x]\nownedImages: {server: nats.container.image}\n"},
+		{"unresolvable value", "thirdPartyImages: {aa: missing.image, server: nats.container.image}\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := imageCatalogFixture(t, test.index+natsImage)
+			snapshot.Dependencies = map[string]bool{}
+			_, err := resolveChartImageCatalog(snapshot)
+			var keyError *imageFormatKeyError
+			if !errors.As(err, &keyError) {
+				t.Fatalf("format key error masked by %v", err)
+			}
+			check := &chartCheck{chart: "c"}
+			check.catalogFailure(err.Error(), err, "", "")
+			findings, expected := pendingFixOutcome(check, chartImageExclusion{Reason: reasonPendingFix})
+			if expected != "" || len(findings) != 1 || findings[0].Category != findingInvalidEntry {
+				t.Fatalf("pending-fix outcome: findings %+v, expected label %q", findings, expected)
+			}
+		})
 	}
 }
 

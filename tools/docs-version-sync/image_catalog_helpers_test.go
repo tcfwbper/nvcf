@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -129,8 +130,7 @@ type chartDependency struct {
 }
 
 // readChartDependencies reads the dependencies a chart declares. Format
-// lookup, vendored-subchart validation and dependency builds all read them
-// here.
+// lookup and dependency builds both read them here.
 func readChartDependencies(chart string) ([]chartDependency, error) {
 	raw, err := os.ReadFile(filepath.Join(chart, "Chart.yaml"))
 	if err != nil {
@@ -182,29 +182,42 @@ func gitCommandEnvironment() []string {
 // resolveChartImageCatalog validates indexed value paths and returns stable,
 // sorted image identities using the same parser as release inventories.
 //
-// Every path's format key is checked before any value is resolved, and
-// entries are walked in sorted order, so an undeclared format key always wins
-// over an ordinary coverage error. Otherwise a pending-fix chart with both
-// would pass or fail depending on map iteration order.
+// An undeclared format key always wins over every other index error. The
+// first pass walks entries in sorted order and checks the format key of every
+// usable path, recording a malformed entry (non-map category, empty or
+// non-string path, duplicate identity) instead of returning on it; values are
+// resolved only after the whole index passes. Otherwise a pending-fix chart
+// with {aa: "", server: nats.image} and no nats dependency would report the
+// empty path as an expected coverage failure and hide the key error.
 func resolveChartImageCatalog(snapshot imageChartSnapshot) ([]catalogImage, error) {
 	var declared []catalogImage
+	var declarationError error
 	identities := make(map[string]bool)
 	for _, category := range imageIndexCategories {
 		entries, ok := snapshot.Values[category].(map[string]any)
 		if snapshot.Values[category] != nil && !ok {
-			return nil, fmt.Errorf("%s must be a map of image value paths", category)
+			declarationError = cmp.Or(declarationError, fmt.Errorf("%s must be a map of image value paths", category))
+			continue
 		}
 		for _, id := range sortedKeys(entries) {
 			path, ok := entries[id].(string)
-			if !ok || path == "" || identities[id] {
-				return nil, fmt.Errorf("%s.%s must be a unique identity referencing existing image values", category, id)
+			if !ok || path == "" {
+				declarationError = cmp.Or(declarationError, fmt.Errorf("%s.%s must be a unique identity referencing existing image values", category, id))
+				continue
 			}
-			identities[id] = true
 			if _, err := imageFormatFor(path, snapshot.Dependencies); err != nil {
 				return nil, fmt.Errorf("%s.%s (%s): %w", category, id, path, err)
 			}
+			if identities[id] {
+				declarationError = cmp.Or(declarationError, fmt.Errorf("%s.%s must be a unique identity referencing existing image values", category, id))
+				continue
+			}
+			identities[id] = true
 			declared = append(declared, catalogImage{ID: id, Path: path, Ownership: category})
 		}
+	}
+	if declarationError != nil {
+		return nil, declarationError
 	}
 	if len(declared) == 0 {
 		return nil, fmt.Errorf("chart must declare thirdPartyImages or ownedImages")

@@ -60,7 +60,13 @@ var imageValueFormats = map[string]imageValueFormat{
 			}
 			return requireImageFields(node, "registry", "repository")
 		},
-		override: splitImageOverride,
+		// fullImageName and digest are cleared: Helm keeps default fields an
+		// override omits, and either would still take precedence over the tag.
+		override: func(registry, repository, version, digest string) map[string]any {
+			fields := splitImageOverride(registry, repository, version, digest)
+			fields["fullImageName"] = ""
+			return fields
+		},
 	},
 	// cert-manager (jetstack "image" helper): an explicit repository, prefixed
 	// by image.registry when set, else imageRegistry/imageNamespace/name. Tag
@@ -142,9 +148,11 @@ func (e *imageFormatKeyError) Error() string {
 	return fmt.Sprintf("image format %q applies only to a declared %s dependency or alias in Chart.yaml", e.format, e.root)
 }
 
-// splitImageOverride writes a separate registry and a tag@digest tag.
+// splitImageOverride writes a separate registry and a tag@digest tag. digest
+// is cleared because Helm keeps default fields an override omits: a default
+// digest would otherwise render "<tag>@<new>@<old>".
 func splitImageOverride(registry, repository, version, digest string) map[string]any {
-	return map[string]any{"registry": registry, "repository": repository, "tag": version + "@" + digest}
+	return map[string]any{"registry": registry, "repository": repository, "tag": version + "@" + digest, "digest": ""}
 }
 
 func joinImageRepository(prefix, repository string) string {
