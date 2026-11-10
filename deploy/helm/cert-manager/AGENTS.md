@@ -8,9 +8,10 @@ Run from the repository root:
 
 ```sh
 helm lint deploy/helm/cert-manager
-NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestImageCatalogCharts/cert-manager$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestChartImageCoverage$' -count=1
 ```
 
-The image test renders defaults and ordinary Helm overrides without a cluster.
+The coverage test checks every tracked chart, including this one. It renders
+defaults and ordinary Helm overrides without a cluster.
 Follow root QA guidance before live installation. Preserve external-controller
 mode and explicit repository/tag/digest overrides.

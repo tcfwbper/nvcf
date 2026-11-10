@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Authoritative list of CI-only Helm values scenarios.
+#
+# Each entry pairs a chart directory (relative to the repository root) with a
+# values file name in tools/ci/helm-validate-values/. One chart may appear in
+# several entries, one per scenario.
+#
+# Readers:
+#   - tools/ci/check-helm-charts lints and renders every entry, and fails when a
+#     values file has no entry or an entry points at a missing file or chart.
+#   - TestChartImageCoverage in tools/docs-version-sync renders every scenario
+#     mapped to a chart when it checks that chart's images.
+#
+# Nothing here is generated. No scenario, such as "all toggles enabled", is
+# derived automatically: to test one, add a values file and an entry for it.
+# This file lives outside helm-validate-values/ because every *.yaml in that
+# directory is treated as a values file.
+scenarios:
+  - {chart: deploy/helm/admin-token-issuer-proxy/chart, values: admin-token-issuer-proxy.yaml}
+  - {chart: deploy/helm/api-keys-colocated/api-keys, values: api-keys-colocated.yaml}
+  - {chart: deploy/helm/cassandra/helm, values: cassandra.yaml}
+  - {chart: deploy/helm/cloud-functions/nvcf-api, values: cloud-functions.yaml}
+  - {chart: deploy/helm/container-cache/deploy, values: container-cache.yaml}
+  - {chart: deploy/helm/encrypted-secret-store/ess-api, values: ess.yaml}
+  - {chart: deploy/helm/function-autoscaler, values: function-autoscaler.yaml}
+  - {chart: deploy/helm/gateway-routes/chart, values: gateway-routes-vanity.yaml}
+  - {chart: deploy/helm/gateway-routes/chart, values: gateway-routes-all-enabled.yaml}
+  - {chart: deploy/helm/grpc-proxy/grpc-proxy, values: grpc-proxy.yaml}
+  - {chart: deploy/helm/helm-reval, values: helm-reval.yaml}
+  - {chart: deploy/helm/http-invocation/nvcf-invocation-service, values: http-invocation.yaml}
+  - {chart: deploy/helm/icms/icms-api, values: icms.yaml}
+  - {chart: deploy/helm/llm-api-gateway/llm-api-gateway, values: llm-api-gateway.yaml}
+  - {chart: deploy/helm/llm-request-router/llm-request-router, values: llm-request-router.yaml}
+  - {chart: deploy/helm/notary/nvcf-notary-service, values: notary.yaml}
+  - {chart: deploy/helm/nvca-operator/nvca-operator, values: nvca-operator.yaml}
+  - {chart: deploy/helm/nvcf-pki, values: nvcf-pki-cluster-issuer.yaml}
+  - {chart: deploy/helm/openbao/helm, values: openbao.yaml}
+  - {chart: deploy/helm/ratelimiter/nvcf-ratelimiter, values: ratelimiter.yaml}
+  - {chart: deploy/helm/vanity-gateway/helm-nvcf-vanity-gateway, values: vanity-gateway.yaml}
+  - {chart: deploy/helm/worker-callback-proxy/worker-callback-proxy, values: worker-callback-proxy.yaml}
+  - {chart: deploy/stacks/nvcf-compute-plane/charts/nvcf-cluster-topology, values: nvcf-cluster-topology-all-enabled.yaml}
+  - {chart: deploy/stacks/observability/charts/nvcf-default-monitors, values: nvcf-default-monitors-all-enabled.yaml}

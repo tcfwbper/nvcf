@@ -11,8 +11,11 @@ the repository from `Chart.lock` and download the chart dependency:
 helm repo add nats https://nats-io.github.io/k8s/helm/charts/
 make -C deploy/helm/nats deps
 make -C deploy/helm/nats test
-NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestImageCatalogCharts/nats$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestChartImageCoverage$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestNATSAndOpenBaoChartImageGuards$' -count=1
 ```
 
-The image test renders defaults and ordinary Helm overrides without a cluster.
+The coverage test checks every tracked chart, including this one. The guards
+test covers native NATS `fullImageName` and digest overrides. Both render
+without a cluster.
 Follow root QA guidance before live installation.
