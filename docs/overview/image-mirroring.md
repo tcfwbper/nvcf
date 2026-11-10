@@ -116,7 +116,7 @@ Repeat for each chart that you need to mirror.
 
 ```bash
 CHART_NAME="helm-nvca-operator"
-CHART_VERSION="1.28.0"
+CHART_VERSION="1.37.1"
 CHART_REFERENCE="nvcf/helm-nvca-operator"
 CHART_ARCHIVE="${CHART_NAME}-${CHART_VERSION}.tgz"
 (

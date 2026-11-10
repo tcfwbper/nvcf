@@ -10,9 +10,9 @@ stacks. Stack, chart and image versions do not need matching version numbers.
 
 | Stack | Selected version | Source tag |
 | --- | --- | --- |
-| [Self-managed (control plane)](../self-managed/installation.md) | `1.0.10` | `deploy/stacks/self-managed/v1.0.10` |
-| [Compute plane](../compute-plane/cluster-management/index.md) | `1.0.5` | `deploy/stacks/nvcf-compute-plane/v1.0.5` |
-| [Observability](../observability/observability.md) | `1.0.0` | `deploy/stacks/observability/v1.0.0` |
+| [Self-managed (control plane)](../self-managed/installation.md) | `1.1.5` | `deploy/stacks/self-managed/v1.1.5` |
+| [Compute plane](../compute-plane/cluster-management/index.md) | `1.1.0` | `deploy/stacks/nvcf-compute-plane/v1.1.0` |
+| [Observability](../observability/observability.md) | `1.1.0` | `deploy/stacks/observability/v1.1.0` |
 
 {/*docs-version-sync:END compatibility-matrix*/}
 

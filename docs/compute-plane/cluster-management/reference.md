@@ -184,7 +184,7 @@ agentConfig:
 otelCollector:
   enabled: false
   imageRepository: ""       # Auto-calculated if empty
-  imageTag: 0.143.2
+  imageTag: 0.160.0-nv-0.4.7
 ```
 
 ## Helm-Managed Parameters
@@ -213,10 +213,10 @@ helmManaged:
   ## Image overrides (advanced, usually auto-calculated)
   imageCredHelper:
     imageRepository: ""
-    imageTag: 0.11.3
+    imageTag: 0.11.4
   otelCollector:
     imageRepository: ""
-    imageTag: 0.143.2
+    imageTag: 0.160.0-nv-0.4.7
 ```
 
 ## Self-Managed Parameters
@@ -233,10 +233,10 @@ selfManaged:
   ## Image overrides (advanced, usually auto-calculated)
   imageCredHelper:
     imageRepository: ""
-    imageTag: 0.11.3
+    imageTag: 0.11.4
   otelCollector:
     imageRepository: ""
-    imageTag: 0.143.2
+    imageTag: 0.160.0-nv-0.4.7
 ```
 
 <Note>
