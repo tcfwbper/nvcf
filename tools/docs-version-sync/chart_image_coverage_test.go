@@ -5,6 +5,8 @@ package main
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -365,5 +367,40 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	}
 	if strings.Join(report.Skipped[reasonTestFixture], ",") != "charts/fixture" {
 		t.Errorf("skipped %v", report.Skipped)
+	}
+}
+
+// TestImageCatalogRepositoriesReuseNamesAcrossCharts registers two charts'
+// dependency repositories in one Helm config, as a coverage run does. Both
+// charts name their first repository image-catalog-0, at different URLs; the
+// second chart must not fail with "repository name already exists", which
+// would be a false render error. Local HTTP servers stand in for the remote
+// repositories.
+func TestImageCatalogRepositoriesReuseNamesAcrossCharts(t *testing.T) {
+	if os.Getenv("NVCF_IMAGE_CATALOG_E2E") != "1" {
+		t.Skip("set NVCF_IMAGE_CATALOG_E2E=1 to register repositories with Helm")
+	}
+	isolateHelmConfiguration(t)
+	var urls []string
+	for range 2 {
+		directory := t.TempDir()
+		if err := os.WriteFile(filepath.Join(directory, "index.yaml"), []byte("apiVersion: v1\nentries: {}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		server := httptest.NewServer(http.FileServer(http.Dir(directory)))
+		t.Cleanup(server.Close)
+		urls = append(urls, server.URL)
+	}
+	for _, url := range urls {
+		if err := registerImageCatalogRepositories([]string{url}); err != nil {
+			t.Fatalf("register %s: %v", url, err)
+		}
+	}
+	listed, err := imageCatalogCommand("helm", "repo", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(listed), urls[1]) {
+		t.Fatalf("image-catalog-0 does not point at the latest chart's repository:\n%s", listed)
 	}
 }

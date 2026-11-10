@@ -164,15 +164,28 @@ func prepareImageChart(source, workspace string) (string, error) {
 	if err != nil || !needsBuild {
 		return chart, err
 	}
-	for index, repository := range httpsRepositories {
-		if _, err := imageCatalogCommand("helm", "repo", "add", fmt.Sprintf("image-catalog-%d", index), repository); err != nil {
-			return "", err
-		}
+	if err := registerImageCatalogRepositories(httpsRepositories); err != nil {
+		return "", err
 	}
 	if _, err := imageCatalogCommand("helm", "dependency", "build", "--skip-refresh", chart); err != nil {
 		return "", err
 	}
 	return chart, nil
+}
+
+// registerImageCatalogRepositories registers one chart's HTTPS dependency
+// repositories as image-catalog-<index> in the run's shared Helm config.
+// --force-update lets a later chart reuse a name at a different URL: without
+// it Helm fails with "repository name already exists", a false render error.
+// Overwriting is safe because charts are prepared one at a time and each
+// builds its dependencies right after registering them.
+func registerImageCatalogRepositories(repositories []string) error {
+	for index, repository := range repositories {
+		if _, err := imageCatalogCommand("helm", "repo", "add", "--force-update", fmt.Sprintf("image-catalog-%d", index), repository); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // chartDependencyFetches reports whether a chart needs helm dependency build,

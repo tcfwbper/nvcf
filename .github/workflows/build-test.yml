@@ -187,7 +187,7 @@ jobs:
       - name: Check image coverage for every tracked Helm chart
         env:
           NVCF_IMAGE_CATALOG_E2E: "1"
-        run: go test -C tools/docs-version-sync -run '^(TestChartImageCoverage|TestChartImageCoverageReportsEachFailure)$' -count=1
+        run: go test -C tools/docs-version-sync -run '^(TestChartImageCoverage|TestChartImageCoverageReportsEachFailure|TestImageCatalogRepositoriesReuseNamesAcrossCharts)$' -count=1
 
       - name: Test NATS and OpenBao chart image guards
         env:
