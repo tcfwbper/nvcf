@@ -38,3 +38,8 @@ range does not change the contents of an existing archive.
 Follow the [1.0.4 upgrade notes](release-notes/1.0.2-to-1.0.4-upgrade.md)
 for the docs edition 1.0.2 baseline and required upgrade order. Use
 [Consume an NVCF release](umbrella-releases.md) for package downloads.
+
+For the separate 1.1 upgrade path, see its
+[cross-stack upgrade order](release-notes/1.0.x-to-1.1.0-upgrade.md#cross-stack-upgrade-order).
+That contract applies to its listed starting releases; it does not change
+the exact 1.0.4 selection above.
