@@ -129,6 +129,17 @@ When `usePexec` is false or omitted, the gateway forwards to `NVCF_API_ENDPOINT`
 with `function-id` and `function-version-id` headers. When `usePexec` is true,
 the gateway rewrites the upstream path to the pexec endpoint instead.
 
+When a model route or Vanity URL route invokes a function through the
+invocation service, with or without `usePexec`, the gateway removes the
+caller's `X-Api-Key` and `Cookie` headers before forwarding, so these
+credentials never reach the function. `Authorization` is
+forwarded: the invocation service authenticates the request with it and removes
+it before the function sees the request. The invocation service does not read
+`X-Api-Key`, so a Messages request that authenticates only with `x-api-key` is
+rejected there with `401`. Configured `customHeaders` are set after this step.
+Models with `functionType: LLM` keep both headers, see
+[LLM Function Models](#llm-function-models).
+
 ```yaml
 v2config:
   openai:
@@ -387,7 +398,8 @@ these requests. The LLM Gateway resolves the function from the model, so the
 gateway sets none of them, and a caller-supplied value is removed rather than
 forwarded: the mapping is what decides which function a caller reaches.
 Vanity Gateway passes `Authorization`, `NVCF-POLL-SECONDS`, and the caller's
-other headers to the LLM Gateway.
+other headers, including `X-Api-Key` and `Cookie`, to the LLM Gateway. The LLM
+Gateway accepts the API key in `x-api-key` on Messages requests.
 
 Config validation rejects `functionType: LLM` outside the supported
 sections, and rejects `usePexec`, `outgoingPathOverride`, and `sessionTimeout`

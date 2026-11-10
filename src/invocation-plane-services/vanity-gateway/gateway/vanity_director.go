@@ -313,7 +313,24 @@ func applyExecTarget(request *http.Request, apiScheme string, apiHost string, ta
 	}
 	request.Host = ""
 	setPollingHeaderIfNotPresent(request, target.sessionTimeout)
+	stripCallerCredentials(request)
 	applyCustomHeaders(request, target.customHeaders)
+}
+
+// callerCredentialHeaders are caller credentials the invocation service would
+// pass on to the function. Authorization is not listed: the invocation service
+// authenticates the request with it and removes it before the function. LLM
+// Gateway routes keep these headers because the LLM Gateway authenticates
+// Messages callers with X-Api-Key.
+var callerCredentialHeaders = []string{
+	"X-Api-Key",
+	"Cookie",
+}
+
+func stripCallerCredentials(request *http.Request) {
+	for _, name := range callerCredentialHeaders {
+		request.Header.Del(name)
+	}
 }
 
 func applyCustomHeaders(request *http.Request, headers config.CustomHeaders) {
