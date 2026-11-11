@@ -25,6 +25,10 @@ charts into test-owned directories. It does not create a cluster or verify
 registry publication. Keep the chart probe and override helpers test-only;
 installation uses native Helm values.
 
+A chart that declares an image index cannot be listed as `test-fixture` or
+`no-runtime-image`, so do not commit an indexed fixture chart. Build it in a
+temporary tree with `writeChartFixtureTree`, as the matrix tests do.
+
 When a pending-fix chart is fixed, remove its exclusion entry in the same Pull
 Request. Image value shapes that differ from `registry`/`repository`/`tag`/
 `digest` belong in `imageValueFormats` in `chart_image_formats_test.go`.
