@@ -40,7 +40,9 @@ When enabled, the stack creates:
 - `llm-api-gateway` in the `nvcf` namespace.
 - `llm-request-router` in the `nvcf` namespace.
 - The `llm.<domain>` and `llm.invocation.<domain>` HTTPRoutes when Gateway API
-  ingress is enabled.
+  ingress is enabled. To skip either route, for example when callers reach the
+  gateway in-cluster, set `ingress.gatewayApi.routes.llmApiGateway.enabled` or
+  `ingress.gatewayApi.routes.llmInvocation.enabled` to `false`.
 - LLM worker pods with a `pylon` sidecar that forwards requests to the function
   container on the configured `inferencePort`.
 

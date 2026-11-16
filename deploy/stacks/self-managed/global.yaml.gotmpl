@@ -2690,10 +2690,15 @@ nvcfGatewayRoutes:
     invocation:
       routeAnnotations:
         {{ dig "ingress" "gatewayApi" "routes" "invocation" "routeAnnotations" dict .Values | toYaml | nindent 8 | trim }}
+    # The LLM routes follow the add-on. An environment can turn either off while
+    # the add-on is on, for example when callers reach the gateway in-cluster.
+    # Only a boolean true counts as on, as for the add-on's releases, so a
+    # quoted "false" cannot publish a route with no backend.
+    {{- $llmRoutesAllowed := and (kindIs "bool" $llmEnabled) $llmEnabled }}
     llmApiGateway:
-      enabled: {{ dig "addons" "llm" "enabled" false .Values }}
+      enabled: {{ and $llmRoutesAllowed (dig "ingress" "gatewayApi" "routes" "llmApiGateway" "enabled" true .Values) }}
     llmInvocation:
-      enabled: {{ dig "addons" "llm" "enabled" false .Values }}
+      enabled: {{ and $llmRoutesAllowed (dig "ingress" "gatewayApi" "routes" "llmInvocation" "enabled" true .Values) }}
       backend:
         name: llm-api-gateway
         namespace: nvcf
