@@ -37,8 +37,10 @@ func (v *segmentVolume) segmentBytes() uint64 {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl.gz") {
 			continue
 		}
+		// Counted as a real filesystem counts used space: in the blocks
+		// files take, the unit eviction sizes its candidates in.
 		if info, err := e.Info(); err == nil {
-			used += uint64(info.Size())
+			used += uint64(diskguard.DiskBytes(filepath.Join(v.dir, e.Name()), info.Size()))
 		}
 	}
 	return used
@@ -84,14 +86,13 @@ func TestAboveTheHighWatermarkTheOldestClosedSegmentIsEvictedAndCounted(t *testi
 	if !gone(closed[0]) {
 		t.Fatal("the oldest closed segment was kept above the high watermark")
 	}
-	if gone(closed[1]) {
-		t.Fatal("a newer closed segment was evicted, want only as much as the watermark needs")
-	}
 	if got, _ := metrics.Value(telemetry.SegmentsEvicted, nil); got != 1 {
-		t.Fatalf("segments_evicted = %v, want the loss counted", got)
+		t.Fatalf("segments_evicted = %v, want only the oldest evicted, and counted", got)
 	}
-	if got := fake.SubmitCalls(); got != 0 {
-		t.Fatalf("submits = %d, want preparing paused above the watermark", got)
+	// Back under the high watermark, preparing goes on in the same pass, so
+	// the newer segment may leave by upload, never by eviction.
+	if gone(closed[1]) && fake.SubmitCalls() == 0 {
+		t.Fatal("a newer closed segment was evicted, want only as much as the watermark needs")
 	}
 }
 
@@ -205,11 +206,16 @@ func TestQuarantineOlderThanItsMaxAgeIsRemovedOnAPass(t *testing.T) {
 
 func TestPreparingPausesWhileFreeSpaceIsLowAndResumesAfter(t *testing.T) {
 	spool, closed := spoolWith(t, []string{uploadertest.RequestEnd("a", 1)})
-	// A small volume, 75% used: under the high watermark, but with less
-	// free space than the floor kept for the writer.
+	info, err := os.Stat(closed[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A volume ten segments in size, 84% used: under the high watermark,
+	// but with less free space than twice the segment to prepare.
+	size := info.Size()
 	volume := &segmentVolume{dir: spool.Dir}
-	volume.total.Store(4 << 20)
-	volume.free.Store(1 << 20)
+	volume.total.Store(uint64(10 * size))
+	volume.free.Store(16 * size / 10)
 	fake := backendtest.NewFake()
 	uploader := newUploader(t, spool, fake, service.Options{Volume: volume}, nil)
 
@@ -226,5 +232,125 @@ func TestPreparingPausesWhileFreeSpaceIsLowAndResumesAfter(t *testing.T) {
 	_ = uploader.Pass(context.Background())
 	if got := fake.SubmitCalls(); got != 1 {
 		t.Fatalf("submits = %d after space freed up, want the segment prepared and sent", got)
+	}
+}
+
+// A spool budget bounds the spool by the files it holds, so on a large
+// shared disk the oldest closed segments are evicted once the spool is
+// above its budget's watermark. Without a budget only the disk counts. The
+// active segment is never evicted.
+func TestASpoolBudgetEvictsOnASharedDiskThatHasRoom(t *testing.T) {
+	cases := []struct {
+		name        string
+		budget      int64
+		wantEvicted float64
+	}{
+		{"no budget", 0, 0},
+		// One byte: every closed segment is above the budget's watermark.
+		{"budget below the spool", 1, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spool, closed := spoolWith(t,
+				[]string{uploadertest.RequestEnd("a", 1)},
+				[]string{uploadertest.RequestEnd("b", 2)},
+			)
+			metrics, err := telemetry.NewMemory("fake")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := loadEnv(t, spoolEnv(t, spool.Dir, nil))
+			cfg.SpoolBudgetBytes = tc.budget
+			fake := backendtest.NewFake()
+			opts := service.Options{Metrics: metrics, Volume: roomyVolume(spool.Dir), Faults: fastFaults()}
+			uploader, err := service.NewUploader(cfg, fake, opts)
+			if err != nil {
+				t.Fatalf("NewUploader() error = %v", err)
+			}
+			t.Cleanup(func() { _ = uploader.Close() })
+
+			_ = uploader.Pass(context.Background())
+			if err := uploader.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if got, _ := metrics.Value(telemetry.SegmentsEvicted, nil); got != tc.wantEvicted {
+				t.Fatalf("segments_evicted = %v, want %v", got, tc.wantEvicted)
+			}
+			if left := roomyVolume(spool.Dir).segmentBytes(); left == 0 {
+				t.Fatal("every segment was evicted, want the active one kept")
+			}
+			if tc.budget > 0 && (!gone(closed[0]) || !gone(closed[1])) {
+				t.Fatal("a closed segment above the budget was kept")
+			}
+		})
+	}
+}
+
+// A small spool under its 85% watermark keeps preparing and exporting, with
+// a budget or without one. The fixed 512 MiB free-space floor paused
+// preparing on a spool under about 3.3 GiB, and relief only brings a spool
+// back to its watermark, so it never resumed.
+func TestASmallSpoolKeepsPreparingUnderItsWatermark(t *testing.T) {
+	cases := []struct {
+		name string
+		// budget is the spool budget; zero is none.
+		budget int64
+		// other is how many bytes of other files the spool holds.
+		other int64
+		// total and free, when set, size the volume; otherwise it is roomy.
+		total uint64
+		free  int64
+	}{
+		{"1 GiB budget holding 600 MiB", 1 << 30, 600 << 20, 0, 0},
+		{"2 GiB volume with 500 MiB free, no budget", 0, 0, 2 << 30, 500 << 20},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spool, _ := spoolWith(t, []string{uploadertest.RequestEnd("a", 1)})
+			if tc.other > 0 {
+				// Other files under the spool count against the budget at
+				// their apparent size; a sparse file takes no real disk space.
+				other := filepath.Join(spool.Dir, "other")
+				if err := os.MkdirAll(other, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				f, err := os.Create(filepath.Join(other, "data"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Truncate(tc.other); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			volume := roomyVolume(spool.Dir)
+			if tc.total > 0 {
+				volume.total.Store(tc.total)
+				volume.free.Store(tc.free)
+			}
+			metrics, err := telemetry.NewMemory("fake")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := loadEnv(t, spoolEnv(t, spool.Dir, nil))
+			cfg.SpoolBudgetBytes = tc.budget
+			fake := backendtest.NewFake()
+			uploader, err := service.NewUploader(cfg, fake, service.Options{Metrics: metrics, Volume: volume, Faults: fastFaults()})
+			if err != nil {
+				t.Fatalf("NewUploader() error = %v", err)
+			}
+			t.Cleanup(func() { _ = uploader.Close() })
+
+			_ = uploader.Pass(context.Background())
+			if got := fake.SubmitCalls(); got != 1 {
+				t.Fatalf("submits = %d, want the segment prepared and sent under the watermark", got)
+			}
+			if got, _ := metrics.Value(telemetry.SegmentsEvicted, nil); got != 0 {
+				t.Fatalf("segments_evicted = %v, want nothing evicted under the watermark", got)
+			}
+		})
 	}
 }

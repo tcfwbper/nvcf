@@ -24,6 +24,9 @@ func TestTuningSettingsDefaultToTodaysValues(t *testing.T) {
 		AuthMaxBackoff:       30 * time.Minute,
 		RetryAfterMax:        30 * time.Minute,
 	}
+	if cfg.SpoolBudgetBytes != 0 {
+		t.Fatalf("spool budget = %d, want none, so fullness is measured on the filesystem only", cfg.SpoolBudgetBytes)
+	}
 	if cfg.Faults != wantFaults {
 		t.Fatalf("faults = %+v, want %+v; an unset resend count is nil so the fault handling default applies", cfg.Faults, wantFaults)
 	}
@@ -64,6 +67,10 @@ func TestTuningSettingsApply(t *testing.T) {
 		{"unconfirmed resends none", map[string]string{EnvUnconfirmedResends: "0"}, unconfirmedResends, 0},
 		{"unconfirmed resends", map[string]string{EnvUnconfirmedResends: "3"}, unconfirmedResends, 3},
 		{"unconfirmed resends highest", map[string]string{EnvUnconfirmedResends: "10"}, unconfirmedResends, 10},
+		{"spool budget", map[string]string{EnvSpoolBudgetBytes: " 2147483648 "}, func(c Config) any { return c.SpoolBudgetBytes }, int64(2) << 30},
+		{"spool budget lowest", map[string]string{EnvSpoolBudgetBytes: "1073741824"}, func(c Config) any { return c.SpoolBudgetBytes }, int64(1) << 30},
+		{"spool budget highest", map[string]string{EnvSpoolBudgetBytes: "1125899906842624"}, func(c Config) any { return c.SpoolBudgetBytes }, int64(1) << 50},
+		{"spool budget zero is none", map[string]string{EnvSpoolBudgetBytes: "0"}, func(c Config) any { return c.SpoolBudgetBytes }, int64(0)},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -121,6 +128,13 @@ func TestBadTuningSettingsStopStartupByName(t *testing.T) {
 		{EnvUnconfirmedResends, "11"},
 		{EnvUnconfirmedResends, "two"},
 		{EnvUnconfirmedResends, "1.5"},
+		{EnvSpoolBudgetBytes, "1073741823"},
+		{EnvSpoolBudgetBytes, "1125899906842625"},
+		{EnvSpoolBudgetBytes, "-1"},
+		{EnvSpoolBudgetBytes, "2Gi"},
+		{EnvSpoolBudgetBytes, "2GiB"},
+		{EnvSpoolBudgetBytes, "2e9"},
+		{EnvSpoolBudgetBytes, "two"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name+"="+tc.value, func(t *testing.T) {

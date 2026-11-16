@@ -145,11 +145,15 @@ func (s spoolSegments) Evictable() ([]diskguard.Candidate, error) {
 		if !ok {
 			continue
 		}
-		bytes := item.Size
+		// Sized as the files take disk, the unit the spool budget measures,
+		// so what relief counts as freed is freed.
+		bytes := diskguard.DiskBytes(item.Path, item.Size)
 		if id, isSegment := strings.CutPrefix(key, evictSegment); isSegment {
 			seg, _ := s.u.store.Segment(id)
 			for _, dest := range seg.Destinations {
-				bytes += dest.Transport.Bytes
+				if dest.Transport.Path != "" {
+					bytes += diskguard.DiskBytes(dest.Transport.Path, dest.Transport.Bytes)
+				}
 			}
 		}
 		out = append(out, diskguard.Candidate{Key: key, Bytes: bytes, ModTime: item.ModTime})

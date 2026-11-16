@@ -6,6 +6,7 @@ package diskguard_test
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"math"
 	"os"
@@ -28,9 +29,10 @@ func (v *fakeVolume) Usage() (diskguard.Usage, error) { return v.usage, nil }
 // order.
 type fakeStore struct {
 	kind string
-	// volume, when set, gets the freed space back on each removal: the
-	// item's diskBytes entry, or its logical size.
+	// volume, and budget when set, get the freed space back on each
+	// removal: the item's diskBytes entry, or its logical size.
 	volume    *fakeVolume
+	budget    *fakeBudget
 	diskBytes map[string]int64
 	// partial frees this many bytes for a key whose removal fails.
 	partial    map[string]int64
@@ -53,22 +55,18 @@ func (s *fakeStore) drop(key string) error {
 	}
 	s.attempts[key]++
 	if err := s.fail[key]; err != nil {
-		if s.volume != nil {
-			s.volume.usage.Free += uint64(s.partial[key])
-		}
+		s.free(s.partial[key])
 		return err
 	}
 	for i, item := range s.items {
 		if item.Key == key {
 			s.items = append(s.items[:i], s.items[i+1:]...)
 			*s.removed = append(*s.removed, s.kind+":"+key)
-			if s.volume != nil {
-				freed, ok := s.diskBytes[key]
-				if !ok {
-					freed = item.Bytes
-				}
-				s.volume.usage.Free += uint64(freed)
+			freed, ok := s.diskBytes[key]
+			if !ok {
+				freed = item.Bytes
 			}
+			s.free(freed)
 			if s.unsynced[key] {
 				return fmt.Errorf("remove %s: %w", key, diskguard.ErrDeletedNotSynced)
 			}
@@ -76,6 +74,17 @@ func (s *fakeStore) drop(key string) error {
 		}
 	}
 	return errors.New("unknown key")
+}
+
+// free gives freed bytes back to the volume and to the budget, as a real
+// deletion frees them on the filesystem and under the spool's roots.
+func (s *fakeStore) free(freed int64) {
+	if s.volume != nil {
+		s.volume.usage.Free += uint64(freed)
+	}
+	if s.budget != nil {
+		s.budget.held -= freed
+	}
 }
 
 type metrics struct {
@@ -95,7 +104,9 @@ func item(key string, bytes int64, age time.Duration) diskguard.Candidate {
 }
 
 type world struct {
-	volume     *fakeVolume
+	volume *fakeVolume
+	// budget, when set, is the spool's own size next to its filesystem.
+	budget     *fakeBudget
 	quarantine *fakeStore
 	segments   *fakeStore
 	removed    []string
@@ -111,7 +122,12 @@ func newWorld(total, free uint64) *world {
 
 func (w *world) guard(t *testing.T, cfg diskguard.Config) *diskguard.Guard {
 	t.Helper()
-	g, err := diskguard.New(cfg, w.volume, w.quarantine, w.segments, diskguard.Options{Counter: w.metrics, Gauges: w.metrics})
+	opts := diskguard.Options{Counter: w.metrics, Gauges: w.metrics}
+	if w.budget != nil {
+		opts.Budget = w.budget
+		w.quarantine.budget, w.segments.budget = w.budget, w.budget
+	}
+	g, err := diskguard.New(cfg, w.volume, w.quarantine, w.segments, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -188,7 +204,9 @@ func TestAllowPrepare(t *testing.T) {
 		want        diskguard.PauseReason
 	}{
 		{"room to prepare", 4096 * mib, 2048 * mib, 30 << 20, 3, diskguard.PauseNone},
-		{"below the floor", 2048 * mib, 500 * mib, 30 << 20, 0, diskguard.PauseFreeSpace},
+		// 500 MiB free is under 512 MiB, but the floor of a small volume is
+		// at most half of the 15% its watermark leaves free.
+		{"small volume under its watermark", 2048 * mib, 500 * mib, 30 << 20, 0, diskguard.PauseNone},
 		{"twice the estimate is above the floor", 2048 * mib, 900 * mib, 600 << 20, 0, diskguard.PauseFreeSpace},
 		{"prepare ahead is full", 4096 * mib, 2048 * mib, 30 << 20, 16, diskguard.PausePrepareAhead},
 		{"between the watermarks", 100 * 1024 * mib, 12 * 1024 * mib, 1, 0, diskguard.PauseNone},
@@ -422,9 +440,12 @@ func TestQuarantineDirectory(t *testing.T) {
 		t.Fatalf("Entries: %v", err)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
-	if len(entries) != 2 || entries[0].Key != "rejects/seg-1.jsonl.gz" || entries[0].Bytes != 7 ||
-		entries[1].Key != "seg-3" || entries[1].Bytes != 60 || entries[1].ModTime.IsZero() {
-		t.Fatalf("entries = %+v, want the reject artifact (7 bytes) and seg-3 (60 bytes)", entries)
+	// An entry takes the space its files and directory take on disk.
+	rejectBytes := diskguard.DiskBytes(filepath.Join(q.RejectsDir(), "seg-1.jsonl.gz"), 7)
+	entryBytes := treeDiskBytes(t, filepath.Join(spool, ".rtu-quarantine", "seg-3"))
+	if len(entries) != 2 || entries[0].Key != "rejects/seg-1.jsonl.gz" || entries[0].Bytes != rejectBytes ||
+		entries[1].Key != "seg-3" || entries[1].Bytes != entryBytes || entries[1].ModTime.IsZero() {
+		t.Fatalf("entries = %+v, want the reject artifact (%d bytes) and seg-3 (%d bytes)", entries, rejectBytes, entryBytes)
 	}
 
 	for _, bad := range []string{"../escape", "rejects/../../escape", "", "rejects", "a/b/c"} {
@@ -744,4 +765,22 @@ func TestCheckWithAnUnreadableQuarantineStillReportsTheWatermark(t *testing.T) {
 	if !report.AboveWatermark || len(w.removed) != 0 {
 		t.Fatalf("report = %+v, removed %v; want the spool reported above the watermark and nothing deleted", report, w.removed)
 	}
+}
+
+// treeDiskBytes adds up the space root and everything under it take on
+// disk.
+func treeDiskBytes(t *testing.T, root string) int64 {
+	t.Helper()
+	var total int64
+	err := filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		total += diskguard.DiskBytes(path, 0)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return total
 }

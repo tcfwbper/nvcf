@@ -491,7 +491,11 @@ func (u *Uploader) open(ctx context.Context) error {
 	if volume == nil {
 		volume = diskguard.StatVolume(u.cfg.SourceDir)
 	}
-	u.guard, err = diskguard.New(guardConfig, volume, u.quarantine, spoolSegments{u: u}, diskguard.Options{Counter: counterFor(u.metrics), Gauges: gaugesFor(u.metrics)})
+	guardOptions := diskguard.Options{Counter: counterFor(u.metrics), Gauges: gaugesFor(u.metrics)}
+	if u.cfg.SpoolBudgetBytes > 0 {
+		guardOptions.Budget = diskguard.SpoolBudget(u.cfg.SpoolBudgetBytes, u.cfg.SourceDir, u.cfg.StateDir, u.cfg.QuarantineDir)
+	}
+	u.guard, err = diskguard.New(guardConfig, volume, u.quarantine, spoolSegments{u: u}, guardOptions)
 	return err
 }
 

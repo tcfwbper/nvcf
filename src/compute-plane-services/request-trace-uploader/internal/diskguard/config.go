@@ -43,20 +43,25 @@ const (
 type Config struct {
 	// MinFreeBytes is the least free space preparing leaves. Before a
 	// transport is written, free space must be at least the larger of twice
-	// the transport estimate and this floor.
+	// the transport estimate and this floor. The floor is at most half the
+	// free share the high watermark leaves of the spool, the smaller of the
+	// filesystem and the budget, so a small spool that relief brings back
+	// to the watermark can prepare again.
 	MinFreeBytes int64
 	// PrepareAhead bounds the prepared segments waiting for a batch. It must
 	// be at least the batch size, so a full batch can form.
 	PrepareAhead int
-	// HighWatermark is the used fraction of the spool's filesystem above
-	// which preparing pauses and Policy applies. The whole filesystem
-	// counts, so the spool needs a volume of its own (see the package doc).
+	// HighWatermark is the used fraction of the spool above which preparing
+	// pauses and Policy applies. It applies to the spool's filesystem and,
+	// when the guard has one, its budget; the fuller one counts (see the
+	// package doc).
 	HighWatermark float64
 	// LowWatermark is the used fraction Policy frees the spool down to once
 	// it is above HighWatermark. It must be above 0 and below HighWatermark.
 	LowWatermark float64
 	Policy       Policy
-	// QuarantineMaxFraction bounds quarantine to a fraction of the spool.
+	// QuarantineMaxFraction bounds quarantine to a fraction of the spool:
+	// its budget when that is smaller than the filesystem.
 	QuarantineMaxFraction float64
 	// QuarantineMaxAge bounds how long a quarantined entry is kept.
 	QuarantineMaxAge time.Duration

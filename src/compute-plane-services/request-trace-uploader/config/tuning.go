@@ -10,9 +10,9 @@ import (
 	"time"
 )
 
-// Tuning settings let an operator change batching and fault handling with a
-// restart instead of a new build. Each default is the value the uploader
-// used before the setting existed.
+// Tuning settings let an operator change batching, fault handling and the
+// spool budget with a restart instead of a new build. Each default is the
+// value the uploader used before the setting existed.
 const (
 	// EnvCreatesPerMinute is the per-pod budget for creating backend jobs.
 	EnvCreatesPerMinute = "REQUEST_TRACE_UPLOADER_CREATES_PER_MINUTE"
@@ -41,6 +41,11 @@ const (
 	// could not confirm is sent again before its segment is quarantined,
 	// on a backend that cannot take a resend safely.
 	EnvUnconfirmedResends = "REQUEST_TRACE_UPLOADER_UNCONFIRMED_RESENDS"
+	// EnvSpoolBudgetBytes is the spool's own size, as whole bytes, such as
+	// the size limit of its emptyDir. The disk guard then measures the
+	// files the spool holds against it as well as the filesystem. Unset or
+	// 0 measures the filesystem only.
+	EnvSpoolBudgetBytes = "REQUEST_TRACE_UPLOADER_SPOOL_BUDGET_BYTES"
 
 	DefaultCreatesPerMinute     = 30
 	DefaultCreateBurst          = 1
@@ -70,6 +75,11 @@ const (
 	// maxUnconfirmedResends bounds EnvUnconfirmedResends. Unset uses the
 	// fault handling default of 2.
 	maxUnconfirmedResends = 10
+	// minSpoolBudgetBytes is twice the disk guard's 512 MiB free-space
+	// floor, so a budget leaves room to prepare, and a unit mistake, such
+	// as 2 meant as GiB, stops startup.
+	minSpoolBudgetBytes = int64(1) << 30
+	maxSpoolBudgetBytes = int64(1) << 50
 )
 
 // BatchPolicy bounds each upload batch. A zero field, also the value when
@@ -171,6 +181,21 @@ func strictByteSize(lookup LookupFunc, name string, minimum, maximum int64) (int
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed < minimum || parsed > maximum {
 		return 0, fmt.Errorf("%s must be whole bytes, with no unit, from %d to %d", name, minimum, maximum)
+	}
+	return parsed, nil
+}
+
+// spoolBudgetValue reads the spool budget. Unset or 0 is no budget. Any
+// other value out of range, or with a unit, is a startup error that names
+// the setting, never a fallback.
+func spoolBudgetValue(lookup LookupFunc) (int64, error) {
+	value := strings.TrimSpace(valueOrDefault(lookup, EnvSpoolBudgetBytes, ""))
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed != 0 && (parsed < minSpoolBudgetBytes || parsed > maxSpoolBudgetBytes) {
+		return 0, fmt.Errorf("%s must be 0 for no budget, or whole bytes with no unit from %d to %d", EnvSpoolBudgetBytes, minSpoolBudgetBytes, maxSpoolBudgetBytes)
 	}
 	return parsed, nil
 }

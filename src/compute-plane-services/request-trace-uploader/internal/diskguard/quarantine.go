@@ -147,9 +147,9 @@ func (q *Quarantine) Entries() ([]Candidate, error) {
 		if err != nil {
 			return nil, fmt.Errorf("stat quarantine entry: %w", err)
 		}
-		size, err := treeSize(filepath.Join(q.dir, item.Name()))
+		size, err := treeSize(filepath.Join(q.dir, item.Name()), map[fileID]bool{})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("measure quarantine entry: %w", err)
 		}
 		entries = append(entries, Candidate{Key: item.Name(), Bytes: size, ModTime: info.ModTime()})
 	}
@@ -167,9 +167,9 @@ func (q *Quarantine) rejects() ([]Candidate, error) {
 		if err != nil {
 			return nil, fmt.Errorf("stat reject artifact: %w", err)
 		}
-		size, err := treeSize(filepath.Join(q.RejectsDir(), item.Name()))
+		size, err := treeSize(filepath.Join(q.RejectsDir(), item.Name()), map[fileID]bool{})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("measure quarantine entry: %w", err)
 		}
 		entries = append(entries, Candidate{
 			Key:     RejectsDirName + "/" + item.Name(),
@@ -240,25 +240,38 @@ func validEntryName(name string) bool {
 	return name != "" && name != "." && name != ".." && name != RejectsDirName && !strings.ContainsAny(name, `/\`)
 }
 
-func treeSize(root string) (int64, error) {
+// treeSize adds up the space root and everything under it take on disk,
+// as the kubelet counts an emptyDir: files, directories and links, with a
+// file seen under another name counted once. A file or directory that is
+// gone by the time the walk reaches it, such as one deleted meanwhile,
+// holds nothing.
+func treeSize(root string, seen map[fileID]bool) (int64, error) {
 	var size int64
 	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
-		if d.Type().IsRegular() {
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			size += info.Size()
+		info, err := d.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
 		}
+		if err != nil {
+			return err
+		}
+		bytes, id, linked := diskUsage(info)
+		if linked {
+			if seen[id] {
+				return nil
+			}
+			seen[id] = true
+		}
+		size += bytes
 		return nil
 	})
-	if err != nil {
-		return 0, fmt.Errorf("measure quarantine entry: %w", err)
-	}
-	return size, nil
+	return size, err
 }
 
 func syncDir(dir string) error {

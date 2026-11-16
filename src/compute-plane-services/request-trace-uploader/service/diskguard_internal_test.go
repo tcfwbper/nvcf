@@ -58,6 +58,26 @@ func (f evictionFixture) discover(t *testing.T, sha string, size int64, mtime ti
 	return seg
 }
 
+// An eviction candidate is sized as the space its files take on disk, the
+// unit the spool budget measures, so what relief counts as freed is freed.
+func TestEvictionCandidatesAreSizedAsTheyTakeDisk(t *testing.T) {
+	f := newEvictionFixture(t)
+	size, mtime := f.fileIdentity(t)
+	want := diskguard.DiskBytes(f.closed, size)
+	if want == size {
+		t.Skip("this filesystem allocates a small file exactly its length")
+	}
+	seg := f.discover(t, strings.Repeat("4", 64), size, mtime)
+
+	candidates, err := spoolSegments{u: f.u}.Evictable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].Key != evictSegment+seg.ID || candidates[0].Bytes != want {
+		t.Fatalf("Evictable() = %+v, want %s with %d bytes, the space it takes on disk (its length is %d)", candidates, evictSegment+seg.ID, want, size)
+	}
+}
+
 func (f evictionFixture) fileIdentity(t *testing.T) (int64, time.Time) {
 	t.Helper()
 	info, err := os.Stat(f.closed)

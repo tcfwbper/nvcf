@@ -132,6 +132,10 @@ type Config struct {
 	// Spool bounds spool use: when data is deleted to keep the spool from
 	// filling, and how much free space preparing leaves.
 	Spool SpoolPolicy
+	// SpoolBudgetBytes is the spool's own size, such as its emptyDir size
+	// limit. Zero, also the value when its setting is unset, measures
+	// fullness on the spool's filesystem only.
+	SpoolBudgetBytes int64
 }
 
 // ObjectStorePolicy configures the generic S3-compatible backend. Bucket and
@@ -286,6 +290,10 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 	if err != nil {
 		return Config{}, nil, err
 	}
+	spoolBudget, err := spoolBudgetValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
 
 	return Config{
 		SourceDir:     sourceDir,
@@ -318,6 +326,7 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		Batch:            batchPolicy,
 		Faults:           faultPolicy,
 		Spool:            spool,
+		SpoolBudgetBytes: spoolBudget,
 	}, warnings, nil
 }
 

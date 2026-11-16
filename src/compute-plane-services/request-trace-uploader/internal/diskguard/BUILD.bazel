@@ -3,6 +3,9 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "diskguard",
     srcs = [
+        "alloc_other.go",
+        "alloc_unix.go",
+        "budget.go",
         "config.go",
         "guard.go",
         "quarantine.go",
@@ -21,6 +24,8 @@ alias(
 go_test(
     name = "diskguard_test",
     srcs = [
+        "budget_alloc_test.go",
+        "budget_test.go",
         "guard_test.go",
         "quarantine_internal_test.go",
     ],

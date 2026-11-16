@@ -7,11 +7,16 @@
 // first, until the spool is down to the low watermark. Every deletion is
 // counted, because each one is data that will not reach its destination.
 //
-// Usage is measured on the whole filesystem that holds the spool, so the
-// spool needs a volume of its own. On a disk it shares with other data,
-// such as an emptyDir on the node's disk, that data counts as used: the
-// guard would pause preparing and delete segments without bringing usage
-// below the watermark.
+// Usage is measured on the whole filesystem that holds the spool. On a disk
+// the spool shares with other data, such as an emptyDir on the node's disk,
+// that data counts as used, and the spool's own size limit is not seen. A
+// budget fixes both: the files the spool holds are measured against the
+// spool's own size as well, and the fuller of the budget and the filesystem
+// sets the watermark, while the free-space floor holds in both.
+//
+// The free-space floor is at most half the share of the spool that the high
+// watermark leaves free, of the smaller of the filesystem and the budget, so
+// a small spool that relief brings back to its watermark prepares again.
 package diskguard
 
 import (
@@ -113,6 +118,9 @@ type Options struct {
 	Counter Counter
 	Gauges  Gauges
 	Logger  *slog.Logger
+	// Budget, when set, bounds the spool to its own size next to its
+	// filesystem.
+	Budget Budget
 }
 
 // Guard applies the disk rules. Its methods are safe to call at any time;
@@ -122,6 +130,7 @@ type Guard struct {
 	mu         sync.Mutex
 	cfg        Config
 	volume     Volume
+	budget     Budget
 	quarantine QuarantineStore
 	segments   Segments
 	counter    Counter
@@ -137,6 +146,7 @@ func New(cfg Config, volume Volume, quarantine QuarantineStore, segments Segment
 	g := &Guard{
 		cfg:        cfg,
 		volume:     volume,
+		budget:     opts.Budget,
 		quarantine: quarantine,
 		segments:   segments,
 		counter:    opts.Counter,
@@ -166,14 +176,14 @@ func (g *Guard) AllowPrepare(estimate int64, waiting int) (Decision, error) {
 	if waiting >= g.cfg.PrepareAhead {
 		return Decision{Reason: PausePrepareAhead}, nil
 	}
-	usage, err := g.volume.Usage()
+	r, err := g.room()
 	if err != nil {
 		return Decision{}, err
 	}
-	if g.aboveWatermark(usedBytes(usage), usage.Total) {
+	if r.excess > 0 {
 		return Decision{Reason: PauseHighWatermark}, nil
 	}
-	if int64(usage.Free) < max(2*estimate, g.cfg.MinFreeBytes) {
+	if r.free < max(2*estimate, r.floor) {
 		return Decision{Reason: PauseFreeSpace}, nil
 	}
 	return Decision{Allowed: true}, nil
@@ -188,15 +198,22 @@ func (g *Guard) Check(now time.Time) (Report, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	var report Report
-	usage, err := g.volume.Usage()
-	if err != nil {
-		return report, err
+	r, measureErr := g.room()
+	if measureErr != nil && !errors.As(measureErr, new(budgetError)) {
+		return report, measureErr
 	}
+	errs := []error{measureErr}
+	budgetReported := measureErr != nil
 	entries, listErr := g.quarantineEntries()
-	_, err = g.boundQuarantine(now, usage.Total, entries, true, &report)
-	report.AboveWatermark = g.aboveWatermark(usedBytes(usage)-report.FreedBytes, usage.Total)
+	_, err := g.boundQuarantine(now, r.total, entries, true, &report)
+	errs = append(errs, listErr, err)
+	l := r.load
+	if report.FreedBytes > 0 {
+		l = g.measureAgain(l.less(report.FreedBytes), &budgetReported, &errs)
+	}
+	report.AboveWatermark = l.above() != volumes{}
 	g.logDeleted(report)
-	return report, errors.Join(listErr, err)
+	return report, errors.Join(errs...)
 }
 
 // Enforce first bounds quarantine: entries older than QuarantineMaxAge go,
@@ -204,23 +221,36 @@ func (g *Guard) Check(now time.Time) (Report, error) {
 // the high watermark, it deletes per Policy, oldest first, until the spool
 // is down to the low watermark, so a writer that keeps writing does not
 // trigger a deletion on every pass. Between the two watermarks nothing is
-// deleted. Every deletion is counted. Call it only while no segment is being
-// prepared.
+// deleted. With a budget, each of the budget and the filesystem that is
+// above its high watermark is freed to its own low watermark. Every deletion
+// is counted. Call it only while no segment is being prepared.
 func (g *Guard) Enforce(now time.Time) (Report, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	var report Report
-	usage, err := g.volume.Usage()
-	if err != nil {
+	r, err := g.room()
+	if err != nil && !errors.As(err, new(budgetError)) {
 		return report, err
 	}
+	// A budget that cannot be measured must not stop relief either: the
+	// filesystem was measured, so its pass still runs.
+	errs := []error{err}
+	budgetReported := err != nil
 	entries, listErr := g.quarantineEntries()
-	kept, err := g.boundQuarantine(now, usage.Total, entries, false, &report)
-	errs := []error{listErr, err}
-	used := usedBytes(usage) - report.FreedBytes
-	if g.aboveWatermark(used, usage.Total) {
+	kept, err := g.boundQuarantine(now, r.total, entries, false, &report)
+	errs = append(errs, listErr, err)
+	l := r.load
+	if report.FreedBytes > 0 {
+		// A deletion can free less than it was sized at, such as a file
+		// still linked under another name, so the spool is measured again.
+		l = g.measureAgain(l.less(report.FreedBytes), &budgetReported, &errs)
+	}
+	// A volume still above its high watermark once quarantine is bounded
+	// starts relief, which frees it to its low watermark.
+	if started := l.above(); started != (volumes{}) {
+		_, need := started.of(l)
 		report.AboveWatermark = true
-		errs = append(errs, g.relieve(used-watermarkBytes(g.cfg.LowWatermark, usage.Total), kept, &report))
+		errs = append(errs, g.relieve(need, l, started, kept, &report, &budgetReported))
 	}
 	g.logDeleted(report)
 	return report, errors.Join(errs...)
@@ -289,19 +319,41 @@ func (g *Guard) logDeleted(report Report) {
 	}
 }
 
-// relieve frees need bytes, enough to reach the low watermark, per the
-// policy: quarantine first, then the oldest closed segments.
-func (g *Guard) relieve(need int64, quarantine []Candidate, report *Report) error {
+// relieve frees need bytes, enough to bring the volumes that started relief
+// down to their low watermarks, per the policy: quarantine first, then the
+// oldest closed segments. l is how far each volume is above its watermarks
+// now; budgetReported says a budget measuring error was already reported.
+func (g *Guard) relieve(need int64, l load, started volumes, quarantine []Candidate, report *Report, budgetReported *bool) error {
 	if g.cfg.Policy == PolicyNone {
 		g.logger.Warn("spool above the high watermark; preparing paused and nothing deleted by policy")
 		return nil
 	}
-	freed := int64(0)
 	var errs []error
+	// freed counts the bytes deleted since the last measure, by their sizes.
+	freed := int64(0)
+	// measure measures the spool again and reports whether the target is
+	// met. A deletion can free more or less space than it was sized at, such
+	// as a small file that fills a whole block, a file still linked under
+	// another name, or a removal that failed part way, so sizes alone never
+	// end relief or start on segments.
+	measure := func() bool {
+		l = g.measureAgain(l.less(freed), budgetReported, &errs)
+		_, need = started.of(l)
+		freed = 0
+		return need <= 0
+	}
+	// settled measures only when something was deleted since the last
+	// measure.
+	settled := func() bool {
+		if freed > 0 {
+			return measure()
+		}
+		return need <= 0
+	}
 	if g.cfg.Policy == PolicyQuarantineThenOldest {
 		for _, e := range quarantine {
-			if freed >= need {
-				break
+			if freed >= need && settled() {
+				return errors.Join(errs...)
 			}
 			gone, err := g.removeQuarantine(e, report)
 			errs = append(errs, err)
@@ -310,42 +362,35 @@ func (g *Guard) relieve(need int64, quarantine []Candidate, report *Report) erro
 			}
 		}
 	}
-	if freed < need {
-		// A deleted file can free more space than its length, such as a
-		// small file that fills a whole block, and a removal that failed part
-		// way can free space it does not report, so usage is measured again
-		// before a segment, which may not have been sent, is evicted.
-		if usage, err := g.volume.Usage(); err != nil {
-			errs = append(errs, fmt.Errorf("measure spool volume: %w", err))
-		} else {
-			need, freed = usedBytes(usage)-watermarkBytes(g.cfg.LowWatermark, usage.Total), 0
-		}
+	// A segment may not have been sent, so it goes only once the spool is
+	// measured to need it, including space a failed removal freed.
+	if measure() {
+		return errors.Join(errs...)
 	}
-	if freed < need {
-		segments, err := g.segments.Evictable()
-		if err != nil {
-			return errors.Join(append(errs, err)...)
+	segments, err := g.segments.Evictable()
+	if err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	for _, s := range oldestFirst(segments) {
+		if freed >= need && settled() {
+			return errors.Join(errs...)
 		}
-		for _, s := range oldestFirst(segments) {
-			if freed >= need {
-				break
+		if err := g.segments.Evict(s.Key); err != nil {
+			errs = append(errs, fmt.Errorf("evict segment: %w", err))
+			if !errors.Is(err, ErrDeletedNotSynced) {
+				continue
 			}
-			if err := g.segments.Evict(s.Key); err != nil {
-				errs = append(errs, fmt.Errorf("evict segment: %w", err))
-				if !errors.Is(err, ErrDeletedNotSynced) {
-					continue
-				}
-			}
-			g.counter.Add(CounterSegmentsEvicted, 1)
-			report.SegmentsEvicted++
-			report.FreedBytes += s.Bytes
-			freed += s.Bytes
 		}
+		g.counter.Add(CounterSegmentsEvicted, 1)
+		report.SegmentsEvicted++
+		report.FreedBytes += s.Bytes
+		freed += s.Bytes
 	}
-	if freed < need {
-		g.logger.Error("spool still above the low watermark after deleting everything the policy allows",
-			"still_needed_bytes", need-freed)
+	if freed >= need && settled() {
+		return errors.Join(errs...)
 	}
+	g.logger.Error("spool still above the low watermark after deleting everything the policy allows",
+		"still_needed_bytes", need-freed)
 	return errors.Join(errs...)
 }
 
@@ -366,10 +411,10 @@ func (g *Guard) removeQuarantine(e Candidate, report *Report) (bool, error) {
 	return true, nil
 }
 
-// UpdateGauges sets the spool gauges from the volume and the segments not
-// yet done.
+// UpdateGauges sets the spool gauges from the fuller volume, the least free
+// space, and the segments not yet done.
 func (g *Guard) UpdateGauges(now time.Time, pending []Candidate) error {
-	usage, err := g.volume.Usage()
+	r, err := g.room()
 	if err != nil {
 		return err
 	}
@@ -385,16 +430,151 @@ func (g *Guard) UpdateGauges(now time.Time, pending []Candidate) error {
 	if !oldest.IsZero() {
 		age = max(now.Sub(oldest).Seconds(), 0)
 	}
-	g.gauges.Set(GaugeSpoolUsedBytes, float64(usedBytes(usage)))
-	g.gauges.Set(GaugeSpoolFreeBytes, float64(usage.Free))
+	g.gauges.Set(GaugeSpoolUsedBytes, float64(r.used))
+	g.gauges.Set(GaugeSpoolFreeBytes, float64(r.free))
 	g.gauges.Set(GaugePendingSegments, float64(len(pending)))
 	g.gauges.Set(GaugePendingBytes, float64(bytes))
 	g.gauges.Set(GaugeOldestPendingAge, age)
 	return nil
 }
 
-func (g *Guard) aboveWatermark(used int64, total uint64) bool {
-	return used > watermarkBytes(g.cfg.HighWatermark, total)
+// room is the spool's room across the filesystem and, when set, the
+// budget.
+type room struct {
+	// used is the fuller volume's used bytes.
+	used int64
+	// excess is how far the fuller volume is above its high watermark, in
+	// bytes; zero or less is at or below it.
+	excess int64
+	// load is how far each volume is above its watermarks, for relief.
+	load load
+	// free is the least free space of the volumes.
+	free int64
+	// total is the smallest volume, the size quarantine's share is of.
+	total uint64
+	// floor is the least free space preparing leaves.
+	floor int64
+}
+
+// room measures the filesystem and the budget. The fuller is the one
+// further above, or less far below, its high watermark. When only the
+// budget cannot be measured, it returns the filesystem's room with a
+// budgetError.
+func (g *Guard) room() (room, error) {
+	r, err := g.measure(g.volume)
+	if err != nil {
+		return room{}, err
+	}
+	var budgetErr error
+	if g.budget != nil {
+		size, held, err := g.budget.Held()
+		if err != nil {
+			budgetErr = budgetError{err}
+		} else {
+			excess := held - watermarkBytes(g.cfg.HighWatermark, uint64(size))
+			r.load.budget = pressure{excess: excess, need: held - watermarkBytes(g.cfg.LowWatermark, uint64(size))}
+			r.load.haveBudget = true
+			if excess > r.excess {
+				r.used, r.excess = held, excess
+			}
+			r.free = min(r.free, max(size-held, 0))
+			r.total = min(r.total, uint64(size))
+		}
+	}
+	// Relief may stop at the high watermark, as a deletion that fails part
+	// way does, so the floor must sit below the free share that watermark
+	// leaves, or a small spool never prepares again.
+	r.floor = min(g.cfg.MinFreeBytes, int64((1-g.cfg.HighWatermark)/2*float64(r.total)))
+	return r, budgetErr
+}
+
+// budgetError is a failure to measure the budget. The room returned with it
+// is the filesystem's alone, which relief may still use; preparing does not.
+type budgetError struct{ err error }
+
+func (e budgetError) Error() string { return "measure spool budget: " + e.err.Error() }
+
+func (e budgetError) Unwrap() error { return e.err }
+
+func (g *Guard) measure(v Volume) (room, error) {
+	usage, err := v.Usage()
+	if err != nil {
+		return room{}, err
+	}
+	used := usedBytes(usage)
+	excess := used - watermarkBytes(g.cfg.HighWatermark, usage.Total)
+	return room{
+		used:   used,
+		excess: excess,
+		load:   load{fs: pressure{excess: excess, need: used - watermarkBytes(g.cfg.LowWatermark, usage.Total)}},
+		free:   int64(usage.Free),
+		total:  usage.Total,
+	}, nil
+}
+
+// pressure is how far one volume is above its high watermark (excess) and
+// above its low watermark (need), in bytes; zero or less is at or below it.
+type pressure struct{ excess, need int64 }
+
+// load is the pressure on the filesystem and, when it was measured, the
+// budget.
+type load struct {
+	fs, budget pressure
+	haveBudget bool
+}
+
+// less is the load after freed bytes came off both volumes.
+func (l load) less(freed int64) load {
+	l.fs.excess, l.fs.need = l.fs.excess-freed, l.fs.need-freed
+	l.budget.excess, l.budget.need = l.budget.excess-freed, l.budget.need-freed
+	return l
+}
+
+// volumes says which volumes started relief.
+type volumes struct{ fs, budget bool }
+
+// above names the volumes above their high watermarks.
+func (l load) above() volumes {
+	return volumes{fs: l.fs.excess > 0, budget: l.haveBudget && l.budget.excess > 0}
+}
+
+// of is how far the volumes that started relief are still above their high
+// and low watermarks: the furthest of them. Relief frees each to its own
+// low watermark, so a volume only between its watermarks drives nothing.
+func (v volumes) of(l load) (excess, need int64) {
+	switch {
+	case v.fs && v.budget:
+		return max(l.fs.excess, l.budget.excess), max(l.fs.need, l.budget.need)
+	case v.fs:
+		return l.fs.excess, l.fs.need
+	case v.budget:
+		return l.budget.excess, l.budget.need
+	}
+	return 0, 0
+}
+
+// measureAgain measures the volumes again where it can. A volume that cannot
+// be measured keeps its estimate, so relief never moves to another volume's
+// target. A budget error is reported once per pass.
+func (g *Guard) measureAgain(estimate load, budgetReported *bool, errs *[]error) load {
+	r, err := g.room()
+	if err != nil && !errors.As(err, new(budgetError)) {
+		*errs = append(*errs, fmt.Errorf("measure spool: %w", err))
+		return estimate
+	}
+	next := estimate
+	next.fs = r.load.fs
+	if err != nil {
+		if !*budgetReported {
+			*errs = append(*errs, err)
+			*budgetReported = true
+		}
+		return next
+	}
+	if r.load.haveBudget {
+		next.budget, next.haveBudget = r.load.budget, true
+	}
+	return next
 }
 
 func watermarkBytes(fraction float64, total uint64) int64 {
