@@ -164,10 +164,12 @@ Helm values files to override registry, repository and tag fields, including
 mirrors with different repository names. The image index is used by CI; Helm
 consumes the existing values keys directly.
 
-Run the maintenance chart's defaults, indirect-image coverage and override tests:
+Run the image coverage test, which checks defaults, indirect images and
+ordinary overrides for every tracked chart, then this chart's own guards:
 
 ```sh
-NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestImageCatalogCharts/openbao$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestChartImageCoverage$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestNATSAndOpenBaoChartImageGuards/openbao_guards$' -count=1
 ```
 
 The test downloads dependencies in an isolated copy and Helm configuration.
