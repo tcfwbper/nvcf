@@ -150,6 +150,21 @@ func strictInt(lookup LookupFunc, name string, fallback, minimum, maximum int) (
 	return parsed, nil
 }
 
+// strictBytes parses a whole-bytes setting, such as 268435456 for 256 MiB,
+// within bounds. A unit suffix or any other bad value is an error and never
+// a fallback.
+func strictBytes(lookup LookupFunc, name string, fallback, minimum, maximum int64) (int64, error) {
+	value := strings.TrimSpace(valueOrDefault(lookup, name, ""))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < minimum || parsed > maximum {
+		return 0, fmt.Errorf("%s must be whole bytes, with no unit, from %d to %d", name, minimum, maximum)
+	}
+	return parsed, nil
+}
+
 // strictDuration parses a duration setting, such as "30s" or "1h", within
 // bounds. A bare number has no unit and is refused, as is any other bad
 // value: it is an error and never a fallback.

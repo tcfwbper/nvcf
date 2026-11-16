@@ -34,6 +34,10 @@ var (
 // source.
 const RejectsDirName = "rejects"
 
+// rejectTempSuffix ends the name of a reject artifact still being written;
+// transform.RejectFile writes under such a name and renames it when done.
+const rejectTempSuffix = ".tmp"
+
 // Quarantine is the quarantine directory on the spool volume:
 //
 //	<dir>/<segment id>/          a quarantined segment and its files
@@ -117,8 +121,8 @@ func moveInto(path, dir string) error {
 }
 
 // Entries lists every quarantined segment and every reject artifact, with
-// its size and modification time. A quarantine that does not exist yet is
-// empty.
+// its size and modification time. A reject artifact still being written is
+// marked Busy. A quarantine that does not exist yet is empty.
 func (q *Quarantine) Entries() ([]Candidate, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -167,7 +171,14 @@ func (q *Quarantine) rejects() ([]Candidate, error) {
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, Candidate{Key: RejectsDirName + "/" + item.Name(), Bytes: size, ModTime: info.ModTime()})
+		entries = append(entries, Candidate{
+			Key:     RejectsDirName + "/" + item.Name(),
+			Bytes:   size,
+			ModTime: info.ModTime(),
+			// A reject artifact is written under a temporary name and renamed
+			// once complete, so a temporary one may still be written.
+			Busy: strings.HasSuffix(item.Name(), rejectTempSuffix),
+		})
 	}
 	return entries, nil
 }

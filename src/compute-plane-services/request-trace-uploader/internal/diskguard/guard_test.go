@@ -6,6 +6,8 @@ package diskguard_test
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -121,9 +123,14 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	if err := defaults.Validate(); err != nil {
 		t.Fatalf("defaults invalid: %v", err)
 	}
-	if defaults.Policy != diskguard.PolicyQuarantineThenOldest || defaults.HighWatermark != 0.85 ||
-		defaults.QuarantineMaxFraction != 0.2 || defaults.QuarantineMaxAge != 7*24*time.Hour || defaults.PrepareAhead != 16 {
-		t.Fatalf("defaults = %+v, want the proposed values", defaults)
+	// Deletion is a near-full backstop: an alert at about 70% and a runbook
+	// come first. It starts at 85% and frees down to 75%, as the earlier
+	// uploader prunes, which leaves room for a 256 MiB segment on a 2 GiB
+	// spool when it starts.
+	if defaults.Policy != diskguard.PolicyQuarantineThenOldest || defaults.HighWatermark != 0.85 || defaults.LowWatermark != 0.75 ||
+		defaults.MinFreeBytes != 512<<20 || defaults.QuarantineMaxFraction != 0.2 || defaults.QuarantineMaxAge != 7*24*time.Hour ||
+		defaults.PrepareAhead != 16 {
+		t.Fatalf("defaults = %+v, want the decided values", defaults)
 	}
 	cases := []struct {
 		name   string
@@ -133,6 +140,11 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 		{"zero prepare ahead", func(c *diskguard.Config) { c.PrepareAhead = 0 }},
 		{"watermark zero", func(c *diskguard.Config) { c.HighWatermark = 0 }},
 		{"watermark one", func(c *diskguard.Config) { c.HighWatermark = 1 }},
+		{"low watermark zero", func(c *diskguard.Config) { c.LowWatermark = 0 }},
+		{"low watermark negative", func(c *diskguard.Config) { c.LowWatermark = -0.1 }},
+		{"low watermark equals the high one", func(c *diskguard.Config) { c.LowWatermark = c.HighWatermark }},
+		{"low watermark above the high one", func(c *diskguard.Config) { c.LowWatermark = 0.95 }},
+		{"low watermark not a number", func(c *diskguard.Config) { c.LowWatermark = math.NaN() }},
 		{"unknown policy", func(c *diskguard.Config) { c.Policy = "evict-newest" }},
 		{"empty policy", func(c *diskguard.Config) { c.Policy = "" }},
 		{"quarantine fraction zero", func(c *diskguard.Config) { c.QuarantineMaxFraction = 0 }},
@@ -179,12 +191,13 @@ func TestAllowPrepare(t *testing.T) {
 		{"below the floor", 2048 * mib, 500 * mib, 30 << 20, 0, diskguard.PauseFreeSpace},
 		{"twice the estimate is above the floor", 2048 * mib, 900 * mib, 600 << 20, 0, diskguard.PauseFreeSpace},
 		{"prepare ahead is full", 4096 * mib, 2048 * mib, 30 << 20, 16, diskguard.PausePrepareAhead},
-		{"above the high watermark", 100 * 1024 * mib, 10 * 1024 * mib, 1, 0, diskguard.PauseHighWatermark},
+		{"between the watermarks", 100 * 1024 * mib, 12 * 1024 * mib, 1, 0, diskguard.PauseNone},
+		{"above the high watermark", 100 * 1024 * mib, 5 * 1024 * mib, 1, 0, diskguard.PauseHighWatermark},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newWorld(tc.total, tc.free)
-			got, err := w.guard(t, diskguard.DefaultConfig()).AllowPrepare(tc.estimate, tc.waiting)
+			got, err := w.guard(t, watermarks(0.90, 0.80)).AllowPrepare(tc.estimate, tc.waiting)
 			if err != nil {
 				t.Fatalf("AllowPrepare: %v", err)
 			}
@@ -230,22 +243,61 @@ func TestQuarantineAboveItsShareOfTheSpoolIsEvictedOldestFirst(t *testing.T) {
 }
 
 func TestAboveTheWatermarkQuarantineGoesFirstThenTheOldestSegments(t *testing.T) {
-	// F25: 950 of 1000 bytes used; the watermark is 850, so 100 must go.
+	// F25: 950 of 1000 bytes used is above the 900 high watermark, so the
+	// spool is freed down to the 800 low watermark: 150 must go.
 	w := newWorld(1000, 50)
 	w.quarantine.items = []diskguard.Candidate{item("q-new", 40, time.Hour), item("q-old", 30, 2*time.Hour)}
 	w.segments.items = []diskguard.Candidate{item("s-mid", 60, 4*time.Hour), item("s-old", 50, 5*time.Hour), item("s-new", 70, 3*time.Hour)}
 
-	report, err := w.guard(t, diskguard.DefaultConfig()).Enforce(now)
+	report, err := w.guard(t, watermarks(0.90, 0.80)).Enforce(now)
 	if err != nil {
 		t.Fatalf("Enforce: %v", err)
 	}
-	if got := strings.Join(w.removed, ","); got != "quarantine:q-old,quarantine:q-new,segment:s-old" {
-		t.Fatalf("eviction order = %s, want quarantine oldest first, then the oldest segment", got)
+	if got := strings.Join(w.removed, ","); got != "quarantine:q-old,quarantine:q-new,segment:s-old,segment:s-mid" {
+		t.Fatalf("eviction order = %s, want quarantine oldest first, then the oldest segments down to the low watermark", got)
 	}
-	if !report.AboveWatermark || report.QuarantineEvicted != 2 || report.SegmentsEvicted != 1 || report.FreedBytes != 120 {
-		t.Fatalf("report = %+v, want 2 quarantine and 1 segment evicted, 120 bytes", report)
+	if !report.AboveWatermark || report.QuarantineEvicted != 2 || report.SegmentsEvicted != 2 || report.FreedBytes != 180 {
+		t.Fatalf("report = %+v, want 2 quarantine and 2 segments evicted, 180 bytes", report)
 	}
-	if w.metrics.counts[diskguard.CounterSegmentsEvicted] != 1 || w.metrics.counts[diskguard.CounterQuarantineEvicted] != 2 {
+	if w.metrics.counts[diskguard.CounterSegmentsEvicted] != 2 || w.metrics.counts[diskguard.CounterQuarantineEvicted] != 2 {
+		t.Fatalf("counts = %v, want every eviction counted", w.metrics.counts)
+	}
+}
+
+func TestBetweenTheWatermarksNothingIsEvicted(t *testing.T) {
+	// 880 of 1000 bytes used: above the 800 low watermark but not above the
+	// 900 high one, so nothing triggers a deletion.
+	w := newWorld(1000, 120)
+	w.quarantine.items = []diskguard.Candidate{item("q", 40, time.Hour)}
+	w.segments.items = []diskguard.Candidate{item("s", 70, time.Hour)}
+
+	report, err := w.guard(t, watermarks(0.90, 0.80)).Enforce(now)
+	if err != nil || report.AboveWatermark || len(w.removed) != 0 {
+		t.Fatalf("Enforce = %+v, %v, removed %v; want nothing deleted between the watermarks", report, err, w.removed)
+	}
+}
+
+func TestFreeingToTheLowWatermarkEvictsOnlyWhatIsListed(t *testing.T) {
+	// 950 of 1000 bytes used and a low watermark of 500: 450 must go, but
+	// only 180 bytes are listed. A segment in a batch that may have been
+	// sent is never listed, so the guard stops there and touches nothing else.
+	w := newWorld(1000, 50)
+	w.quarantine.items = []diskguard.Candidate{item("q", 30, time.Hour)}
+	w.segments.items = []diskguard.Candidate{item("s-new", 70, time.Hour), item("s-old", 80, 2*time.Hour)}
+	cfg := diskguard.DefaultConfig()
+	cfg.LowWatermark = 0.5
+
+	report, err := w.guard(t, cfg).Enforce(now)
+	if err != nil {
+		t.Fatalf("Enforce: %v", err)
+	}
+	if got := strings.Join(w.removed, ","); got != "quarantine:q,segment:s-old,segment:s-new" {
+		t.Fatalf("eviction order = %s, want every listed item, quarantine first, then oldest first", got)
+	}
+	if report.QuarantineEvicted != 1 || report.SegmentsEvicted != 2 || report.FreedBytes != 180 {
+		t.Fatalf("report = %+v, want 1 quarantine and 2 segments evicted, 180 bytes", report)
+	}
+	if w.metrics.counts[diskguard.CounterSegmentsEvicted] != 2 || w.metrics.counts[diskguard.CounterQuarantineEvicted] != 1 {
 		t.Fatalf("counts = %v, want every eviction counted", w.metrics.counts)
 	}
 }
@@ -258,7 +310,7 @@ func TestAnUnreadableQuarantineStillLetsTheWatermarkPassRun(t *testing.T) {
 	w.quarantine.entriesErr = unreadable
 	w.segments.items = []diskguard.Candidate{item("s-old", 150, 5*time.Hour), item("s-new", 70, 3*time.Hour)}
 
-	report, err := w.guard(t, diskguard.DefaultConfig()).Enforce(now)
+	report, err := w.guard(t, watermarks(0.85, 0.80)).Enforce(now)
 	if !errors.Is(err, unreadable) {
 		t.Fatalf("Enforce error = %v, want the quarantine listing error reported", err)
 	}
@@ -455,7 +507,8 @@ func TestAFailedQuarantineRemovalStillCountsTowardTheShare(t *testing.T) {
 		},
 		{
 			// 950 of 1000 bytes used: after the share pass frees 60, the
-			// watermark pass still needs 40 and takes a segment.
+			// spool is above the 850 high watermark, and the watermark pass
+			// takes a segment to reach the 800 low watermark.
 			name:        "over the share and above the watermark",
 			free:        50,
 			quarantine:  []diskguard.Candidate{item("stuck", 150, 3*time.Hour), item("other", 60, 2*time.Hour)},
@@ -471,7 +524,7 @@ func TestAFailedQuarantineRemovalStillCountsTowardTheShare(t *testing.T) {
 			busy := errors.New("entry busy")
 			w.quarantine.fail = map[string]error{"stuck": busy}
 
-			_, err := w.guard(t, diskguard.DefaultConfig()).Enforce(now)
+			_, err := w.guard(t, watermarks(0.85, 0.80)).Enforce(now)
 			if !errors.Is(err, busy) {
 				t.Fatalf("Enforce error = %v, want the failed removal reported", err)
 			}
@@ -489,11 +542,11 @@ func TestAFailedQuarantineRemovalStillCountsTowardTheShare(t *testing.T) {
 // its own copy, so it still deletes oldest first.
 func TestEvictionOrderDoesNotDependOnTheStoreSlice(t *testing.T) {
 	t.Run("segments", func(t *testing.T) {
-		// 950 of 1000 bytes used; the watermark is 850, so 100 must go.
+		// 950 of 1000 bytes used; freeing to the 850 low watermark takes 100.
 		w := newWorld(1000, 50)
 		w.segments.items = []diskguard.Candidate{item("old", 50, 5*time.Hour), item("middle", 60, 4*time.Hour), item("new", 70, 3*time.Hour)}
 
-		if _, err := w.guard(t, diskguard.DefaultConfig()).Enforce(now); err != nil {
+		if _, err := w.guard(t, watermarks(0.90, 0.85)).Enforce(now); err != nil {
 			t.Fatalf("Enforce: %v", err)
 		}
 		if got := strings.Join(w.removed, ","); got != "segment:old,segment:middle" {
@@ -516,20 +569,20 @@ func TestEvictionOrderDoesNotDependOnTheStoreSlice(t *testing.T) {
 // A deleted file can free more space than its length, such as a small reject
 // artifact that fills a whole block. Usage is measured again after quarantine
 // relief, so no segment, which may not have been sent, is evicted once the
-// spool is back under the watermark.
+// spool is back under the low watermark.
 func TestSegmentsAreNotEvictedOnceQuarantineReliefFreedEnoughSpace(t *testing.T) {
-	// 950 of 1000 bytes used; the watermark is 850, so 100 must go.
+	// 950 of 1000 bytes used; freeing to the 800 low watermark takes 150.
 	w := newWorld(1000, 50)
 	w.quarantine.items = []diskguard.Candidate{item("q-new", 10, time.Hour), item("q-old", 10, 2*time.Hour)}
-	w.quarantine.diskBytes = map[string]int64{"q-new": 60, "q-old": 60}
+	w.quarantine.diskBytes = map[string]int64{"q-new": 80, "q-old": 80}
 	w.segments.items = []diskguard.Candidate{item("s-mid", 60, 4*time.Hour), item("s-old", 50, 5*time.Hour)}
 
-	report, err := w.guard(t, diskguard.DefaultConfig()).Enforce(now)
+	report, err := w.guard(t, watermarks(0.85, 0.80)).Enforce(now)
 	if err != nil {
 		t.Fatalf("Enforce: %v", err)
 	}
 	if got := strings.Join(w.removed, ","); got != "quarantine:q-old,quarantine:q-new" {
-		t.Fatalf("evicted %s, want only the quarantine: it freed 120 bytes on disk", got)
+		t.Fatalf("evicted %s, want only the quarantine: it freed 160 bytes on disk", got)
 	}
 	if report.SegmentsEvicted != 0 {
 		t.Fatalf("report = %+v, want no segment evicted", report)
@@ -540,15 +593,155 @@ func TestSegmentsAreNotEvictedOnceQuarantineReliefFreedEnoughSpace(t *testing.T)
 // reports none. Usage is measured before any segment is evicted, so the
 // space it freed is seen.
 func TestSegmentsAreNotEvictedAfterAQuarantineRemovalThatFailedPartWay(t *testing.T) {
-	// 950 of 1000 bytes used; the watermark is 850, so 100 must go.
+	// 950 of 1000 bytes used; freeing to the 800 low watermark takes 150.
 	w := newWorld(1000, 50)
-	w.quarantine.items = []diskguard.Candidate{item("q-old", 130, 8*24*time.Hour)}
+	w.quarantine.items = []diskguard.Candidate{item("q-old", 160, 8*24*time.Hour)}
 	w.quarantine.fail = map[string]error{"q-old": errors.New("removed part of the entry")}
-	w.quarantine.partial = map[string]int64{"q-old": 130}
+	w.quarantine.partial = map[string]int64{"q-old": 160}
 	w.segments.items = []diskguard.Candidate{item("s-mid", 60, 4*time.Hour), item("s-old", 50, 5*time.Hour)}
 
-	report, _ := w.guard(t, diskguard.DefaultConfig()).Enforce(now)
+	report, _ := w.guard(t, watermarks(0.85, 0.80)).Enforce(now)
 	if report.SegmentsEvicted != 0 {
-		t.Fatalf("evicted %v, want no segment: the failed removal freed 130 bytes", w.removed)
+		t.Fatalf("evicted %v, want no segment: the failed removal freed 160 bytes", w.removed)
+	}
+}
+
+// Usage measured again after quarantine relief is still freed down to the
+// low watermark: a spool that is back under the high watermark but above
+// the low one loses its oldest segment.
+func TestReliefMeasuredAgainStillFreesToTheLowWatermark(t *testing.T) {
+	// 950 of 1000 bytes used. The two entries free 120 bytes on disk,
+	// leaving 830: under the 850 high watermark, above the 800 low one.
+	w := newWorld(1000, 50)
+	w.quarantine.items = []diskguard.Candidate{item("q-new", 10, time.Hour), item("q-old", 10, 2*time.Hour)}
+	w.quarantine.diskBytes = map[string]int64{"q-new": 60, "q-old": 60}
+	w.segments.items = []diskguard.Candidate{item("s-mid", 60, 4*time.Hour), item("s-old", 50, 5*time.Hour)}
+
+	report, err := w.guard(t, watermarks(0.85, 0.80)).Enforce(now)
+	if err != nil {
+		t.Fatalf("Enforce: %v", err)
+	}
+	if got := strings.Join(w.removed, ","); got != "quarantine:q-old,quarantine:q-new,segment:s-old" {
+		t.Fatalf("evicted %s, want the quarantine, then the oldest segment to reach the low watermark", got)
+	}
+	if report.SegmentsEvicted != 1 {
+		t.Fatalf("report = %+v, want one segment evicted", report)
+	}
+}
+
+// watermarks is the default config with these watermarks, for a test whose
+// numbers must not move with the defaults.
+func watermarks(high, low float64) diskguard.Config {
+	cfg := diskguard.DefaultConfig()
+	cfg.HighWatermark, cfg.LowWatermark = high, low
+	return cfg
+}
+
+func TestCheckBoundsQuarantineButNeverEvictsSegments(t *testing.T) {
+	// 950 of 1000 bytes used: the stale entry goes, and the spool is still
+	// above the 900 high watermark, which Check reports and leaves to
+	// Enforce. Check deletes no segment and no quarantine beyond its bounds.
+	w := newWorld(1000, 50)
+	w.quarantine.items = []diskguard.Candidate{item("stale", 30, 8*24*time.Hour), item("fresh", 40, time.Hour)}
+	w.segments.items = []diskguard.Candidate{item("s-old", 60, 2*time.Hour), item("s-new", 70, time.Hour)}
+
+	report, err := w.guard(t, watermarks(0.90, 0.80)).Check(now)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if got := strings.Join(w.removed, ","); got != "quarantine:stale" {
+		t.Fatalf("removed %s, want only the stale quarantine entry", got)
+	}
+	if !report.AboveWatermark || report.QuarantineEvicted != 1 || report.SegmentsEvicted != 0 {
+		t.Fatalf("report = %+v, want above the watermark with one quarantine entry removed", report)
+	}
+	if w.metrics.counts[diskguard.CounterQuarantineEvicted] != 1 || w.metrics.counts[diskguard.CounterSegmentsEvicted] != 0 {
+		t.Fatalf("counts = %v, want the removal counted and no segment evicted", w.metrics.counts)
+	}
+}
+
+func TestCheckBelowTheHighWatermarkReportsNothingDue(t *testing.T) {
+	// 880 of 1000 bytes used is under the 900 high watermark.
+	w := newWorld(1000, 120)
+	report, err := w.guard(t, watermarks(0.90, 0.80)).Check(now)
+	if err != nil || report.AboveWatermark || len(w.removed) != 0 {
+		t.Fatalf("Check = %+v, %v, removed %v; want nothing due", report, err, w.removed)
+	}
+}
+
+func TestOnlyEnforceRemovesARejectArtifactStillBeingWritten(t *testing.T) {
+	// A busy reject artifact is past its age and over quarantine's 200-byte
+	// share. Check runs while a prepare may be writing it, so it keeps it;
+	// Enforce runs while nothing is prepared, so a busy item is an orphan.
+	w := newWorld(1000, 700)
+	busy := item("rejects/.reject.1.tmp", 300, 8*24*time.Hour)
+	busy.Busy = true
+	w.quarantine.items = []diskguard.Candidate{busy}
+	g := w.guard(t, diskguard.DefaultConfig())
+
+	if _, err := g.Check(now); err != nil || len(w.removed) != 0 {
+		t.Fatalf("Check removed %v (%v), want the busy artifact kept", w.removed, err)
+	}
+	if _, err := g.Enforce(now); err != nil || strings.Join(w.removed, ",") != "quarantine:rejects/.reject.1.tmp" {
+		t.Fatalf("Enforce removed %v (%v), want the orphaned artifact removed", w.removed, err)
+	}
+}
+
+func TestCheckCountsARejectArtifactStillBeingWrittenTowardTheQuarantineShare(t *testing.T) {
+	// Quarantine may hold 200 of the 1000-byte spool. The busy artifact and
+	// the completed entry hold 300 together, so Check removes the completed
+	// entry and keeps the busy one.
+	w := newWorld(1000, 700)
+	busy := item("rejects/.reject.1.tmp", 150, time.Minute)
+	busy.Busy = true
+	w.quarantine.items = []diskguard.Candidate{busy, item("done", 150, time.Hour)}
+
+	report, err := w.guard(t, diskguard.DefaultConfig()).Check(now)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if got := strings.Join(w.removed, ","); got != "quarantine:done" || report.QuarantineEvicted != 1 {
+		t.Fatalf("removed %s (report %+v), want only the completed entry", got, report)
+	}
+}
+
+func TestQuarantineMarksARejectArtifactStillBeingWrittenBusy(t *testing.T) {
+	q := diskguard.NewQuarantine(filepath.Join(t.TempDir(), "quarantine"))
+	if err := os.MkdirAll(q.RejectsDir(), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"seg-1.jsonl.gz", ".reject.123.tmp"} {
+		if err := os.WriteFile(filepath.Join(q.RejectsDir(), name), []byte("x"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := q.Entries()
+	if err != nil {
+		t.Fatalf("Entries: %v", err)
+	}
+	busy := map[string]bool{}
+	for _, e := range entries {
+		busy[e.Key] = e.Busy
+	}
+	want := map[string]bool{"rejects/seg-1.jsonl.gz": false, "rejects/.reject.123.tmp": true}
+	if !maps.Equal(busy, want) {
+		t.Fatalf("busy by key = %v, want %v", busy, want)
+	}
+}
+
+// Check deletes no segment, but it still measures the spool, so an
+// unreadable quarantine does not hide that Enforce is due.
+func TestCheckWithAnUnreadableQuarantineStillReportsTheWatermark(t *testing.T) {
+	w := newWorld(1000, 50)
+	unreadable := errors.New("quarantine entry unreadable")
+	w.quarantine.entriesErr = unreadable
+	w.segments.items = []diskguard.Candidate{item("s", 70, time.Hour)}
+
+	report, err := w.guard(t, diskguard.DefaultConfig()).Check(now)
+	if !errors.Is(err, unreadable) {
+		t.Fatalf("Check error = %v, want the quarantine listing error reported", err)
+	}
+	if !report.AboveWatermark || len(w.removed) != 0 {
+		t.Fatalf("report = %+v, removed %v; want the spool reported above the watermark and nothing deleted", report, w.removed)
 	}
 }

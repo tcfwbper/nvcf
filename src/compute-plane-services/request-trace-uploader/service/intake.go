@@ -60,6 +60,9 @@ func (u *Uploader) intake(ctx context.Context, final bool) error {
 				"resume_seconds", int64(u.faults.QuarantineResume/time.Second))
 			break
 		}
+		// Between segments nothing is being prepared, so an eviction the
+		// spool check asked for runs here and not mid-prepare.
+		u.evictIfDue()
 		err := u.take(ctx, item)
 		if errors.Is(err, errPreparePaused) {
 			break

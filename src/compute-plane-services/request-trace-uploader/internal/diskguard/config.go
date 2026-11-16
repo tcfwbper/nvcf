@@ -12,9 +12,12 @@ import (
 const (
 	// DefaultMinFreeBytes leaves room for Dynamo to finish its active
 	// segment while the uploader stops preparing.
-	DefaultMinFreeBytes          = int64(512) << 20
-	DefaultPrepareAhead          = 16
+	DefaultMinFreeBytes = int64(512) << 20
+	DefaultPrepareAhead = 16
+	// Deletion is a near-full backstop: an alert well below the high
+	// watermark and a runbook are the main path.
 	DefaultHighWatermark         = 0.85
+	DefaultLowWatermark          = 0.75
 	DefaultQuarantineMaxFraction = 0.2
 	DefaultQuarantineMaxAge      = 7 * 24 * time.Hour
 )
@@ -49,7 +52,10 @@ type Config struct {
 	// which preparing pauses and Policy applies. The whole filesystem
 	// counts, so the spool needs a volume of its own (see the package doc).
 	HighWatermark float64
-	Policy        Policy
+	// LowWatermark is the used fraction Policy frees the spool down to once
+	// it is above HighWatermark. It must be above 0 and below HighWatermark.
+	LowWatermark float64
+	Policy       Policy
 	// QuarantineMaxFraction bounds quarantine to a fraction of the spool.
 	QuarantineMaxFraction float64
 	// QuarantineMaxAge bounds how long a quarantined entry is kept.
@@ -62,6 +68,7 @@ func DefaultConfig() Config {
 		MinFreeBytes:          DefaultMinFreeBytes,
 		PrepareAhead:          DefaultPrepareAhead,
 		HighWatermark:         DefaultHighWatermark,
+		LowWatermark:          DefaultLowWatermark,
 		Policy:                PolicyQuarantineThenOldest,
 		QuarantineMaxFraction: DefaultQuarantineMaxFraction,
 		QuarantineMaxAge:      DefaultQuarantineMaxAge,
@@ -79,6 +86,9 @@ func (c Config) Validate() error {
 	}
 	if !(c.HighWatermark > 0 && c.HighWatermark < 1) {
 		errs = append(errs, fmt.Errorf("disk guard high watermark must be between 0 and 1, got %v", c.HighWatermark))
+	}
+	if !(c.LowWatermark > 0 && c.LowWatermark < c.HighWatermark) {
+		errs = append(errs, fmt.Errorf("disk guard low watermark must be above 0 and below the high watermark %v, got %v", c.HighWatermark, c.LowWatermark))
 	}
 	switch c.Policy {
 	case PolicyQuarantineThenOldest, PolicyOldest, PolicyNone:

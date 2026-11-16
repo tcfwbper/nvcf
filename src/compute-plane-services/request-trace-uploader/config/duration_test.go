@@ -49,6 +49,18 @@ func TestDurationSettings(t *testing.T) {
 			valid: map[string]time.Duration{"1m": time.Minute, "2h": 2 * time.Hour, "24h": 24 * time.Hour},
 			bad:   []string{"60", "0", "0s", "-1h", "soon", "59s", "25h"},
 		},
+		{
+			name:  EnvQuarantineMaxAge,
+			get:   func(c Config) time.Duration { return c.Spool.QuarantineMaxAge },
+			valid: map[string]time.Duration{"168h": 7 * 24 * time.Hour, "1m": time.Minute, "720h": 30 * 24 * time.Hour},
+			bad:   []string{"604800", "0", "0s", "-168h", "soon", "59s", "721h"},
+		},
+		{
+			name:  EnvSpoolCheckInterval,
+			get:   func(c Config) time.Duration { return c.Spool.CheckInterval },
+			valid: map[string]time.Duration{"10s": 10 * time.Second, "1s": time.Second, "1h": time.Hour},
+			bad:   []string{"10", "0", "0s", "-10s", "soon", "500ms", "61m"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

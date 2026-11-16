@@ -5,13 +5,16 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/journalfs"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/uploadertest"
@@ -134,5 +137,71 @@ func TestEvictionRecordsTheLossBeforeDeleting(t *testing.T) {
 	got, _ := f.u.store.Segment(seg.ID)
 	if got.State != journal.StateDone || got.Reason != journal.ReasonEvicted {
 		t.Fatalf("segment = %s/%s after a failed delete, want done/evicted so it is never prepared from a missing file", got.State, got.Reason)
+	}
+}
+
+func TestAnEvictionWhoseDirectorySyncFailedIsStillReportedAsADeletion(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	for _, keyed := range []string{"journal entry", "bare file"} {
+		t.Run(keyed, func(t *testing.T) {
+			f := newEvictionFixture(t)
+			key := evictFile + filepath.Base(f.closed)
+			if keyed == "journal entry" {
+				size, mtime := f.fileIdentity(t)
+				key = evictSegment + f.discover(t, "4444444444444444444444444444444444444444444444444444444444444444", size, mtime).ID
+			}
+			// The spool directory allows the delete but cannot be opened to
+			// sync it, so the file is gone and the sync fails.
+			dir := filepath.Dir(f.closed)
+			if err := os.Chmod(dir, 0o300); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+			err := (spoolSegments{u: f.u}).Evict(key)
+			if !errors.Is(err, diskguard.ErrDeletedNotSynced) {
+				t.Fatalf("Evict() error = %v, want %v so the guard counts the deletion", err, diskguard.ErrDeletedNotSynced)
+			}
+			if _, statErr := os.Stat(f.closed); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("source after Evict: %v, want it deleted", statErr)
+			}
+			if logged := safeError(err); strings.Contains(logged, dir) {
+				t.Fatalf("logged error %q names the spool directory", logged)
+			}
+		})
+	}
+}
+
+func TestAQuarantineRemovalWhoseDirectorySyncFailedIsCountedAndLogsNoPath(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	quarantine := diskguard.NewQuarantine(filepath.Join(t.TempDir(), "quarantine"))
+	dir := quarantine.RejectsDir()
+	artifact := filepath.Join(dir, "seg-1.jsonl.gz")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifact, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The rejects directory allows the delete but cannot be opened to sync
+	// it, so the artifact is gone and the sync fails.
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	err := quarantine.Remove(diskguard.RejectsDirName + "/seg-1.jsonl.gz")
+	if !errors.Is(err, diskguard.ErrDeletedNotSynced) {
+		t.Fatalf("Remove() error = %v, want %v so the guard counts the deletion", err, diskguard.ErrDeletedNotSynced)
+	}
+	if _, statErr := os.Stat(artifact); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("artifact after Remove: %v, want it deleted", statErr)
+	}
+	if logged := safeError(err); strings.Contains(logged, dir) {
+		t.Fatalf("logged error %q names the quarantine directory", logged)
 	}
 }

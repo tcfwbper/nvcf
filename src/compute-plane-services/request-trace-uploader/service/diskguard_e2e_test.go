@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/backendtest"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/service"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
@@ -64,9 +66,9 @@ func TestAboveTheHighWatermarkTheOldestClosedSegmentIsEvictedAndCounted(t *testi
 		[]string{uploadertest.RequestEnd("b", 2)},
 	)
 	volume := &segmentVolume{dir: spool.Dir}
-	// The three segments fill 90% of the volume; removing the oldest brings
-	// it under the 85% watermark.
-	volume.total.Store(volume.segmentBytes() * 10 / 9)
+	// The three segments fill 95% of the volume, above the 85% high
+	// watermark; removing the oldest brings it under the 75% low watermark.
+	volume.total.Store(volume.segmentBytes() * 20 / 19)
 	metrics, err := telemetry.NewMemory("fake")
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +92,83 @@ func TestAboveTheHighWatermarkTheOldestClosedSegmentIsEvictedAndCounted(t *testi
 	}
 	if got := fake.SubmitCalls(); got != 0 {
 		t.Fatalf("submits = %d, want preparing paused above the watermark", got)
+	}
+}
+
+func TestAboveTheHighWatermarkTheSpoolIsFreedDownToTheConfiguredLowWatermark(t *testing.T) {
+	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
+	sent := spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("sent", 1)).Bytes())
+	older := spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("older", 2)).Bytes())
+	fake := backendtest.NewFake()
+	// The first segment's job stays pending, so it is in a batch that may
+	// have been sent for the rest of the test.
+	fake.Script(backendtest.SubmitStep{Statuses: []backendtest.StatusStep{{Status: backend.StatusPending}}})
+	volume := roomyVolume(spool.Dir)
+	metrics, err := telemetry.NewMemory("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader := newUploader(t, spool, fake, service.Options{Metrics: metrics, Volume: volume}, map[string]string{
+		config.EnvSpoolHighWatermark: "0.9",
+		config.EnvSpoolLowWatermark:  "0.4",
+	})
+	_ = uploader.Pass(context.Background())
+	if got := fake.SubmitCalls(); got != 1 {
+		t.Fatalf("submits = %d, want the first segment sent", got)
+	}
+
+	newer := spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("newer", 3)).Bytes())
+	active := spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("active", 4)).Bytes())
+	// Four segments fill 95% of the volume. Freeing to 75% would take one
+	// closed segment; freeing to the configured 40% takes every closed
+	// segment that is in no batch.
+	volume.total.Store(volume.segmentBytes() * 20 / 19)
+	_ = uploader.Pass(context.Background())
+	if err := uploader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if !gone(older) || !gone(newer) {
+		t.Fatalf("older gone %v newer gone %v, want both freed down to the low watermark", gone(older), gone(newer))
+	}
+	if gone(sent) {
+		t.Fatal("a segment in a batch that may have been sent was evicted")
+	}
+	if gone(active) {
+		t.Fatal("the active segment was evicted")
+	}
+	if got, _ := metrics.Value(telemetry.SegmentsEvicted, nil); got != 2 {
+		t.Fatalf("segments_evicted = %v, want both deletions counted", got)
+	}
+}
+
+func TestAPartlySetSpoolPolicyStopsTheUploader(t *testing.T) {
+	spool, _ := spoolWith(t)
+	cfg := loadEnv(t, spoolEnv(t, spool.Dir, nil))
+	cfg.Spool = config.SpoolPolicy{HighWatermark: 0.9}
+	uploader, err := service.NewUploader(cfg, backendtest.NewFake(), service.Options{Faults: fastFaults(), Volume: roomyVolume(spool.Dir)})
+	if err != nil {
+		t.Fatalf("NewUploader() error = %v", err)
+	}
+	t.Cleanup(func() { _ = uploader.Close() })
+
+	if err := uploader.Pass(context.Background()); err == nil || !strings.Contains(err.Error(), "low watermark") {
+		t.Fatalf("Pass() error = %v, want a startup error for the missing low watermark", err)
+	}
+}
+
+func TestANegativeSpoolCheckIntervalStopsTheUploader(t *testing.T) {
+	spool, _ := spoolWith(t)
+	cfg := loadEnv(t, spoolEnv(t, spool.Dir, nil))
+	cfg.Spool.CheckInterval = -time.Second
+	uploader, err := service.NewUploader(cfg, backendtest.NewFake(), service.Options{Faults: fastFaults(), Volume: roomyVolume(spool.Dir)})
+	if err != nil {
+		t.Fatalf("NewUploader() error = %v", err)
+	}
+	t.Cleanup(func() { _ = uploader.Close() })
+
+	if err := uploader.Pass(context.Background()); err == nil || !strings.Contains(err.Error(), "check interval") {
+		t.Fatalf("Pass() error = %v, want a startup error for the negative check interval", err)
 	}
 }
 
