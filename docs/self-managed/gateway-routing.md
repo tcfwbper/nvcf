@@ -216,7 +216,10 @@ EOF
 
 Split or multi-cluster gRPC invocation needs an additional TCP listener for the
 worker callback path. Add this listener only when enabling split or
-multi-cluster gRPC invocation.
+multi-cluster gRPC invocation. To run more than one grpc-proxy or
+invocation-service replica with workers in another cluster, use the
+[Worker Callback Proxy](./worker-callback-proxy.md) instead. It needs DNS for
+its own worker domain and no Gateway listener.
 
 ```yaml
   - name: worker-tcp

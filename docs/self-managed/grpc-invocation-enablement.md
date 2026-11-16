@@ -13,13 +13,22 @@ pod networks.
 Single-cluster deployments usually do not need this worker callback route
 because workers can reach grpc-proxy pod IPs directly.
 
+<Note>
+This TCP route is one way to give remote workers a callback path. The
+[Worker Callback Proxy](./worker-callback-proxy.md) is the other. It forwards
+each callback to the pod that holds the request, so it works with more than one
+grpc-proxy replica and also serves HTTP functions. Use one or the other: the
+stack refuses to render when the proxy is enabled together with
+`grpcproxy.workerConnectBaseURL`.
+</Note>
+
 For a complete Amazon EKS installation example that compares single-cluster and
 multi-cluster topologies, see the
 [CSP End-to-End Example](./csp-end-to-end-example-installation.md).
 
 <Warning>
-Split or multi-cluster gRPC invocation is beta in 0.6.0. It supports one
-grpc-proxy replica in the control plane. Set `grpcproxy.replicaCount: 1` and
+Split or multi-cluster gRPC invocation over this TCP route is beta in 0.6.0.
+It supports one grpc-proxy replica in the control plane. Set `grpcproxy.replicaCount: 1` and
 keep the grpc-proxy Horizontal Pod Autoscaler (HPA) disabled. Multiple
 grpc-proxy replicas are not supported because the 0.6.0 worker callback route is
 shared TCP routing and can send a callback to the wrong pod.

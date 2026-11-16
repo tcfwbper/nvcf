@@ -480,7 +480,11 @@ control-plane worker endpoints used by NVCF. For multi-cluster EKS installs,
 first validate the GPU cluster by checking `nvca-operator` rollout and
 `NVCFBackend` agent health. Function deployment and invocation are valid
 acceptance checks only after the worker endpoints are reachable from the GPU
-cluster.
+cluster. When the control plane runs the
+[Worker Callback Proxy](../../self-managed/worker-callback-proxy.md), the GPU
+cluster must also resolve `*.<workerDomain>` to the proxy and trust its CA
+(`global.nvcaOperator.agent.workerCallbackCaPem`); see that page to validate
+them.
 
 1. Set up environment variables:
 

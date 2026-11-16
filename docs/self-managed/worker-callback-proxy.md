@@ -47,7 +47,10 @@ forwards each one to the pod that holds the request.
   `global.workerEndpoints.invocationServiceURL`,
   `global.workerEndpoints.grpcProxyWorkerConnectURL`,
   `grpcproxy.workerConnectBaseURL`, and
-  `invocation.env.WORKER_STREAM_PROPERTIES__SELF_ADDRESS` empty.
+  `invocation.env.WORKER_STREAM_PROPERTIES__SELF_ADDRESS` empty. They name
+  addresses that workers would use instead of the proxy, so the stack refuses
+  to render when any of them is set while `workerCallbackProxy.enabled` is
+  true.
 - Access to the Envoy image. The chart pulls `docker.io/envoyproxy/envoy` by
   default. To use a mirror, set `workerCallbackProxy.image.registry` and
   `workerCallbackProxy.image.repository`.
@@ -76,10 +79,23 @@ forwards each one to the pod that holds the request.
    Both callback paths are TLS, but any client that reaches the Service can
    open one.
 
+   `workerDomain` is not the ingress domain. The two serve different callers:
+
+   | Setting | Names | Resolves to | Used by |
+   | --- | --- | --- | --- |
+   | `global.domain` (ingress domain) | `api.<domain>`, `invocation.<domain>`, the other Gateway API routes | The Gateway load balancer | Clients and tools outside the cluster |
+   | `workerCallbackProxy.workerDomain` | `<dashed-pod-ip>.<workerDomain>` and `invocation.<workerDomain>` | The worker callback proxy Service | Function workers in the compute cluster |
+
+   Do not set `workerDomain` to the ingress domain. A wildcard record on the
+   ingress domain points at the Gateway, and `invocation.<global.domain>`
+   already names a Gateway route, so it cannot also name the proxy. Pick a
+   separate DNS name for which you control the zone. Only the compute cluster
+   needs to resolve it, so a private zone is enough.
+
 2. Make `*.<workerDomain>` resolve to the proxy Service from the compute
-   cluster, for example with a wildcard DNS record for the load balancer
-   address. Workers resolve every `<dashed-pod-ip>.<workerDomain>` name, not
-   only the base name.
+   cluster. See [Expose the proxy and its DNS name](#expose-the-proxy-and-its-dns-name).
+   Workers resolve every `<dashed-pod-ip>.<workerDomain>` name, not only the
+   base name.
 
    A single cluster does not need the proxy or this step, because workers there
    call the pods directly. Leave `workerCallbackProxy.enabled` false. If you
@@ -98,6 +114,179 @@ forwards each one to the pod that holds the request.
    cluster resolves to the proxy and that you have exposed yourself.
 
 3. Apply the stack: `HELMFILE_ENV=<environment-name> helmfile sync`.
+
+## Expose the proxy and its DNS name
+
+### What to expose
+
+The proxy Service listens on two ports. Both must be reachable from the compute
+cluster through the load balancer:
+
+| Port | Protocol | Carries |
+| --- | --- | --- |
+| 10084 | TCP | HTTP callbacks (`invocation.<workerDomain>`) |
+| 443 | UDP | gRPC callbacks over HTTP/3 (`<dashed-pod-ip>.<workerDomain>`) |
+
+Set `workerCallbackProxy.service.type: LoadBalancer`, and add the annotations
+your platform needs for a private load balancer through
+`workerCallbackProxy.service.annotations`. If the platform selects the load
+balancer implementation by class, set
+`workerCallbackProxy.service.loadBalancerClass`. The stack passes the whole
+`workerCallbackProxy.service` block to the chart.
+
+Confirm that your load balancer type forwards both a TCP and a UDP listener from
+one Service, and that the security groups or network controls allow both ports
+from the compute cluster's egress addresses. A gRPC call that times out with `DEADLINE_EXCEEDED` while HTTP works
+often means the UDP port is closed or the name does not reach the proxy.
+
+On AWS, a load balancer health check that probes the UDP gRPC port over TCP
+cannot succeed, because that port accepts only UDP. The AWS Load Balancer
+Controller checks the traffic port by default. If the load balancer reports the
+proxy targets unhealthy, point the health check at the TCP port instead, with
+these entries in `workerCallbackProxy.service.annotations`. The port to name
+depends on the load balancer's target type
+(`service.beta.kubernetes.io/aws-load-balancer-nlb-target-type`):
+
+| Target type | `aws-load-balancer-healthcheck-port` | Why |
+| --- | --- | --- |
+| `ip` | `"10084"` | The controller probes the pod port. |
+| `instance` | `invocation-tcp` | The controller resolves the Service port name to its allocated node port. |
+
+```yaml
+workerCallbackProxy:
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: tcp
+      service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "10084"
+```
+
+The example is for `ip` targets. The Service's target port is the named port
+`invocation-tcp`, so use the numeric `10084` only with `ip` targets.
+
+Check the target health in your load balancer after the Service is created, and
+confirm that both an HTTP and a gRPC invocation succeed.
+
+Read the address after the Service has one:
+
+```bash
+kubectl -n nvcf get svc worker-callback-proxy \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}{"\n"}'
+```
+
+An AWS load balancer returns a hostname; other platforms may return an IP
+address.
+
+### Why not a nip.io style name
+
+A wildcard DNS service such as nip.io maps a name to an IP address written in
+that name. The callback name already starts with an IP address, the
+control-plane pod's, so such a service does not send it to the proxy. For
+example, with a worker domain of `203-0-113-10.nip.io`, the callback name
+`10-0-0-12.203-0-113-10.nip.io` resolves to `10.0.0.12`, the pod IP, which the
+compute cluster cannot reach, and gRPC invocations fail with
+`DEADLINE_EXCEEDED`. A domain built from the Gateway address, such as one you
+might use for the ingress domain, has the same problem and would point at the
+Gateway in any case. Use a DNS name that you control, and map the wildcard to
+the proxy address yourself.
+
+### Resolve `*.<workerDomain>` on an EKS compute cluster
+
+Use one of these. Both map the whole wildcard to the proxy address, so
+`<dashed-pod-ip>.<workerDomain>` and `invocation.<workerDomain>` both resolve.
+
+**Option A: a Route 53 private hosted zone.** Create a private hosted zone for
+`<workerDomain>` and associate it with the VPC of the compute cluster, then add
+a wildcard record that points at the load balancer hostname. With
+`PROXY_LB` set to the hostname from the previous step:
+
+```bash
+cat > worker-callback-dns.json <<EOF
+{
+  "Changes": [{
+    "Action": "UPSERT",
+    "ResourceRecordSet": {
+      "Name": "*.<workerDomain>",
+      "Type": "CNAME",
+      "TTL": 60,
+      "ResourceRecords": [{"Value": "${PROXY_LB}"}]
+    }
+  }]
+}
+EOF
+aws route53 change-resource-record-sets \
+  --hosted-zone-id <hosted-zone-id> --change-batch file://worker-callback-dns.json
+```
+
+If the platform returns an IP address, use an `A` record with that address.
+
+To roll back, run the same command with `"Action": "DELETE"` and the same
+record.
+
+**Option B: a CoreDNS rewrite in the compute cluster.** Use this when you cannot
+create a zone. Back up the CoreDNS configuration first:
+
+```bash
+kubectl -n kube-system get configmap coredns -o yaml > coredns-backup.yaml
+```
+
+Edit `kube-system/coredns`, and add this block inside the server block of the
+Corefile (`.:53 { ... }`), with the dots of the domain escaped and
+`<proxy-host>` set to the load balancer hostname, which the compute cluster must
+be able to resolve:
+
+```text
+rewrite stop {
+  name regex (.+)\.grpc-worker\.example\.com\.$ <proxy-host>.
+  answer auto
+}
+```
+
+Then restart CoreDNS:
+
+```bash
+kubectl -n kube-system rollout restart deployment/coredns
+kubectl -n kube-system rollout status deployment/coredns
+```
+
+To roll back, reapply `coredns-backup.yaml` and restart CoreDNS again. If the
+CoreDNS add-on is managed by your platform, an add-on update can revert a manual
+edit, so check the rule again after updating the add-on.
+
+### Validate from the compute cluster
+
+Run these in the compute cluster, after the stack is applied, and before you
+invoke a function.
+
+1. Resolve both kinds of name from a pod. Use any image that has `nslookup`:
+
+   ```bash
+   kubectl run dns-check --rm -it --restart=Never --image=<image-with-nslookup> -- \
+     nslookup 10-0-0-1.<workerDomain>
+   kubectl run dns-check --rm -it --restart=Never --image=<image-with-nslookup> -- \
+     nslookup invocation.<workerDomain>
+   ```
+
+   Both must return the load balancer address, not `10.0.0.1`. An answer of the
+   pod IP means a name-embedded-IP DNS service is answering.
+
+2. Check the HTTP frontend certificate. From a host or pod that can reach the
+   load balancer, with the CA from
+   [Give workers the CA](#give-workers-the-ca) when the issuer is the stack's:
+
+   ```bash
+   openssl s_client -connect invocation.<workerDomain>:10084 \
+     -servername invocation.<workerDomain> \
+     -verify_hostname invocation.<workerDomain> \
+     -CAfile worker-callback-ca.pem </dev/null
+   ```
+
+   `-servername` only sends the name. `-verify_hostname` checks it against the
+   certificate's DNS names, which must include `*.<workerDomain>`. The output
+   must end with `Verify return code: 0 (ok)`.
+
+3. Invoke a real HTTP function and a real gRPC function several times. The
+   gRPC call exercises UDP 443, which a TCP check cannot test. See
+   [Verify](#verify) for the proxy's access log.
 
 ## Certificates and CAs
 

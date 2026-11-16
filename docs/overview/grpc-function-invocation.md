@@ -11,6 +11,9 @@ configuration.
 Self-hosted split or multi-cluster deployments require additional enablement
 before workers can reach the grpc-proxy callback endpoint. See
 [gRPC Invocation Enablement](../self-managed/grpc-invocation-enablement.md).
+To scale grpc-proxy or Invocation Service across replicas with workers in
+another cluster, see the
+[Worker Callback Proxy](../self-managed/worker-callback-proxy.md).
 
 ## Invocation Path
 

@@ -337,6 +337,15 @@ execution.
 The stack maps the effective `llmRequestRouterAddress` to the NVCF API
 remote-config key `nvcf.llm-request-router.worker-address` only when the LLM
 addon is enabled. Do not place this value under `api.env`.
+
+Workers must also reach the control-plane pod that holds their request. For
+more than one grpc-proxy or invocation-service replica, enable the
+[Worker Callback Proxy](./worker-callback-proxy.md). It uses its own worker
+domain, `workerCallbackProxy.workerDomain`, which must resolve to the proxy and
+not to the Gateway. Do not reuse the `GATEWAY_ADDR` based domain for it: a name
+that embeds an IP address, such as a nip.io style name, resolves the callback
+name to the pod IP instead of the proxy. The page lists the DNS steps for an
+EKS compute cluster and how to validate them.
 </Info>
 
 ### Create the registry pull secret
