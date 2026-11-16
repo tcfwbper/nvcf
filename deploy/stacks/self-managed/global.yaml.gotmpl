@@ -2166,6 +2166,12 @@ llmRequestRouter:
     imagePullSecrets:
       {{- toYaml .Values.global.imagePullSecrets | nindent 6 }}
     {{- end }}
+    {{- with include "nvcf.nodeSelector" (dict "type" "controlplane" "selectors" .Values.global.nodeSelectors) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    {{- with include "nvcf.tolerations" (dict "type" "controlplane" "tolerations" .Values.global.tolerations) }}
+    {{- . | nindent 4 }}
+    {{- end }}
   grpcTls:
     enabled: {{ $grpcTlsEnabled }}
     allowInsecureHttp: {{ $grpcTlsAllowInsecureHttp }}

@@ -99,6 +99,12 @@ printf '%s\n' "$default_args" | grep -qx -- '--watch-heartbeat-ms=5000' || {
   --state-values-set addons.llm.requestRouter.discovery.watchHeartbeatMs=7000 \
   --state-values-set-string 'addons.llm.requestRouter.discovery.remoteWatchUrls[0]=https://region-b.example.invalid:50071' \
   --state-values-set addons.llm.requestRouter.discovery.allowInsecureRemoteWatchHttp=true \
+  --state-values-set global.nodeSelectors.enabled=true \
+  --state-values-set global.tolerations.enabled=true \
+  --state-values-set-string 'global.tolerations.controlplane[0].key=dedicated' \
+  --state-values-set-string 'global.tolerations.controlplane[0].operator=Equal' \
+  --state-values-set-string 'global.tolerations.controlplane[0].value=control-plane' \
+  --state-values-set-string 'global.tolerations.controlplane[0].effect=NoSchedule' \
   --state-values-set ingress.gatewayApi.gateways.shared.name=shared-gw \
   --state-values-set ingress.gatewayApi.gateways.shared.namespace=envoy-gateway-system \
   --state-values-set ingress.gatewayApi.gateways.grpc.name=grpc-gw \
@@ -167,6 +173,20 @@ test "$backend_image" = "$expected_backend_image" || {
   echo "llm-router-local-chart: expected backend router image $expected_backend_image, got ${backend_image:-missing}" >&2
   exit 1
 }
+
+# The backend router runs on the control-plane pool, like the main router.
+for field in nodeSelector tolerations; do
+  main_placement="$(yq ea -o=json -I=0 \
+    "select(.kind == \"Deployment\" and .metadata.name == \"llm-request-router\") | .spec.template.spec.${field}" \
+    "$local_manifest")"
+  backend_placement="$(yq ea -o=json -I=0 \
+    "select(.kind == \"Deployment\" and .metadata.name == \"llm-request-router-backend-router\") | .spec.template.spec.${field}" \
+    "$local_manifest")"
+  test "$main_placement" != "null" && test "$backend_placement" = "$main_placement" || {
+    echo "llm-router-local-chart: backend router ${field} ${backend_placement:-missing} does not match the main router's ${main_placement:-missing}" >&2
+    exit 1
+  }
+done
 
 remote_watch_url="$(yq -r '.llmRequestRouter.discovery.remoteWatchUrls[0]' "$values_file")"
 test "$remote_watch_url" = "https://region-b.example.invalid:50071" || {
