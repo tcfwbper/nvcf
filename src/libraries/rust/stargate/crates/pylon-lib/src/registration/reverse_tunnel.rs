@@ -27,8 +27,10 @@ use crate::quic_http_tunnel::{
     ReverseQuicTunnelConfig, ReverseQuicTunnelHandle, TunnelError, start_reverse_quic_tunnel,
 };
 
-use super::REVERSE_TUNNEL_CONNECT_TIMEOUT;
 use super::types::RegistrationSessionConfig;
+use super::{
+    REVERSE_TUNNEL_ACCEPT_WINDOW, REVERSE_TUNNEL_CLOSE_LINGER, REVERSE_TUNNEL_CONNECT_TIMEOUT,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ReverseTunnelEndpoint {
@@ -165,10 +167,13 @@ pub(super) fn reverse_quic_tunnel_config(
 }
 
 /// Maintains a single reverse QUIC tunnel connection to a stargate router.
+/// `registration_stop` is the token of the registration stream that owns this
+/// loop; when it is cancelled, the tunnel drains before it closes.
 pub(super) async fn run_reverse_tunnel_loop(
     router_addr: String,
     config: Arc<RegistrationSessionConfig>,
     state_tx: watch::Sender<ReverseTunnelState>,
+    registration_stop: CancellationToken,
     stop: CancellationToken,
 ) {
     let mut state_rx = state_tx.subscribe();
@@ -226,7 +231,22 @@ pub(super) async fn run_reverse_tunnel_loop(
 
                 tokio::select! {
                     _ = stop.cancelled() => {
-                        handle.shutdown().await;
+                        if registration_stop.is_cancelled() {
+                            let accept_window =
+                                REVERSE_TUNNEL_ACCEPT_WINDOW.min(config.shutdown_drain_timeout);
+                            tracing::info!(
+                                router_addr = %router_addr,
+                                inference_server_id = %config.inference_server_id,
+                                accept_window_ms = accept_window.as_millis(),
+                                "reverse tunnel draining"
+                            );
+                            // Accept the streams the router sent before it saw the
+                            // registration close. A timeout is the normal outcome.
+                            let _ = tokio::time::timeout(accept_window, handle.closed()).await;
+                            handle.drain(REVERSE_TUNNEL_CLOSE_LINGER).await;
+                        } else {
+                            handle.shutdown().await;
+                        }
                         state_tx.send_if_modified(|state| state.mark_disconnected(&endpoint));
                         return;
                     }

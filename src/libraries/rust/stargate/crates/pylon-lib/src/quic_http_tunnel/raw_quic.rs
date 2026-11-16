@@ -13,15 +13,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use stargate_protocol::{RecvStream, SendStream};
+use stargate_protocol::{RecvStream, SendStream, tunnel_contract::HEADER_REQUEST_ID};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::core::{
     ResponseBodyEventSink, TunnelRequestParts, TunnelRequestTransport, TunnelServerApp,
     forward_tunnel_request, next_body_len, request_body_buffer, serve_bidi_streams,
 };
+
+// Bounds the wait after every response, not only during shutdown, where the
+// drain deadline can end it sooner.
+const RESPONSE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub(super) async fn handle_raw_quic_connection(
     incoming: quinn::Incoming,
@@ -126,7 +132,8 @@ pub(super) async fn handle_stream(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| anyhow::anyhow!("missing required x-path header"))?
         .to_string();
-    forward_tunnel_request(
+    let request_id = request_headers.get(HEADER_REQUEST_ID).cloned();
+    let result = forward_tunnel_request(
         &app,
         TunnelRequestParts {
             method,
@@ -135,7 +142,34 @@ pub(super) async fn handle_stream(
         },
         &mut transport,
     )
-    .await
+    .await;
+    if result.is_ok() {
+        let request_id = request_id
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        // This stream can hold the last reference to the connection, and
+        // dropping that reference discards response bytes the router has not
+        // acknowledged.
+        match tokio::time::timeout(RESPONSE_DELIVERY_TIMEOUT, transport.send_stream.stopped()).await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    inference_server_id = %app.inference_server_id,
+                    request_id,
+                    %error,
+                    "raw QUIC response delivery not confirmed"
+                );
+            }
+            Err(_) => tracing::warn!(
+                inference_server_id = %app.inference_server_id,
+                request_id,
+                "raw QUIC response delivery wait timed out"
+            ),
+        }
+    }
+    result
 }
 
 fn raw_quic_response_headers(

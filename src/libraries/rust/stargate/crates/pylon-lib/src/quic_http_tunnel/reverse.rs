@@ -16,6 +16,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use quinn::Endpoint;
@@ -81,6 +82,7 @@ impl TunnelServerApp {
 pub struct ReverseQuicTunnelHandle {
     shutdown: CancellationToken,
     task_tracker: TaskTracker,
+    linger_connection: Option<quinn::Connection>,
 }
 
 impl ReverseQuicTunnelHandle {
@@ -96,12 +98,23 @@ impl ReverseQuicTunnelHandle {
         Self {
             shutdown,
             task_tracker,
+            linger_connection: None,
         }
     }
 
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         self.task_tracker.wait().await;
+    }
+
+    /// Shuts down like [`Self::shutdown`], then keeps a raw QUIC connection
+    /// open for up to `linger` so a relay can pass on the last response bytes.
+    pub async fn drain(self, linger: Duration) {
+        self.shutdown.cancel();
+        self.task_tracker.wait().await;
+        if let Some(connection) = &self.linger_connection {
+            let _ = tokio::time::timeout(linger, connection.closed()).await;
+        }
     }
 
     pub async fn closed(&self) {
@@ -310,7 +323,8 @@ pub async fn start_reverse_quic_tunnel(
 
     Ok(match tunnel_protocol {
         TunnelTransportProtocol::RawQuic => {
-            ReverseQuicTunnelHandle::spawn(move |shutdown, stream_tracker| {
+            let linger_connection = connection.clone();
+            let mut handle = ReverseQuicTunnelHandle::spawn(move |shutdown, stream_tracker| {
                 serve_bidi_streams(
                     endpoint,
                     app,
@@ -320,7 +334,9 @@ pub async fn start_reverse_quic_tunnel(
                     handle_stream,
                     |error| tracing::warn!(%error, "reverse tunnel stream failed"),
                 )
-            })
+            });
+            handle.linger_connection = Some(linger_connection);
+            handle
         }
         TunnelTransportProtocol::Http3 => {
             ReverseQuicTunnelHandle::spawn(move |shutdown, stream_tracker| async move {

@@ -17,15 +17,21 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::common::sse::{assert_sse_done, chat_completion_contents, parse_sse_events};
 use crate::common::{
-    MapResolver, base_config, init_crypto, localhost_reverse_tunnel_config, start_dummy_backend,
-    wait_for_routing, wait_for_unroutable,
+    MapResolver, base_config, init_crypto, localhost_reverse_tunnel_config,
+    reverse_registration_config, start_dummy_backend, wait_for_routing, wait_for_unroutable,
+    with_proxy_headers,
 };
+use axum::Router;
+use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
 use pylon_lib::{
-    ReverseQuicTunnelConfig, ReverseQuicTunnelHandle, TunnelTransportProtocol,
-    start_reverse_quic_tunnel,
+    InferenceServerRegistrationClient, PylonRuntimeState, ReverseQuicTunnelConfig,
+    ReverseQuicTunnelHandle, TunnelTransportProtocol, start_reverse_quic_tunnel,
 };
-use stargate::runtime::BoundStargateListeners;
+use stargate::runtime::{BoundStargateListeners, ReverseTunnelConfig};
 use stargate_forwarding::ForwardingResolver;
 use stargate_proto::pb::stargate_control_plane_client::StargateControlPlaneClient;
 use stargate_proto::pb::{
@@ -642,4 +648,151 @@ async fn relayed_tunnel_peer_unreachable() {
 
     handle_a.begin_shutdown();
     handle_a.wait_for_shutdown(Duration::from_secs(5)).await;
+}
+
+/// Chat backend that answers every streaming request at once with `events`
+/// content chunks of `chunk_len` bytes each.
+async fn start_large_sse_backend(model: &str, events: usize, chunk_len: usize) -> SocketAddr {
+    let chunk = serde_json::json!({
+        "id": "chunk-1",
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": "x".repeat(chunk_len)}, "finish_reason": null}],
+    });
+    let body = format!("data: {chunk}\n\n").repeat(events) + "data: [DONE]\n\n";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move { ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response() }
+            }),
+        )
+        .route("/health", get(|| async { "ok" }));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// Regression: a relay in front of the router acknowledges response bytes
+/// before it passes them on, and drops them when Pylon closes the tunnel.
+#[tokio::test]
+async fn reverse_tunnel_drain_through_relay_delivers_full_response() {
+    const EVENTS: usize = 3_000;
+    const CHUNK_LEN: usize = 1_000;
+    // Longer than the 2 s accept window and shorter than it plus the final
+    // tunnel wait. The relay holds the response tail until the client reads.
+    const CLIENT_PAUSE: Duration = Duration::from_millis(2_500);
+
+    init_crypto();
+    let peers = Arc::new(Mutex::new(Vec::<StargateInfo>::new()));
+
+    // A is only the relay: Pylon dials it, and it forwards the tunnel by SNI to B.
+    let mut config_a = base_config(
+        "sg-a",
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    let reverse_tunnel_a = localhost_reverse_tunnel_config("127.0.0.1:0".parse().unwrap());
+    let listeners_a = BoundStargateListeners::bind(&mut config_a).unwrap();
+    let (grpc_a, http_a) = (config_a.grpc_listen_addr, config_a.http_listen_addr);
+    let reverse_a = reverse_tunnel_a.listen_addr();
+
+    let mut config_b = base_config(
+        "sg-b",
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    let reverse_tunnel_b = ReverseTunnelConfig::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        "sg-b.stargate.external".to_string(),
+        Some(reverse_a.to_string()),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let listeners_b = BoundStargateListeners::bind(&mut config_b).unwrap();
+    let (grpc_b, http_b) = (config_b.grpc_listen_addr, config_b.http_listen_addr);
+
+    let mut resolver_a = MapResolver::new("sg-a.stargate.external");
+    resolver_a.insert("sg-b.stargate.external", reverse_tunnel_b.listen_addr());
+    config_a.forwarding = Some(Arc::new(resolver_a));
+    config_b.forwarding = Some(Arc::new(MapResolver::new("sg-b.stargate.external")));
+
+    let handle_a = stargate::runtime::StargateRuntime::new(
+        config_a,
+        Box::new(crate::common::SharedDiscovery::new(
+            "sg-a",
+            grpc_a,
+            http_a,
+            peers.clone(),
+        )),
+        listeners_a,
+        Some(reverse_tunnel_a),
+    )
+    .start()
+    .await
+    .expect("stargate A failed");
+    let handle_b = stargate::runtime::StargateRuntime::new(
+        config_b,
+        Box::new(crate::common::SharedDiscovery::new(
+            "sg-b", grpc_b, http_b, peers,
+        )),
+        listeners_b,
+        Some(reverse_tunnel_b),
+    )
+    .start()
+    .await
+    .expect("stargate B failed");
+
+    let model = "relay-drain-model";
+    let backend_addr = start_large_sse_backend(model, EVENTS, CHUNK_LEN).await;
+    let mut registration = InferenceServerRegistrationClient::default();
+    registration
+        .start(reverse_registration_config(
+            vec![grpc_b.to_string()],
+            "relay-drain-inst",
+            format!("http://{backend_addr}"),
+            PylonRuntimeState::new(InferenceServerStatus::Active, &[model.to_string()]),
+        ))
+        .expect("registration should start");
+    wait_for_routing(http_b, model, Duration::from_secs(15)).await;
+
+    let response = with_proxy_headers(
+        reqwest::Client::new().post(format!("http://{http_b}/v1/chat/completions")),
+        model,
+        "req-relay-drain",
+    )
+    .json(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+    }))
+    .send()
+    .await
+    .expect("request should reach stargate B");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let shutdown = tokio::spawn(async move { registration.shutdown().await });
+    tokio::time::sleep(CLIENT_PAUSE).await;
+    let body = response
+        .text()
+        .await
+        .expect("response body should complete");
+    shutdown.await.unwrap();
+
+    let events = parse_sse_events(&body).expect("response should be valid SSE");
+    assert_sse_done(&events);
+    let delivered: usize = chat_completion_contents(&events)
+        .iter()
+        .map(String::len)
+        .sum();
+    assert_eq!(delivered, EVENTS * CHUNK_LEN);
+
+    handle_a.begin_shutdown();
+    handle_b.begin_shutdown();
+    handle_a.wait_for_shutdown(Duration::from_secs(5)).await;
+    handle_b.wait_for_shutdown(Duration::from_secs(5)).await;
 }

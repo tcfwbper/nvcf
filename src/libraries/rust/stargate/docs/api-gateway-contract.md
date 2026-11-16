@@ -276,6 +276,16 @@ output and `--pylon-output-chunk-timeout-ms` (default 30000) between outputs.
 The two waits run one after the other, so a single attempt can wait for their
 sum before its first output, and each retry can wait that long again.
 
+When a reverse-tunnel Pylon gets SIGTERM, it closes its registrations, accepts
+new tunnel streams for up to 2 s more, waits for in-flight requests, and keeps a raw
+QUIC tunnel open up to 1 s after its last request.
+`--pylon-shutdown-drain-timeout-ms` (default 90000) bounds all of these,
+counted from the signal. Pylon then needs up to 5 s more to stop, so set the
+timeout at least 5 s below the pod's termination grace period. With the
+default, the grace period must be at least 95 s, which is longer than the
+Kubernetes default of 30 s. For LLM container functions, NVCA sets the
+timeout from its inference stop pause.
+
 Gateway rules:
 
 - Set `x-stargate-max-wait-ms` from the remaining request deadline.

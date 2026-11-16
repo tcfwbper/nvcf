@@ -259,6 +259,18 @@ struct Args {
         value_name = "MS"
     )]
     pylon_output_chunk_timeout_ms: u64,
+    /// Longest wait for in-flight requests after SIGTERM, counted from the
+    /// signal. It also bounds the window of up to 2 s that still accepts tunnel
+    /// streams and the final tunnel wait. Pylon needs up to 5 s more to stop, so set it
+    /// at least 5 s below the worker pod termination grace period
+    #[arg(
+        long,
+        default_value_t = pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(1..),
+        env = "PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS",
+        value_name = "MS"
+    )]
+    pylon_shutdown_drain_timeout_ms: u64,
     /// Collect post-stream output quality metrics (gibberish checks)
     #[arg(long, default_value_t = false)]
     collect_quality_metrics: bool,
@@ -505,6 +517,7 @@ mod tests {
     fn pylon_stream_timeouts_reject_zero() {
         assert!(try_parse_argv(&["--pylon-first-output-timeout-ms", "0"]).is_err());
         assert!(try_parse_argv(&["--pylon-output-chunk-timeout-ms", "0"]).is_err());
+        assert!(try_parse_argv(&["--pylon-shutdown-drain-timeout-ms", "0"]).is_err());
     }
 
     #[test]

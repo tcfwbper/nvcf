@@ -45,6 +45,7 @@ fn crate_root_exports_registration_public_api() {
         tunnel_protocol: TunnelTransportProtocol::RawQuic,
         forwarding: pylon_lib::TunnelForwardingConfig::default(),
         auth_token_provider: None,
+        shutdown_drain_timeout: pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
     };
 
     assert_eq!(config.inference_server_id, "pylon-a");

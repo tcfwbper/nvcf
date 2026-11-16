@@ -393,6 +393,7 @@ fn test_registration_config() -> InferenceServerRegistrationConfig {
         quic_insecure: true,
         tunnel_protocol: TunnelTransportProtocol::RawQuic,
         auth_token_provider: None,
+        shutdown_drain_timeout: crate::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
     }
 }
 

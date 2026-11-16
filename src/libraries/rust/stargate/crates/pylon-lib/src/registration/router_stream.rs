@@ -95,6 +95,7 @@ pub(super) async fn run_router_registration_stream(
             let reverse_task_state_tx = reverse_state_tx.clone();
             let reverse_router_addr = router_addr.clone();
             let reverse_config = config.clone();
+            let registration_stop = stop.clone();
             Some(OwnedTask::spawn_child(
                 "reverse tunnel registration worker",
                 &stop,
@@ -103,6 +104,7 @@ pub(super) async fn run_router_registration_stream(
                         reverse_router_addr,
                         reverse_config,
                         reverse_task_state_tx,
+                        registration_stop,
                         reverse_stop,
                     )
                 },
@@ -244,10 +246,21 @@ pub(super) async fn run_router_registration_stream(
             advertised_reverse_connected = reverse_connected;
             last_send = Instant::now();
         };
+        // A stop that cancels a pending update send ends the loop as a failed
+        // send, but the reverse tunnel still drains, so it needs the drain bound.
+        let stopped = stopped || stop.is_cancelled();
 
+        // Close the registration before the reverse tunnel stops accepting, so
+        // the router stops picking this server first.
+        drop(update_tx);
         drop(advertised_status);
         if let Some(task) = reverse_task {
-            task.shutdown(TASK_SHUTDOWN_TIMEOUT).await;
+            let timeout = if stopped {
+                config.shutdown_drain_timeout
+            } else {
+                TASK_SHUTDOWN_TIMEOUT
+            };
+            task.shutdown(timeout).await;
         }
         if stopped
             || stop

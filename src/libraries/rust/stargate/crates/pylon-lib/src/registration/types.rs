@@ -48,6 +48,9 @@ pub struct InferenceServerRegistrationConfig {
     pub quic_insecure: bool,
     pub tunnel_protocol: TunnelTransportProtocol,
     pub auth_token_provider: Option<Arc<AuthTokenProvider>>,
+    /// Longest shutdown wait, counted from SIGTERM. It covers the accept
+    /// window, the in-flight drain, and the final tunnel wait.
+    pub shutdown_drain_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -65,6 +68,7 @@ pub(super) struct RegistrationSessionConfig {
     pub(super) quic_insecure: bool,
     pub(super) tunnel_protocol: TunnelTransportProtocol,
     pub(super) auth_token_provider: Option<Arc<AuthTokenProvider>>,
+    pub(super) shutdown_drain_timeout: Duration,
 }
 
 impl TryFrom<InferenceServerRegistrationConfig> for RegistrationSessionConfig {
@@ -108,6 +112,7 @@ impl TryFrom<InferenceServerRegistrationConfig> for RegistrationSessionConfig {
             quic_insecure: config.quic_insecure,
             tunnel_protocol: config.tunnel_protocol,
             auth_token_provider: config.auth_token_provider,
+            shutdown_drain_timeout: config.shutdown_drain_timeout,
         })
     }
 }

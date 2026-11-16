@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +29,7 @@ use super::topology::RegistrationRouterTopology;
 use super::types::{ClientError, InferenceServerRegistrationConfig, RegistrationSessionConfig};
 
 async fn run_registration_session(config: RegistrationSessionConfig, stop: CancellationToken) {
+    let drain_timeout = config.shutdown_drain_timeout;
     let config = Arc::new(config);
     let (router_topology_tx, router_topology_rx) =
         watch::channel(RegistrationRouterTopology::default());
@@ -50,7 +52,7 @@ async fn run_registration_session(config: RegistrationSessionConfig, stop: Cance
     let tasks = vec![watch_task, registration_task];
 
     stop.cancelled().await;
-    OwnedTask::shutdown_all(tasks, TASK_SHUTDOWN_TIMEOUT).await;
+    OwnedTask::shutdown_all(tasks, drain_timeout).await;
 }
 
 async fn run_registration_supervisor(
@@ -73,8 +75,7 @@ async fn run_registration_supervisor(
         let retired_tasks = per_router_tasks
             .extract_if(|router, _| !desired_routers.contains(router))
             .map(|(_, task)| task)
-            .collect();
-        OwnedTask::shutdown_all(retired_tasks, TASK_SHUTDOWN_TIMEOUT).await;
+            .collect::<Vec<_>>();
 
         for router in &desired_routers {
             if !per_router_tasks.contains_key(router) {
@@ -90,6 +91,9 @@ async fn run_registration_supervisor(
                 per_router_tasks.insert(router.clone(), task);
             }
         }
+        // Retired streams drain their reverse tunnels, so register with new
+        // routers first.
+        OwnedTask::shutdown_all(retired_tasks, TASK_SHUTDOWN_TIMEOUT).await;
 
         let finished = tokio::select! {
             _ = stop.cancelled() => true,
@@ -102,7 +106,7 @@ async fn run_registration_supervisor(
 
     OwnedTask::shutdown_all(
         per_router_tasks.into_values().collect(),
-        TASK_SHUTDOWN_TIMEOUT,
+        config.shutdown_drain_timeout,
     )
     .await;
 }
@@ -110,6 +114,7 @@ async fn run_registration_supervisor(
 #[derive(Default)]
 pub struct InferenceServerRegistrationClient {
     running: Option<OwnedTask>,
+    drain_timeout: Duration,
 }
 
 impl InferenceServerRegistrationClient {
@@ -119,7 +124,7 @@ impl InferenceServerRegistrationClient {
 
     pub async fn shutdown(&mut self) {
         if let Some(running) = self.running.take() {
-            running.shutdown(TASK_SHUTDOWN_TIMEOUT).await;
+            running.shutdown(self.drain_timeout).await;
         }
     }
 
@@ -134,7 +139,8 @@ impl InferenceServerRegistrationClient {
 
     pub fn start(&mut self, config: InferenceServerRegistrationConfig) -> Result<(), ClientError> {
         self.stop();
-        let config = config.try_into()?;
+        let config: RegistrationSessionConfig = config.try_into()?;
+        self.drain_timeout = config.shutdown_drain_timeout;
         self.running = Some(OwnedTask::spawn("registration session", move |stop| {
             run_registration_session(config, stop)
         }));
@@ -178,6 +184,7 @@ mod tests {
         let (running, dropped) = spawn_pending_owned_task().await;
         let client = InferenceServerRegistrationClient {
             running: Some(running),
+            ..Default::default()
         };
 
         // Dropping the client must tear down its one physical session root.

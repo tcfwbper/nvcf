@@ -2371,6 +2371,7 @@ async fn transport_local_shared_cluster_failover_stays_within_selected_cluster()
             grpc_tls_ca_cert_pem: None,
             quic_insecure: true,
             tunnel_protocol: Default::default(),
+            shutdown_drain_timeout: pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
         },
         "bad registration failed",
     );

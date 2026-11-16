@@ -33,3 +33,15 @@ pub use types::{ClientError, InferenceServerRegistrationConfig};
 use urls::normalize_addr;
 
 const REVERSE_TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// Routers keep sending requests until they see the registration close, so a
+// stopping reverse tunnel keeps accepting streams this long after the close.
+const REVERSE_TUNNEL_ACCEPT_WINDOW: Duration = Duration::from_secs(2);
+// A relay in front of the router acknowledges response bytes before it passes
+// them on and drops them when the tunnel closes, so a drained tunnel stays open
+// this long after its last request.
+const REVERSE_TUNNEL_CLOSE_LINGER: Duration = Duration::from_secs(1);
+/// Default bound on the wait for in-flight requests when Pylon shuts down.
+/// Pylon needs up to 5 s more to stop, so the worker pod termination grace
+/// period must be at least this bound plus 5 s, which is longer than the
+/// Kubernetes default of 30 s.
+pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
