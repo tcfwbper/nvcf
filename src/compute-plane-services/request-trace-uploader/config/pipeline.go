@@ -135,8 +135,10 @@ func auditPrefixValue(lookup LookupFunc, segmentPrefix string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
+	// The segment package quotes the prefixes it rejects; startup errors
+	// name the setting only.
 	if err := segment.ValidatePrefixes([]string{segmentPrefix, value}); err != nil {
-		return "", fmt.Errorf("%s: %w", EnvAuditPrefix, err)
+		return "", fmt.Errorf("%s must have no path separator, and neither it nor %s may equal the other or extend it with a dot", EnvAuditPrefix, EnvSegmentPrefix)
 	}
 	return value, nil
 }

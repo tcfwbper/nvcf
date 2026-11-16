@@ -6,9 +6,11 @@
 package service
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -43,7 +45,7 @@ func TestFingerprintRefusesWhatIsNotARegularFile(t *testing.T) {
 	for _, path := range []string{link, fifo} {
 		done := make(chan error, 1)
 		go func() {
-			_, err := u.fingerprint(segment.Segment{Path: path})
+			_, err := u.fingerprint(context.Background(), segment.Segment{Path: path})
 			done <- err
 		}()
 		select {
@@ -117,5 +119,23 @@ func TestRecordPolicyWithRedactionOffIsUnchangedByTheUpgrade(t *testing.T) {
 	sum := sha256.Sum256(raw)
 	if want := hex.EncodeToString(sum[:16]); got != want {
 		t.Fatalf("recordPolicy = %s, want %s, the policy before the redaction version", got, want)
+	}
+}
+
+// A drain is bounded by its context, so hashing a large segment stops once
+// the context is done, and the unfinished hash is not kept.
+func TestFingerprintStopsWhenTheContextIsDone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "request-trace.000001.jsonl.gz")
+	if err := os.WriteFile(path, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{fingerprints: map[fileIdentity]string{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := u.fingerprint(ctx, segment.Segment{Path: path, Size: 1 << 20}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("fingerprint() error = %v, want context.Canceled", err)
+	}
+	if len(u.fingerprints) != 0 {
+		t.Fatal("an unfinished hash was kept")
 	}
 }

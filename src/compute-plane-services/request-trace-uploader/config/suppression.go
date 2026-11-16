@@ -145,6 +145,12 @@ func ncaHeaders(raw string) ([]string, error) {
 		if j := slices.Index(headers, header); j >= 0 {
 			return nil, fmt.Errorf("%s entry %d repeats entry %d", EnvSuppressNCAHeaders, i, j)
 		}
+		// Checked here as well as in Validate, so a bad name fails startup
+		// even while no NCA id uses the list.
+		probe := suppress.Config{Rules: []suppress.Rule{{Name: NCAIDRuleName, Headers: []string{header}, Values: []string{"probe"}, Action: suppress.StripPayload}}}
+		if probe.Validate() != nil {
+			return nil, fmt.Errorf("%s entry %d is not an HTTP header name", EnvSuppressNCAHeaders, i)
+		}
 		headers = append(headers, header)
 	}
 	return headers, nil

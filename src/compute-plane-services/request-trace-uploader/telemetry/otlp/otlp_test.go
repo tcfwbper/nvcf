@@ -435,3 +435,64 @@ func TestOTLPExportFailureLogsNoCollectorDetails(t *testing.T) {
 		}
 	}
 }
+
+// firstByte accepts one connection and reports the first byte its client
+// sends.
+func firstByte(t *testing.T) (string, <-chan byte) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	got := make(chan byte, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		b := make([]byte, 1)
+		if _, err := io.ReadFull(conn, b); err == nil {
+			got <- b[0]
+		}
+	}()
+	return listener.Addr().String(), got
+}
+
+// tlsHandshake is the first byte of a TLS record that starts a handshake.
+const tlsHandshake = 0x16
+
+// Validate accepts the scheme in any case, as URLs allow, so TLS must follow
+// it in any case too.
+func TestAnHTTPSEndpointUsesTLSWhateverTheCaseOfItsScheme(t *testing.T) {
+	for _, protocol := range []Protocol{ProtocolGRPC, ProtocolHTTP} {
+		for _, scheme := range []string{"https", "HTTPS"} {
+			t.Run(string(protocol)+" "+scheme, func(t *testing.T) {
+				addr, got := firstByte(t)
+				endpoint := scheme + "://" + addr
+				if protocol == ProtocolHTTP {
+					endpoint += "/v1/metrics"
+				}
+				exporter, err := New(context.Background(), Config{Endpoint: endpoint, Protocol: protocol, Interval: time.Hour}, "fake")
+				if err != nil {
+					t.Fatalf("New() error = %v", err)
+				}
+				exporter.Add(telemetry.SubmitsAmbiguous, 1, nil)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_ = exporter.Flush(ctx)
+				_ = exporter.Shutdown(ctx)
+				select {
+				case b := <-got:
+					if b != tlsHandshake {
+						t.Fatalf("first byte = %#x, want %#x: the exporter must start a TLS handshake", b, tlsHandshake)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("the exporter never connected")
+				}
+			})
+		}
+	}
+}

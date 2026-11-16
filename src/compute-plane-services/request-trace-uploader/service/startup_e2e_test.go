@@ -6,6 +6,7 @@ package service_test
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/backendtest"
@@ -15,14 +16,20 @@ import (
 )
 
 // A missing secrets file stops startup before any segment is read or sent.
+// The runner logs the error, and logs never carry paths.
 func TestStartupStopsWithoutTheSecretsFile(t *testing.T) {
 	spool, closed := spoolWith(t, []string{uploadertest.RequestEnd("a", 1)})
 	fake := backendtest.NewFake()
-	missing := filepath.Join(t.TempDir(), "missing.json")
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.json")
 	uploader := newUploader(t, spool, fake, service.Options{}, map[string]string{config.EnvSecretsFile: missing})
 
-	if err := uploader.Pass(context.Background()); err == nil {
+	err := uploader.Pass(context.Background())
+	if err == nil {
 		t.Fatal("Pass() error = nil, want startup to fail without the secrets file")
+	}
+	if strings.Contains(err.Error(), dir) {
+		t.Fatalf("Pass() error = %q, want no path", err)
 	}
 	if fake.SubmitCalls() != 0 || gone(closed[0]) {
 		t.Fatalf("submit calls = %d, want the segment left in place and nothing sent", fake.SubmitCalls())

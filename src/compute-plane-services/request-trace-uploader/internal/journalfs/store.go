@@ -283,10 +283,11 @@ func (s *Store) MarkPrepared(id, backendName string, transports map[string]journ
 	})
 }
 
-// Reprepare sends a prepared segment whose transports were never put in a
-// batch back to Discovered and removes the transports, so it is prepared
-// again, for example under a changed record-handling policy. A segment with
-// any destination in a batch is refused: that work may already be sent.
+// Reprepare sends a prepared segment back to Discovered and removes its
+// transports, so it is prepared again, for example under a changed
+// record-handling policy. Every destination is prepared and sent again,
+// including a confirmed one. A segment with any destination in an
+// unfinished batch is refused: that work may already be sent.
 func (s *Store) Reprepare(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -298,6 +299,9 @@ func (s *Store) Reprepare(id string) error {
 		return fmt.Errorf("%w: segment %s is %s, not prepared", journal.ErrInvalidTransition, shortID(id), seg.State)
 	}
 	for _, dest := range seg.Destinations {
+		if dest.State == journal.StateConfirmed {
+			continue
+		}
 		if dest.State != journal.StatePrepared || dest.BatchID != "" {
 			return fmt.Errorf("%w: segment %s is in a batch", journal.ErrInvalidTransition, shortID(id))
 		}

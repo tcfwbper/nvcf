@@ -83,10 +83,16 @@ func TestNewRequiresCredentials(t *testing.T) {
 	}
 }
 
+// The runner logs this error at startup, and logs never carry paths.
 func TestNewRejectsUnreadableSecretsFile(t *testing.T) {
-	cfg := baseConfig(filepath.Join(t.TempDir(), "missing.json"), "https://127.0.0.1:0")
-	if _, err := New(cfg); err == nil {
+	dir := t.TempDir()
+	cfg := baseConfig(filepath.Join(dir, "missing.json"), "https://127.0.0.1:0")
+	_, err := New(cfg)
+	if err == nil {
 		t.Fatal("New() error = nil, want a read error")
+	}
+	if strings.Contains(err.Error(), dir) {
+		t.Fatalf("New() error = %q, want no path", err)
 	}
 }
 

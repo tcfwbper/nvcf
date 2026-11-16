@@ -93,6 +93,7 @@ func TestLoadSuppressNCAHeaders(t *testing.T) {
 		{name: "a trailing separator fails", env: map[string]string{EnvSuppressNCAIDs: "acme", EnvSuppressNCAHeaders: "nvcf-ncaid,"}, wantErr: true},
 		{name: "a repeated header fails", env: map[string]string{EnvSuppressNCAIDs: "acme", EnvSuppressNCAHeaders: "nvcf-ncaid, NVCF-NCAID"}, wantErr: true},
 		{name: "a bad header list fails without ids", env: map[string]string{EnvSuppressNCAHeaders: "nvcf-ncaid,,x"}, wantErr: true},
+		{name: "a name that is not an HTTP header fails without ids", env: map[string]string{EnvSuppressNCAHeaders: "nvcf-ncaid,bad/header"}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -350,7 +351,7 @@ func TestLoadSuppressionErrorsNameRulesByIndexAndFieldsCanonically(t *testing.T)
 		{
 			name:   "nca id header that is not a header name",
 			env:    map[string]string{EnvSuppressNCAIDs: "t1", EnvSuppressNCAHeaders: "nvcf-ncaid,acme header"},
-			want:   []string{"headers entry 1"},
+			want:   []string{EnvSuppressNCAHeaders + " entry 1"},
 			quoted: []string{"acme header"},
 		},
 		{

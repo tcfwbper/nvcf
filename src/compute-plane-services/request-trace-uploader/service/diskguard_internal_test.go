@@ -43,7 +43,7 @@ func newEvictionFixture(t *testing.T) evictionFixture {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	cfg := config.Config{SourceDir: spool.Dir, SegmentPrefix: config.DefaultSegmentPrefix}
-	return evictionFixture{u: &Uploader{cfg: cfg, store: store}, closed: closed}
+	return evictionFixture{u: &Uploader{cfg: cfg, store: store, point: func(string) {}}, closed: closed}
 }
 
 func (f evictionFixture) discover(t *testing.T, sha string, size int64, mtime time.Time) journal.Segment {

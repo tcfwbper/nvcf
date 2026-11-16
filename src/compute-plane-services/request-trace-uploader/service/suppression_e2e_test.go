@@ -6,18 +6,22 @@ package service_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/backendtest"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/format"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/service"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/uploadertest"
 )
 
@@ -322,6 +326,196 @@ func TestARefusedBatchIsPreparedAgainWhenThePolicyChangesBeforeItsRetry(t *testi
 	}
 }
 
+// dualBackend is a fake that writes every segment to two destinations,
+// one gzip JSON lines transport each. It can refuse every submit to the
+// secondary destination in a way that shows nothing was processed. When
+// landing is set, it copies each file it is sent there, named by
+// destination, so a test can read what went out.
+type dualBackend struct {
+	*backendtest.Fake
+	refuseSecondary bool
+	landing         string
+	sent            *atomic.Int32
+}
+
+func newDualBackend(refuseSecondary bool, landing string) dualBackend {
+	fake := backendtest.NewFake()
+	caps := fake.Capabilities()
+	caps.Destinations = []backend.Destination{"primary", "secondary"}
+	fake.SetCapabilities(caps)
+	return dualBackend{Fake: fake, refuseSecondary: refuseSecondary, landing: landing, sent: &atomic.Int32{}}
+}
+
+func (b dualBackend) Submit(ctx context.Context, request backend.SubmitRequest) (string, error) {
+	if b.refuseSecondary && request.Destination == "secondary" {
+		return refusingBackend{}.Submit(ctx, request)
+	}
+	if b.landing != "" {
+		for _, file := range request.Transports() {
+			name := fmt.Sprintf("%s-%d.jsonl.gz", request.Destination, b.sent.Add(1))
+			if err := copyFile(file.Path, filepath.Join(b.landing, name)); err != nil {
+				return "", err
+			}
+		}
+	}
+	return b.Fake.Submit(ctx, request)
+}
+
+func (dualBackend) Format() backend.Format { return backend.FormatGzipJSONL }
+
+func (dualBackend) NewWriter(target format.Target) (format.Writer, error) {
+	var lanes fanout
+	for _, destination := range target.Destinations {
+		one := target
+		one.Destinations = []backend.Destination{destination}
+		writer, err := format.GzipJSONL{}.NewWriter(one)
+		if err != nil {
+			return nil, errors.Join(err, lanes.Abort())
+		}
+		lanes = append(lanes, writer)
+	}
+	return lanes, nil
+}
+
+// fanout writes every record to each of its writers.
+type fanout []format.Writer
+
+func (f fanout) Write(r transform.Record) error {
+	for _, w := range f {
+		if err := w.Write(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f fanout) Close() error {
+	var errs []error
+	for _, w := range f {
+		errs = append(errs, w.Close())
+	}
+	return errors.Join(errs...)
+}
+
+func (f fanout) Abort() error {
+	var errs []error
+	for _, w := range f {
+		errs = append(errs, w.Abort())
+	}
+	return errors.Join(errs...)
+}
+
+func (f fanout) Outputs() []format.Output {
+	var outputs []format.Output
+	for _, w := range f {
+		outputs = append(outputs, w.Outputs()...)
+	}
+	return outputs
+}
+
+// partlyConfirmed runs a two-destination uploader whose secondary refuses
+// every submit, so the one closed segment, holding suppressedLine, ends with
+// its primary destination confirmed and its secondary never sent. It
+// returns the spool, the closed segment and the confirmed batch id.
+func partlyConfirmed(t *testing.T) (*uploadertest.Spool, []string, string) {
+	t.Helper()
+	spool, closed := spoolWith(t, []string{suppressedLine})
+	first := newUploader(t, spool, newDualBackend(true, ""), service.Options{}, nil)
+	for range 3 {
+		_ = first.Pass(context.Background())
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var confirmed []string
+	for _, b := range journalBatches(t, spool) {
+		if b.Destination == "primary" && b.State == journal.StateConfirmed {
+			confirmed = append(confirmed, b.ID)
+		}
+	}
+	if len(confirmed) != 1 {
+		t.Fatalf("confirmed primary batches = %v, want one", confirmed)
+	}
+	return spool, closed, confirmed[0]
+}
+
+// A segment with one destination confirmed and another never sent is
+// prepared again as a whole when the record policy changes, so nothing goes
+// out under the old policy. The confirmed destination is sent again and
+// counted as a possible duplicate. This holds whether the confirmed batch
+// file is still there or was unreadable and fenced; recovery counts the
+// fenced batch as ambiguous too.
+func TestAPartlyConfirmedSegmentIsPreparedAgainWhenThePolicyChanges(t *testing.T) {
+	cases := []struct {
+		name          string
+		fence         bool
+		wantAmbiguous float64
+	}{
+		{"batch kept", false, 1},
+		{"batch fenced", true, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spool, closed, confirmed := partlyConfirmed(t)
+			if tc.fence {
+				batchFile := filepath.Join(spool.Dir, "request-trace-uploader-state", "batches", confirmed+".json")
+				if err := os.WriteFile(batchFile, []byte("{"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			landing := t.TempDir()
+			metrics, err := telemetry.NewMemory("fake")
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted := newUploader(t, spool, newDualBackend(false, landing), service.Options{Metrics: metrics}, map[string]string{config.EnvSuppressNCAIDs: "nca-acme-nca", config.EnvSuppressNCAHeaders: ncaHeaders})
+			if err := restarted.Pass(context.Background()); err != nil {
+				t.Fatalf("first Pass() after the restart error = %v", err)
+			}
+			passUntil(t, restarted, func() bool { return gone(closed[0]) })
+
+			for _, destination := range []string{"secondary", "primary"} {
+				files, err := filepath.Glob(filepath.Join(landing, destination+"-*.jsonl.gz"))
+				if err != nil || len(files) != 1 {
+					t.Fatalf("%s files sent after the restart = %v, %v; want one", destination, files, err)
+				}
+				joined := strings.Join(readGzipLines(t, files[0]), "\n")
+				if strings.Contains(joined, "secret") || !strings.Contains(joined, `"payload_suppressed":true`) {
+					t.Fatalf("%s sent %s, want the record suppressed under the policy now configured", destination, joined)
+				}
+			}
+			if got, _ := metrics.Value(telemetry.SubmitsAmbiguous, nil); got != tc.wantAmbiguous {
+				t.Fatalf("submits_ambiguous = %v, want %v", got, tc.wantAmbiguous)
+			}
+		})
+	}
+}
+
+// When its source is gone, a partly confirmed segment cannot be prepared
+// again, so its stale transports are kept in quarantine and never sent
+// under the old policy.
+func TestAPartlyConfirmedSegmentWhoseSourceIsGoneIsQuarantinedWhenThePolicyChanges(t *testing.T) {
+	spool, closed, _ := partlyConfirmed(t)
+	if err := os.Remove(closed[0]); err != nil {
+		t.Fatal(err)
+	}
+	landing := t.TempDir()
+	restarted := newUploader(t, spool, newDualBackend(false, landing), service.Options{}, map[string]string{config.EnvSuppressNCAIDs: "nca-acme-nca", config.EnvSuppressNCAHeaders: ncaHeaders})
+	for range 2 {
+		_ = restarted.Pass(context.Background())
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if sent, _ := filepath.Glob(filepath.Join(landing, "*")); len(sent) != 0 {
+		t.Fatalf("files sent after the restart = %v, want none", sent)
+	}
+	if state := journalStates(t, spool)[filepath.Base(closed[0])]; state != journal.StateQuarantined {
+		t.Fatalf("state = %q, want quarantined", state)
+	}
+}
+
 // lostResponseBackend lands each job and then loses the response, so the
 // uploader cannot tell whether the submit committed.
 type lostResponseBackend struct{ dirBackend }
@@ -352,6 +546,102 @@ func TestARetainedSubmitIsNeitherPreparedAgainNorResentWhenThePolicyChanges(t *t
 	}
 	if len(jobs) != 1 || gone(closed[0]) {
 		t.Fatalf("landed jobs = %d, source deleted = %t; want the retained submit left for an operator", len(jobs), gone(closed[0]))
+	}
+}
+
+// A batch whose submits were only refused is released at startup when the
+// record policy changed. If the journal refuses that release, startup fails
+// and stays failed, so its transport, prepared under the old policy, is never
+// sent, even once the journal takes writes again.
+func TestAFailedStaleReleaseAtStartupSendsNothing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	landing := t.TempDir()
+	spool, closed := spoolWith(t, []string{suppressedLine})
+	first := newUploader(t, spool, refusingBackend{dirBackend{root: landing}}, service.Options{}, nil)
+	_ = first.Pass(context.Background())
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	batches := journalBatches(t, spool)
+	if len(batches) != 1 || batches[0].State != journal.StateRetryWait || batches[0].MayHaveLanded {
+		t.Fatalf("batches = %+v, want one refused batch waiting to retry", batches)
+	}
+
+	batchDir := filepath.Join(spool.Dir, "request-trace-uploader-state", "batches")
+	if err := os.Chmod(batchDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	restarted := newUploader(t, spool, dirBackend{root: landing}, service.Options{}, map[string]string{config.EnvSuppressNCAIDs: "nca-acme-nca", config.EnvSuppressNCAHeaders: ncaHeaders})
+	firstErr := restarted.Pass(context.Background())
+	if err := os.Chmod(batchDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if firstErr == nil {
+		t.Fatal("Pass() error = nil with the release refused, want startup to fail")
+	}
+	for range 3 {
+		if err := restarted.Pass(context.Background()); err == nil {
+			t.Fatal("Pass() error = nil after a failed startup, want it to stay failed")
+		}
+	}
+	if sent, err := filepath.Glob(filepath.Join(landing, "*")); err != nil || len(sent) != 0 {
+		t.Fatalf("sent = %v, %v; want nothing sent under the old policy", sent, err)
+	}
+	if gone(closed[0]) {
+		t.Fatal("source deleted, want it kept for the next start")
+	}
+}
+
+// lostPrimaryBackend is a two-destination fake whose primary submit lands
+// and then loses its response, so it may have landed, while every secondary
+// submit is refused, so nothing of it was sent.
+type lostPrimaryBackend struct{ dualBackend }
+
+func (b lostPrimaryBackend) Submit(ctx context.Context, request backend.SubmitRequest) (string, error) {
+	if request.Destination == "secondary" {
+		return refusingBackend{}.Submit(ctx, request)
+	}
+	if _, err := b.dualBackend.Submit(ctx, request); err != nil {
+		return "", err
+	}
+	return "", &backend.Fault{Class: backend.ClassUncertain, Scope: backend.ScopeBackend, Reason: backend.ReasonTimeout, Err: errors.New("response lost")}
+}
+
+// A segment's primary is in a submit that may have landed and its secondary
+// was never sent when the record policy changes. The primary's batch is
+// retried as it is, but the secondary never goes out under the old policy:
+// once the primary's batch is done, the segment is prepared again and the
+// secondary is sent under the policy now configured.
+func TestAnUnsentDestinationBesideASubmitThatMayHaveLandedWaitsForTheNewPolicy(t *testing.T) {
+	spool, closed := spoolWith(t, []string{suppressedLine})
+	first := newUploader(t, spool, lostPrimaryBackend{newDualBackend(false, "")}, service.Options{}, nil)
+	_ = first.Pass(context.Background())
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	states := map[string]journal.State{}
+	for _, b := range journalBatches(t, spool) {
+		states[b.Destination] = b.State
+	}
+	if states["primary"] != journal.StateAmbiguous || states["secondary"] != journal.StateRetryWait {
+		t.Fatalf("batch states = %v, want the primary ambiguous and the secondary refused", states)
+	}
+
+	landing := t.TempDir()
+	restarted := newUploader(t, spool, newDualBackend(false, landing), service.Options{}, map[string]string{config.EnvSuppressNCAIDs: "nca-acme-nca", config.EnvSuppressNCAHeaders: ncaHeaders})
+	passUntil(t, restarted, func() bool { return gone(closed[0]) })
+
+	secondary, err := filepath.Glob(filepath.Join(landing, "secondary-*.jsonl.gz"))
+	if err != nil || len(secondary) == 0 {
+		t.Fatalf("secondary files sent = %v, %v; want the segment sent", secondary, err)
+	}
+	for _, file := range secondary {
+		joined := strings.Join(readGzipLines(t, file), "\n")
+		if strings.Contains(joined, "secret") || !strings.Contains(joined, `"payload_suppressed":true`) {
+			t.Fatalf("secondary sent %s, want only the record suppressed under the policy now configured", joined)
+		}
 	}
 }
 
@@ -392,9 +682,8 @@ func TestWarnsForEachRuleWhoseHeaderIsNeverSeen(t *testing.T) {
 // final outcome, not again on every pass that retries it.
 func TestSuppressionCountsAreRecordedOncePerSegment(t *testing.T) {
 	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
-	spool.Roll(uploadertest.NewSegment().Member(suppressedLine).Bytes())
+	closed := spool.Roll(uploadertest.NewSegment().Member(suppressedLine).Bytes())
 	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("x", 1)).Bytes())
-	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvSuppressNCAIDs: "acme", config.EnvSuppressNCAHeaders: ncaHeaders}))
 	fake := backendtest.NewFake()
 	refused := backendtest.SubmitStep{Outcome: backendtest.Refuse}
 	fake.Script(refused, refused)
@@ -402,14 +691,11 @@ func TestSuppressionCountsAreRecordedOncePerSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	uploader, err := service.NewUploader(cfg, fake, service.Options{Metrics: metrics})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for range 3 {
-		if err := uploader.Pass(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+	// Fast fault waits, so both retries happen within the test.
+	uploader := newUploader(t, spool, fake, service.Options{Metrics: metrics}, map[string]string{config.EnvSuppressNCAIDs: "acme", config.EnvSuppressNCAHeaders: ncaHeaders})
+	passUntil(t, uploader, func() bool { return gone(closed) })
+	if got := fake.SubmitCalls(); got != 3 {
+		t.Fatalf("submits = %d, want two refusals and a success", got)
 	}
 	if got, _ := metrics.Value(telemetry.RecordsSuppressed, telemetry.Labels{"rule": config.NCAIDRuleName, "action": "strip_payload"}); got != 1 {
 		t.Fatalf("records_suppressed = %v after two refusals and a success, want 1", got)

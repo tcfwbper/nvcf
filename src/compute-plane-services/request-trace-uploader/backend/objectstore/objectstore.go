@@ -24,6 +24,7 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 )
 
@@ -217,7 +218,8 @@ func rejectNonHTTPSRedirect(req *http.Request, via []*http.Request) error {
 func loadCredentials(path string) (credentials, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return credentials{}, fmt.Errorf("objectstore backend: read credentials: %w", err)
+		// The runner logs this error at startup; logs never carry paths.
+		return credentials{}, fmt.Errorf("objectstore backend: read credentials: %w", atomicfile.Pathless(err))
 	}
 	var creds credentials
 	if err := json.Unmarshal(data, &creds); err != nil {

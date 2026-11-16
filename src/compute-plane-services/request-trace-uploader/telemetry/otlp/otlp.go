@@ -245,7 +245,8 @@ func signalFromEnv(lookup func(string) (string, bool), endpointEnv, protocolEnv 
 // clears a certificate the environment named, and the system roots with no
 // client certificate for https.
 func tlsFor(endpoint string) *tls.Config {
-	if strings.HasPrefix(endpoint, "https://") {
+	// url.Parse lowercases the scheme, as Validate reads it.
+	if u, err := url.Parse(endpoint); err == nil && u.Scheme == "https" {
 		return &tls.Config{MinVersion: tls.VersionTLS12}
 	}
 	return nil

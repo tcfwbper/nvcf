@@ -68,6 +68,9 @@ const (
 	// PointReopened follows the reopening of a segment that a run that did
 	// not export finished, before it is prepared again.
 	PointReopened = "reopened"
+	// PointEvicted follows the record of an evicted segment, before its
+	// files are deleted.
+	PointEvicted = "evicted"
 )
 
 // Options tunes an Uploader beyond its configuration.
@@ -152,7 +155,10 @@ type Uploader struct {
 	solo       map[string]bool
 	lastPolled map[string]time.Time
 	// unsaved holds job ids the journal could not record yet, by batch.
-	unsaved  map[string]string
+	unsaved map[string]string
+	// unsent holds batches that were recorded but never sent and whose
+	// release the journal refused.
+	unsent   map[string]bool
 	draining atomic.Bool
 	// evictDue is set by the spool check when segments must be evicted.
 	// Intake evicts at its next segment boundary, never mid-prepare.
@@ -224,6 +230,9 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	telemetry.Preset(metrics)
 	rules.preset(metrics)
 	metrics.Add(telemetry.RecordsDropped, 0, unsupportedVersionLabels())
+	for _, r := range unreadableReasons {
+		metrics.Add(telemetry.RecordsUnreadable, 0, telemetry.Labels{"reason": r.reason})
+	}
 	if receiver, ok := client.(telemetry.Receiver); ok {
 		receiver.UseMetrics(metrics)
 	}
@@ -276,6 +285,7 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 		solo:         map[string]bool{},
 		lastPolled:   map[string]time.Time{},
 		unsaved:      map[string]string{},
+		unsent:       map[string]bool{},
 	}
 	if receiver, ok := client.(telemetry.TransportReceiver); ok {
 		receiver.UseTransport(u.wrapTransport)
@@ -454,10 +464,10 @@ func (u *Uploader) open(ctx context.Context) error {
 	}
 	secret, err := os.Open(u.cfg.SecretsFile)
 	if err != nil {
-		return fmt.Errorf("open uploader secret file: %w", err)
+		return fmt.Errorf("open uploader secret file: %w", atomicfile.Pathless(err))
 	}
 	if err := secret.Close(); err != nil {
-		return fmt.Errorf("close uploader secret file: %w", err)
+		return fmt.Errorf("close uploader secret file: %w", atomicfile.Pathless(err))
 	}
 
 	store, err := journalfs.Open(ctx, journalfs.Config{

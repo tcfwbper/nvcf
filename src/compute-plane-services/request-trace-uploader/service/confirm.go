@@ -23,13 +23,16 @@ func (u *Uploader) pollRound(ctx context.Context) error {
 	if err := u.store.SettleBatches(); err != nil {
 		slog.Warn("finish recorded confirmations", "error", safeError(err))
 	}
+	polled := map[string]bool{}
 	for _, b := range u.store.Batches() {
 		if b.Receipt == nil || b.Receipt.Backend != u.name {
 			continue
 		}
 		switch b.State {
 		case journal.StateSubmitted, journal.StateAmbiguous:
+			polled[b.ID] = true
 		case journal.StateStranded:
+			polled[b.ID] = true
 			if now.Sub(u.polledAt(b.ID)) < strandedPollInterval {
 				continue
 			}
@@ -49,6 +52,7 @@ func (u *Uploader) pollRound(ctx context.Context) error {
 			slog.Error("record job status", "batch", shortID(b.ID), "error", safeError(err))
 		}
 	}
+	u.forgetUnpolled(polled)
 	return nil
 }
 
@@ -191,6 +195,19 @@ func (u *Uploader) observeExportLatency(b journal.Batch) {
 		}
 		if latency := seg.ConfirmedAt.Sub(seg.DiscoveredAt); latency >= 0 {
 			u.metrics.Observe(telemetry.ExportLatency, latency.Seconds(), nil)
+		}
+	}
+}
+
+// forgetUnpolled drops the last poll time of every batch a round did not
+// find in a polled state, such as one whose job failed, so the map holds
+// only batches that are still polled.
+func (u *Uploader) forgetUnpolled(polled map[string]bool) {
+	u.stateMu.Lock()
+	defer u.stateMu.Unlock()
+	for id := range u.lastPolled {
+		if !polled[id] {
+			delete(u.lastPolled, id)
 		}
 	}
 }

@@ -57,3 +57,20 @@ func TestUnsupportedVersionDropsArePresetToZero(t *testing.T) {
 		t.Fatalf("records_dropped%v = %v, %v; want 0 before any traffic", unsupportedVersion, got, ok)
 	}
 }
+
+// The unreadable reasons are an open label, which telemetry.Preset skips, so
+// the uploader presets each reason it records.
+func TestUnreadableRecordReasonsArePresetToZero(t *testing.T) {
+	spool, _ := spoolWith(t)
+	metrics, err := telemetry.NewMemory("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newUploader(t, spool, backendtest.NewFake(), service.Options{Metrics: metrics}, nil)
+
+	for _, reason := range []string{"unparseable", "line_too_long", "row_too_large", "cut"} {
+		if got, ok := metrics.Value(telemetry.RecordsUnreadable, telemetry.Labels{"reason": reason}); !ok || got != 0 {
+			t.Errorf("records_unreadable{reason=%s} = %v, %v; want 0 before any traffic", reason, got, ok)
+		}
+	}
+}

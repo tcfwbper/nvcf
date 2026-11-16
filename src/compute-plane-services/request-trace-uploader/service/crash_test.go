@@ -179,6 +179,77 @@ func TestCrashChildRunsThePipeline(t *testing.T) {
 	}
 }
 
+// TestCrashChildEvictsAboveTheHighWatermark is the child of the eviction
+// crash test: the spool reads as 90% full, so its pass evicts the oldest
+// closed segment. It is killed at the point the parent named.
+func TestCrashChildEvictsAboveTheHighWatermark(t *testing.T) {
+	if !uploadertest.CrashChild() {
+		t.Skip("runs only as a crash child")
+	}
+	spool := &uploadertest.Spool{Dir: os.Getenv(envCrashSpool), Prefix: config.DefaultSegmentPrefix}
+	volume := &segmentVolume{dir: spool.Dir}
+	volume.total.Store(volume.segmentBytes() * 10 / 9)
+	uploader := newUploader(t, spool, dirBackend{root: os.Getenv(envCrashLanding)}, service.Options{Point: uploadertest.CrashPoint, Volume: volume}, nil)
+	_ = uploader.Pass(context.Background())
+}
+
+// transportFiles lists the files in the journal's transport directory.
+func transportFiles(t *testing.T, spool *uploadertest.Spool) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(spool.Dir, "request-trace-uploader-state", "transport"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// A crash after an eviction is recorded and before its files are deleted
+// leaves nothing behind: the restart removes the segment's transports, and
+// the evicted records are never sent.
+func TestACrashAfterAnEvictionIsRecordedLeavesNoTransports(t *testing.T) {
+	if uploadertest.CrashChild() {
+		t.Skip("runs only in the parent")
+	}
+	landing := t.TempDir()
+	spool, closed := spoolWith(t, []string{uploadertest.RequestEnd("a", 1)})
+	env := []string{envCrashSpool + "=" + spool.Dir, envCrashLanding + "=" + landing}
+	// The first child prepares the segment and is killed before it batches it.
+	result := uploadertest.RunCrash(t, "TestCrashChildRunsThePipeline", service.PointPrepared, env...)
+	if !result.Killed || result.Point != service.PointPrepared {
+		t.Fatalf("child was not killed at %s:\n%s", service.PointPrepared, result.Output)
+	}
+	if len(transportFiles(t, spool)) == 0 {
+		t.Fatal("no transport after the segment was prepared")
+	}
+	// The second finds the spool above the high watermark and is killed
+	// after it recorded the eviction.
+	result = uploadertest.RunCrash(t, "TestCrashChildEvictsAboveTheHighWatermark", service.PointEvicted, env...)
+	if !result.Killed || result.Point != service.PointEvicted {
+		t.Fatalf("child was not killed at %s:\n%s", service.PointEvicted, result.Output)
+	}
+
+	restarted := newUploader(t, spool, dirBackend{root: landing}, service.Options{Volume: roomyVolume(spool.Dir)}, nil)
+	if err := restarted.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass() after restart error = %v", err)
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if left := transportFiles(t, spool); len(left) != 0 {
+		t.Errorf("transports left after the restart: %d", len(left))
+	}
+	if n := landedRequests(t, landing)["a"]; n != 0 {
+		t.Errorf("evicted request a landed %d times", n)
+	}
+	if state := journalStates(t, spool)[filepath.Base(closed[0])]; state != journal.StateDone {
+		t.Errorf("journal state = %q, want done", state)
+	}
+}
+
 func TestACrashAtAnyPointLosesAndDoubleDeletesNothing(t *testing.T) {
 	if uploadertest.CrashChild() {
 		t.Skip("runs only in the parent")

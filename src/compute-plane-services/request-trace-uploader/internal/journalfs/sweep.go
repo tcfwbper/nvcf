@@ -5,6 +5,7 @@ package journalfs
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
@@ -28,6 +29,18 @@ func (s *Store) Sweep() (int, error) {
 	for id, seg := range s.segments {
 		if seg.State != journal.StateDone || seg.DoneAt.After(cutoff) {
 			continue
+		}
+		// The tombstone is the last record of an evicted segment's
+		// transports, so their removal is made durable before it goes.
+		if seg.Reason == journal.ReasonEvicted {
+			if err := s.removeTransportsLocked(id, transportPaths(seg)); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if err := syncDirWith(s.hooks, s.layout.transport()); err != nil {
+				errs = append(errs, fmt.Errorf("sync transport directory: %w", err))
+				continue
+			}
 		}
 		if err := removeDurably(s.hooks, filepath.Join(s.layout.segments(), segmentFileName(seg.Name, seg.ID))); err != nil {
 			errs = append(errs, err)

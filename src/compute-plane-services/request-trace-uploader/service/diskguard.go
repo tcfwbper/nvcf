@@ -199,6 +199,8 @@ func evictionKey(entries []journal.Segment, item segment.Segment) (string, bool)
 // Evict records the loss in the journal first and then deletes the files,
 // syncing the directory, so a crash in between leaves a file whose entry is
 // already done: intake skips it and a later pass evicts it as a bare file.
+// The journal removes the transports such a crash or a failed delete left,
+// at the next start or with the tombstone.
 // A segment is never prepared or sent from files that are gone.
 func (s spoolSegments) Evict(key string) error {
 	if name, ok := strings.CutPrefix(key, evictFile); ok {
@@ -218,6 +220,7 @@ func (s spoolSegments) Evict(key string) error {
 	if err := s.u.store.Evict(id); err != nil {
 		return err
 	}
+	s.u.point(PointEvicted)
 	var errs []error
 	for _, dest := range seg.Destinations {
 		errs = append(errs, removeDurably(dest.Transport.Path))

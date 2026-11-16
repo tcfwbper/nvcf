@@ -223,3 +223,22 @@ func TestStrictModeAcceptsExactlyTheDocumentedSettings(t *testing.T) {
 		t.Fatalf("settings Load reads:\n got  %v\n want %v", got, want)
 	}
 }
+
+// Errors name the setting, never its value.
+func TestAuditPrefixErrorsDoNotQuoteTheValue(t *testing.T) {
+	for name, value := range map[string]string{
+		"separator": "secret-audit/x",
+		"equal":     DefaultSegmentPrefix,
+		"extends":   DefaultSegmentPrefix + ".secret-audit",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := Load(mapLookup(requiredEnv(map[string]string{EnvAuditPrefix: value})))
+			if err == nil {
+				t.Fatal("Load() error = nil, want a startup error")
+			}
+			if !strings.Contains(err.Error(), EnvAuditPrefix) || strings.Contains(err.Error(), value) {
+				t.Fatalf("Load() error = %q, want it to name %s and not quote the value", err, EnvAuditPrefix)
+			}
+		})
+	}
+}

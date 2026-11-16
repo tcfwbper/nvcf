@@ -404,6 +404,35 @@ func TestReprepareResetsOnlyAnUnbatchedPreparedSegment(t *testing.T) {
 	mustState(t, store, ids[1], journal.StateSubmitting)
 }
 
+// A confirmed destination's batch is finished, so the segment can be
+// prepared again as a whole, for example after a record policy change.
+func TestRepreparePreparesAgainASegmentWithAConfirmedDestination(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, transports := preparedSegments(t, h, store, 1, "primary", "secondary")
+	createBatch(t, store, batchFor("b1", "primary", ids, transports))
+	if err := store.SetReceipt("b1", journal.Receipt{Backend: "fake", ID: "job-1"}); err != nil {
+		t.Fatalf("SetReceipt: %v", err)
+	}
+	if err := store.ConfirmBatch("b1"); err != nil {
+		t.Fatalf("ConfirmBatch: %v", err)
+	}
+	mustState(t, store, ids[0], journal.StatePrepared)
+
+	if err := store.Reprepare(ids[0]); err != nil {
+		t.Fatalf("Reprepare with a confirmed destination: %v", err)
+	}
+	seg := mustState(t, store, ids[0], journal.StateDiscovered)
+	if len(seg.Destinations) != 0 {
+		t.Fatalf("destinations = %v, want the transports dropped", seg.Destinations)
+	}
+	for _, lane := range []string{"primary", "secondary"} {
+		if _, err := os.Stat(transports[0][lane].Path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s transport stat = %v, want it removed", lane, err)
+		}
+	}
+}
+
 func TestReleaseForResendCountsTheResendOnEveryMember(t *testing.T) {
 	h := newHarness(t)
 	store := h.open()

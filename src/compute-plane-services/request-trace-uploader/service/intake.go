@@ -80,7 +80,7 @@ func (u *Uploader) intake(ctx context.Context, final bool) error {
 }
 
 func (u *Uploader) take(ctx context.Context, item segment.Segment) error {
-	sum, err := u.fingerprint(item)
+	sum, err := u.fingerprint(ctx, item)
 	if errors.Is(err, fs.ErrNotExist) {
 		// Cleanup removed it after the scan listed it.
 		return nil
@@ -136,7 +136,7 @@ func (u *Uploader) take(ctx context.Context, item segment.Segment) error {
 
 // fingerprint returns the hex sha256 of a closed segment, reading it only
 // the first time its name, size and modification time are seen.
-func (u *Uploader) fingerprint(item segment.Segment) (string, error) {
+func (u *Uploader) fingerprint(ctx context.Context, item segment.Segment) (string, error) {
 	key := fileIdentity{name: filepath.Base(item.Path), size: item.Size, modTime: item.ModTime}
 	if sum, ok := u.fingerprints[key]; ok {
 		return sum, nil
@@ -147,12 +147,26 @@ func (u *Uploader) fingerprint(item segment.Segment) (string, error) {
 	}
 	defer file.Close()
 	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
+	// Checked per chunk, so a drain never waits for a whole large segment.
+	if _, err := io.Copy(contextWriter{ctx: ctx, w: hash}, file); err != nil {
 		return "", fmt.Errorf("fingerprint segment: %w", err)
 	}
 	sum := hex.EncodeToString(hash.Sum(nil))
 	u.fingerprints[key] = sum
 	return sum, nil
+}
+
+// contextWriter refuses writes once ctx is done.
+type contextWriter struct {
+	ctx context.Context
+	w   io.Writer
+}
+
+func (c contextWriter) Write(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.w.Write(p)
 }
 
 func (u *Uploader) forgetGone(scan segment.Scan) {
@@ -286,9 +300,16 @@ func recordPolicy(cfg transform.Config, factory format.Factory) (string, error) 
 // redaction applies to them. Their segments are prepared again from the
 // source. A batch whose submits were only ever refused is released first,
 // since nothing in it was sent. Transports in a batch that may have landed
-// are left alone. A segment whose source is gone keeps its transports in
-// quarantine: they are the only copy, and sending them would apply settings
-// they were not prepared for.
+// are left alone. A segment with one destination confirmed and another
+// unsent is prepared again as a whole, so nothing goes out under the old
+// policy; the confirmed destination is sent again and counted in
+// submits_ambiguous as a possible duplicate. A segment whose source is gone
+// keeps its transports in quarantine: they are the only copy, and sending
+// them would apply settings they were not prepared for.
+//
+// It runs at startup and again on every pass: a segment with a destination
+// in a batch that may have landed waits, its unsent destinations held from
+// batching, until that batch is done, and is then prepared again.
 func (u *Uploader) reprepareStale() error {
 	var errs []error
 	for _, b := range u.store.Batches() {
@@ -304,10 +325,15 @@ func (u *Uploader) reprepareStale() error {
 		if seg.State != journal.StatePrepared || seg.Backend != u.name {
 			continue
 		}
-		stale, batched := false, false
+		stale, batched, confirmed := false, false, 0
 		for _, dest := range seg.Destinations {
 			stale = stale || dest.Transport.Policy != u.prepPolicy
-			batched = batched || dest.BatchID != ""
+			if dest.State == journal.StateConfirmed {
+				// Its batch is finished, or gone when it was fenced.
+				confirmed++
+				continue
+			}
+			batched = batched || dest.BatchID != "" || dest.State != journal.StatePrepared
 		}
 		if !stale || batched {
 			continue
@@ -329,6 +355,7 @@ func (u *Uploader) reprepareStale() error {
 			errs = append(errs, err)
 			continue
 		}
+		u.metrics.Add(telemetry.SubmitsAmbiguous, float64(confirmed), nil)
 		discarded++
 	}
 	if discarded > 0 {

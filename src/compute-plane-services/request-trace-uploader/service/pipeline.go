@@ -67,9 +67,9 @@ func (u *Uploader) pass(ctx context.Context, poll bool) error {
 		return err
 	}
 	var errs []error
-	_ = u.locked(&u.intakeMu, func() error {
-		return u.locked(&u.submitMu, func() error { u.enforceDiskBounds(); return nil })
-	})
+	errs = append(errs, u.locked(&u.intakeMu, func() error {
+		return u.locked(&u.submitMu, func() error { u.enforceDiskBounds(); return u.reprepareStale() })
+	}))
 	if !u.draining.Load() {
 		errs = append(errs, u.locked(&u.intakeMu, func() error { return u.intake(ctx, false) }))
 	}

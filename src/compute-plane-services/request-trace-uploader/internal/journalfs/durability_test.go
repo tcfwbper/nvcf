@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
 )
@@ -241,4 +242,47 @@ func TestDirectorySyncErrorsCarryNoPaths(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "missing-dir") {
 		t.Fatalf("syncDir() = %v, want an error with no path", err)
 	}
+}
+
+// An evicted segment's tombstone is the last record of its transports, so
+// their removal is synced before the tombstone goes.
+func TestSweepSyncsAnEvictedSegmentsTransportRemovalsBeforeTheTombstone(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, _ := preparedSegments(t, h, store, 1, "primary")
+	if err := store.Evict(ids[0]); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	h.clock.Advance(25 * time.Hour)
+	events := record(store)
+
+	if removed, err := store.Sweep(); err != nil || removed != 1 {
+		t.Fatalf("Sweep = %d, %v; want the tombstone removed", removed, err)
+	}
+	transports := indexOfEvent(*events, "sync-dir", store.TransportDir())
+	tombstone := indexOfEvent(*events, "sync-dir", filepath.Join(h.cfg.StateDir, "segments"))
+	if transports < 0 || tombstone < 0 || transports > tombstone {
+		t.Fatalf("sweep steps = %v, want the transport directory synced before the tombstone's", *events)
+	}
+}
+
+func TestSweepKeepsAnEvictedTombstoneWhenItsTransportRemovalIsNotSynced(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, _ := preparedSegments(t, h, store, 1, "primary")
+	if err := store.Evict(ids[0]); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	h.clock.Advance(25 * time.Hour)
+	store.hooks.beforeSyncDir = func(dir string) error {
+		if dir == store.TransportDir() {
+			return errCrash
+		}
+		return nil
+	}
+
+	if _, err := store.Sweep(); !errors.Is(err, errCrash) {
+		t.Fatalf("Sweep error = %v, want the transport directory sync failure", err)
+	}
+	mustState(t, store, ids[0], journal.StateDone)
 }

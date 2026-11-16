@@ -371,6 +371,43 @@ func TestEmptyAndEvictedSegmentsEndDone(t *testing.T) {
 	}
 }
 
+// Evict records Done before it deletes the files, so a crash or a failed
+// delete in between leaves the transports. The next start removes them.
+func TestRecoverRemovesTheTransportsOfAnEvictedSegment(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, transports := preparedSegments(t, h, store, 1, "primary")
+	if err := store.Evict(ids[0]); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	store = h.restart(store)
+	recoverFake(t, store)
+
+	mustState(t, store, ids[0], journal.StateDone)
+	if exists(transports[0]["primary"].Path) {
+		t.Fatal("transport of an evicted segment kept after recovery")
+	}
+}
+
+// A tombstone is the last record of its transports, so they go first.
+func TestSweepRemovesAnEvictedSegmentsTransportsWithItsTombstone(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, transports := preparedSegments(t, h, store, 1, "primary")
+	if err := store.Evict(ids[0]); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	h.clock.Advance(25 * time.Hour)
+	if removed, err := store.Sweep(); err != nil || removed != 1 {
+		t.Fatalf("Sweep after the TTL = %d, %v; want the tombstone removed", removed, err)
+	}
+	if exists(transports[0]["primary"].Path) {
+		t.Fatal("transport of an evicted segment outlived its tombstone")
+	}
+}
+
 func TestRecoverPollsAReceiptWithItsOwnLinkedBackend(t *testing.T) {
 	h := newHarness(t)
 	store := h.open()

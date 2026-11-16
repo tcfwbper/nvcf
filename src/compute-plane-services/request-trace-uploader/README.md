@@ -396,7 +396,8 @@ a newer record type that carries them is checked too.
   decides. Names are trimmed and lower-cased. The uploader has no built-in
   list, so this is required while `REQUEST_TRACE_UPLOADER_SUPPRESS_NCA_IDS`
   has an id; the deployment supplies the default, for example
-  `nvcf-ncaid,nvcf-nca-id`. A blank or repeated name stops startup.
+  `nvcf-ncaid,nvcf-nca-id`. A blank, repeated or invalid header name stops
+  startup, even while no NCA id is set.
 - `REQUEST_TRACE_UPLOADER_SUPPRESSION_RULES`: further rules as a JSON list,
   evaluated after the NCA id rule, for example
   `[{"name":"tenants","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`.
@@ -439,3 +440,13 @@ and the first 100 payload records carry no rule header, the uploader logs
 one warning. With strict suppression on, it also logs one warning per rule
 the first time it strips a record for that rule. Without strict
 suppression, it never holds or drops records for a missing header.
+
+When a restart brings new suppression or redaction settings, a segment not
+yet sent everywhere is prepared again from its source under the new
+settings. With two destinations, one that already confirmed the segment gets
+it again, which can duplicate its rows and is counted in
+`submits_ambiguous`. A submit that may have landed is retried as it was, so
+its destination can still get the segment under the old settings. The
+segment's other destinations wait until that submit is done and are then
+prepared again. A segment whose source is gone is quarantined instead of
+sent under the old settings.
