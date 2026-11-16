@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
 )
 
 // ErrDeletedNotSynced reports data that was deleted but whose directory
@@ -66,8 +68,8 @@ func (q *Quarantine) RejectsDir() string {
 // power loss never keeps a removal without the moved file. When a move fails,
 // the moves already made are synced before the error returns. A file never
 // replaces one already in the entry: a name already taken gets a numbered
-// suffix. A path already gone is skipped, so an interrupted Admit can be
-// repeated.
+// suffix. A path already gone is skipped, and so is a source directory that
+// is gone, so an interrupted Admit can be repeated.
 func (q *Quarantine) Admit(id string, paths ...string) error {
 	if !validEntryName(id) {
 		return fmt.Errorf("quarantine id %q is not a plain name", id)
@@ -88,8 +90,13 @@ func (q *Quarantine) Admit(id string, paths ...string) error {
 			sources = append(sources, dir)
 		}
 	}
-	for _, dir := range append([]string{entry}, sources...) {
-		if err := syncDir(dir); err != nil {
+	if err := syncDir(entry); err != nil {
+		return errors.Join(moveErr, err)
+	}
+	for _, dir := range sources {
+		// A source directory removed since its file left has no removal
+		// left to make durable.
+		if err := syncDir(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return errors.Join(moveErr, err)
 		}
 	}
@@ -205,33 +212,22 @@ func (q *Quarantine) Remove(key string) error {
 	return nil
 }
 
-// linkDurable creates entry and any missing parents, then syncs the parent
-// of each, top down. The entry and the quarantine directory that holds it
-// are linked on every call, even when they exist, so a retry after a failed
-// sync still makes them durable. An entry that is not a real directory, such
-// as a link, is refused: files moved through it would leave the quarantine.
+// linkDurable creates entry and any missing parents with
+// atomicfile.MkdirDurable. The entry and the quarantine directory that holds
+// it are linked on every call, even when they exist, so a retry after a
+// failed sync still makes them durable. An entry that is not a real
+// directory, such as a link, is refused: files moved through it would leave
+// the quarantine.
 func linkDurable(entry string) error {
-	link := []string{entry, filepath.Dir(entry)}
-	for d := filepath.Dir(filepath.Dir(entry)); filepath.Dir(d) != d; d = filepath.Dir(d) {
-		if _, err := os.Stat(d); err == nil {
-			break
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat quarantine directory: %w", err)
+	for _, dir := range []string{filepath.Dir(entry), entry} {
+		if err := atomicfile.MkdirDurable(dir, syncDir); err != nil {
+			return fmt.Errorf("create quarantine directory: %w", err)
 		}
-		link = append(link, d)
-	}
-	if err := os.MkdirAll(entry, 0o750); err != nil {
-		return fmt.Errorf("create quarantine directory: %w", err)
 	}
 	if info, err := os.Lstat(entry); err != nil {
-		return fmt.Errorf("stat quarantine entry: %w", err)
+		return fmt.Errorf("stat quarantine entry: %w", atomicfile.Pathless(err))
 	} else if !info.IsDir() {
 		return errors.New("quarantine entry exists and is not a directory")
-	}
-	for i := len(link) - 1; i >= 0; i-- {
-		if err := syncDir(filepath.Dir(link[i])); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -277,12 +273,12 @@ func treeSize(root string, seen map[fileID]bool) (int64, error) {
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("open directory for sync: %w", err)
+		return fmt.Errorf("open directory for sync: %w", atomicfile.Pathless(err))
 	}
 	syncErr := syncFile(d)
 	closeErr := d.Close()
 	if err := errors.Join(syncErr, closeErr); err != nil {
-		return fmt.Errorf("sync directory: %w", err)
+		return fmt.Errorf("sync directory: %w", atomicfile.Pathless(err))
 	}
 	if onSync != nil {
 		onSync(dir)

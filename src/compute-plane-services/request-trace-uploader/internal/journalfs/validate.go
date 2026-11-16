@@ -68,6 +68,11 @@ func validSegment(seg *journal.Segment, transportDir string) error {
 	if seg.Faults < 0 {
 		errs = append(errs, errors.New("segment fault count is negative"))
 	}
+	// The id derives from these fields, and cleanup trusts the prefix and
+	// index to find the active segment, so they must give the id.
+	if journal.SegmentID(seg.Prefix, seg.Index, seg.Size, seg.SHA256) != seg.ID {
+		errs = append(errs, errors.New("segment identity does not give its id"))
+	}
 	if !segmentStates[seg.State] {
 		errs = append(errs, fmt.Errorf("unknown segment state %q", seg.State))
 	}

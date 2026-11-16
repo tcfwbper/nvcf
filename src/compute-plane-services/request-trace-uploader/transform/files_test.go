@@ -119,7 +119,8 @@ func TestRejectFileSyncsTheParentOfEachDirectoryItCreates(t *testing.T) {
 	if _, err := rejects.Write([]byte("bad\n")); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{root, quarantine}; !slices.Equal(synced, want) {
+	// root exists, so its own link is synced first.
+	if want := []string{filepath.Dir(root), root, quarantine}; !slices.Equal(synced, want) {
 		t.Fatalf("synced %q before commit, want %q", synced, want)
 	}
 

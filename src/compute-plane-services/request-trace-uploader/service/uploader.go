@@ -4,6 +4,7 @@
 package service
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/batch"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/format"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/cleanup"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/health"
@@ -174,6 +176,9 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	prepareConfig := transform.DefaultConfig()
 	prepareConfig.Suppression = cfg.Suppression
 	prepareConfig.Redact = !cfg.SkipRedaction
+	// A longer record is drained to the reject file without being held or
+	// parsed, so one huge line cannot exhaust the pod's memory.
+	prepareConfig.RawLineMax = cmp.Or(cfg.RecordMaxBytes, config.DefaultRecordMaxBytes)
 	preparer, err := transform.New(prepareConfig)
 	if err != nil {
 		return nil, err
@@ -285,6 +290,9 @@ func (u *Uploader) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", u.health.Ready)
 	return mux
 }
+
+// syncDir syncs a directory startup creates. Tests replace it.
+var syncDir = atomicfile.SyncDir
 
 // errNotReady stops startup without stopping the process: the uploader stays
 // live and not ready until it is told to stop.
@@ -436,9 +444,12 @@ func (u *Uploader) start(ctx context.Context) error {
 }
 
 func (u *Uploader) open(ctx context.Context) error {
-	for _, directory := range []string{u.cfg.StateDir, u.cfg.QuarantineDir} {
-		if err := os.MkdirAll(directory, 0o750); err != nil {
-			return fmt.Errorf("create uploader directory: %w", err)
+	for _, dir := range []struct{ path, setting string }{
+		{u.cfg.StateDir, config.EnvStateDir},
+		{u.cfg.QuarantineDir, config.EnvQuarantineDir},
+	} {
+		if err := atomicfile.MkdirDurable(dir.path, syncDir); err != nil {
+			return fmt.Errorf("create the %s directory: %w", dir.setting, err)
 		}
 	}
 	secret, err := os.Open(u.cfg.SecretsFile)

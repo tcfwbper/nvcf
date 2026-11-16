@@ -110,20 +110,22 @@ func (c Config) Validate() error {
 	switch c.Headerless {
 	case "", HeaderlessExport, HeaderlessDrop:
 	default:
-		return fmt.Errorf("suppression: unknown headerless policy %q", c.Headerless)
+		return fmt.Errorf("suppression: headerless policy must be %q or %q", HeaderlessExport, HeaderlessDrop)
 	}
-	names := make(map[string]bool, len(c.Rules))
+	// Errors give rule and header positions, never configured names, which
+	// can be customer identifiers.
+	names := make(map[string]int, len(c.Rules))
 	for i, rule := range c.Rules {
 		if rule.Name != "" {
-			if names[rule.Name] {
-				return fmt.Errorf("suppression rule %d: name %q is used twice", i, rule.Name)
+			if first, used := names[rule.Name]; used {
+				return fmt.Errorf("suppression rule %d: name is also used by rule %d", i, first)
 			}
-			names[rule.Name] = true
+			names[rule.Name] = i
 		}
 		switch rule.Action {
 		case StripPayload, DropRecord:
 		default:
-			return fmt.Errorf("suppression rule %d: unknown action %q", i, rule.Action)
+			return fmt.Errorf("suppression rule %d: action must be %q or %q", i, StripPayload, DropRecord)
 		}
 		if rule.Action == StripPayload && !rule.NCAID && rule.Name == "" {
 			return fmt.Errorf("suppression rule %d: a stripPayload rule needs a name", i)
@@ -131,15 +133,15 @@ func (c Config) Validate() error {
 		if len(rule.Headers) == 0 {
 			return fmt.Errorf("suppression rule %d: no header", i)
 		}
-		for _, name := range rule.Headers {
+		for j, name := range rule.Headers {
 			if strings.TrimSpace(name) == "" {
-				return fmt.Errorf("suppression rule %d: blank header name", i)
+				return fmt.Errorf("suppression rule %d: headers entry %d is blank", i, j)
 			}
 			if name != strings.ToLower(name) {
-				return fmt.Errorf("suppression rule %d: header name %q must be lower case", i, name)
+				return fmt.Errorf("suppression rule %d: headers entry %d must be lower case", i, j)
 			}
 			if !isToken(name) {
-				return fmt.Errorf("suppression rule %d: header name %q is not an HTTP header name", i, name)
+				return fmt.Errorf("suppression rule %d: headers entry %d is not an HTTP header name", i, j)
 			}
 		}
 		if len(normalizedSet(rule.Values)) == 0 {

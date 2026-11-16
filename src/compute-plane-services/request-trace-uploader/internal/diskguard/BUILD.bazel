@@ -13,6 +13,7 @@ go_library(
     ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard",
     visibility = ["//src/compute-plane-services/request-trace-uploader:__subpackages__"],
+    deps = ["//src/compute-plane-services/request-trace-uploader/internal/atomicfile"],
 )
 
 alias(

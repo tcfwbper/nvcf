@@ -280,3 +280,102 @@ func TestLoadRejectsAnIDThatReducesToNothing(t *testing.T) {
 		})
 	}
 }
+
+// Suppression errors name a rule by its position and a field by its
+// canonical name. They never quote text from the configured rules (field
+// names as written, rule names, header names, JSON characters), which can
+// hold customer identifiers.
+func TestLoadSuppressionErrorsNameRulesByIndexAndFieldsCanonically(t *testing.T) {
+	const valid = `{"name":"ok","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}`
+	tests := []struct {
+		name   string
+		env    map[string]string
+		want   []string
+		quoted []string
+	}{
+		{
+			name:   "unknown field",
+			env:    map[string]string{EnvSuppressionRules: `[` + valid + `,{"name":"b","headers":["x-tenant"],"values":["t1"],"action":"dropRecord","acme-key":true}]`},
+			want:   []string{"rule 1"},
+			quoted: []string{"acme-key"},
+		},
+		{
+			name:   "field of the wrong type, written in another case",
+			env:    map[string]string{EnvSuppressionRules: `[{"name":"b","HeAdErS":"x-tenant","values":["t1"],"action":"dropRecord"}]`},
+			want:   []string{"rule 0", "headers"},
+			quoted: []string{"HeAdErS", "ruleSpec"},
+		},
+		{
+			name:   "value of the wrong type",
+			env:    map[string]string{EnvSuppressionRules: `[{"name":"b","headers":["x-tenant"],"VALUES":["t1",7],"action":"dropRecord"}]`},
+			want:   []string{"rule 0", "values"},
+			quoted: []string{"VALUES", "ruleSpec"},
+		},
+		{
+			name:   "rule that is not an object",
+			env:    map[string]string{EnvSuppressionRules: `[` + valid + `,"acme-rule"]`},
+			want:   []string{"rule 1"},
+			quoted: []string{"acme-rule"},
+		},
+		{
+			name:   "invalid JSON",
+			env:    map[string]string{EnvSuppressionRules: `[{"name": Zacme}]`},
+			want:   []string{"not valid JSON"},
+			quoted: []string{"'Z'", "Zacme"},
+		},
+		{
+			name:   "unknown action",
+			env:    map[string]string{EnvSuppressionRules: `[{"name":"acme-rule","headers":["x-tenant"],"values":["t1"],"action":"hide"}]`},
+			want:   []string{"rule 0", "action"},
+			quoted: []string{"acme-rule", "hide"},
+		},
+		{
+			name:   "value that is not an id",
+			env:    map[string]string{EnvSuppressionRules: `[{"name":"acme-rule","headers":["x-tenant"],"values":["t1 o1"],"action":"dropRecord"}]`},
+			want:   []string{"rule 0", "values"},
+			quoted: []string{"acme-rule"},
+		},
+		{
+			name:   "repeated rule name",
+			env:    map[string]string{EnvSuppressionRules: `[{"name":"acme-rule","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"},{"name":"acme-rule","headers":["x-org"],"values":["o1"],"action":"dropRecord"}]`},
+			want:   []string{"rule 1", "rule 0", "name"},
+			quoted: []string{"acme-rule"},
+		},
+		{
+			name:   "header that is not a header name",
+			env:    map[string]string{EnvSuppressionRules: `[{"name":"b","headers":["x-tenant","acme(header)"],"values":["t1"],"action":"dropRecord"}]`},
+			want:   []string{"rule 0", "headers entry 1"},
+			quoted: []string{"acme(header)"},
+		},
+		{
+			name:   "nca id header that is not a header name",
+			env:    map[string]string{EnvSuppressNCAIDs: "t1", EnvSuppressNCAHeaders: "nvcf-ncaid,acme header"},
+			want:   []string{"headers entry 1"},
+			quoted: []string{"acme header"},
+		},
+		{
+			name:   "name that is not a short lowercase token",
+			env:    map[string]string{EnvSuppressionRules: `[{"name":"Acme Rule","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`},
+			want:   []string{"rule 0", "name"},
+			quoted: []string{"Acme Rule"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := Load(mapLookup(requiredEnv(tt.env)))
+			if err == nil {
+				t.Fatal("Load() error = nil, want a startup error")
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Load() error = %q, want it to name %q", err, want)
+				}
+			}
+			for _, quoted := range append(tt.quoted, "t1", "o1") {
+				if strings.Contains(err.Error(), quoted) {
+					t.Errorf("Load() error = %q, quotes configured text %q", err, quoted)
+				}
+			}
+		})
+	}
+}

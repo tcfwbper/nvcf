@@ -7,8 +7,6 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
-	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -17,43 +15,7 @@ import (
 
 // syncDir syncs a directory. A var so a test can see which directories are
 // synced.
-var syncDir = func(dir string) error {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(handle.Sync(), handle.Close())
-}
-
-// mkdirDurable creates dir and any missing parents, then syncs the parent of
-// each directory above dir that it created, top down, and the parent of dir
-// itself, so the new links survive a power loss before anything is written
-// into them. dir's parent is synced even when dir exists, because an earlier
-// attempt may have made dir and failed before its sync.
-func mkdirDurable(dir string) error {
-	dir = filepath.Clean(dir)
-	var created []string
-	for d := filepath.Dir(dir); ; d = filepath.Dir(d) {
-		if _, err := os.Stat(d); err == nil {
-			break
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-		created = append(created, d)
-		if filepath.Dir(d) == d {
-			break
-		}
-	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return err
-	}
-	for i := len(created) - 1; i >= 0; i-- {
-		if err := syncDir(filepath.Dir(created[i])); err != nil {
-			return err
-		}
-	}
-	return syncDir(filepath.Dir(dir))
-}
+var syncDir = atomicfile.SyncDir
 
 // RejectFile collects the raw bytes of rejected lines for local inspection.
 // It creates its directory and file only when the first line is rejected, so
@@ -75,8 +37,8 @@ func (r *RejectFile) Write(p []byte) (int, error) {
 		return 0, r.err
 	}
 	if r.out == nil {
-		if err := mkdirDurable(r.dir); err != nil {
-			r.err = fmt.Errorf("create reject directory: %w", atomicfile.Pathless(err))
+		if err := atomicfile.MkdirDurable(r.dir, syncDir); err != nil {
+			r.err = fmt.Errorf("create reject directory: %w", err)
 			return 0, r.err
 		}
 		out, err := atomicfile.Create(r.dir, ".reject.*.tmp")

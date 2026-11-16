@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
 )
 
 // ErrNotSynced reports a record that was renamed into place but whose
@@ -62,29 +64,11 @@ func syncDirWith(h hooks, dir string) error {
 	return nil
 }
 
-// mkdirDurable creates dir and any missing parents, then syncs the parent of
-// each directory it created, top down, so the new links survive a power
-// loss before anything is moved into them.
+// mkdirDurable creates dir with atomicfile.MkdirDurable, reporting each
+// sync to the test hooks.
 func mkdirDurable(h hooks, dir string) error {
-	var created []string
-	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
-		if _, err := os.Stat(d); err == nil {
-			break
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat journal directory: %w", err)
-		}
-		created = append(created, d)
-		if filepath.Dir(d) == d {
-			break
-		}
-	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := atomicfile.MkdirDurable(dir, func(d string) error { return syncDirWith(h, d) }); err != nil {
 		return fmt.Errorf("create journal directory: %w", err)
-	}
-	for i := len(created) - 1; i >= 0; i-- {
-		if err := syncDirWith(h, filepath.Dir(created[i])); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -109,12 +93,12 @@ func writeAndSync(path string, data []byte, h hooks) error {
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("open journal directory for sync: %w", err)
+		return fmt.Errorf("open journal directory for sync: %w", atomicfile.Pathless(err))
 	}
 	syncErr := d.Sync()
 	closeErr := d.Close()
 	if err := errors.Join(syncErr, closeErr); err != nil {
-		return fmt.Errorf("sync journal directory: %w", err)
+		return fmt.Errorf("sync journal directory: %w", atomicfile.Pathless(err))
 	}
 	return nil
 }

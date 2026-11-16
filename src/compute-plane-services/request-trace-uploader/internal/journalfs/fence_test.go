@@ -330,6 +330,13 @@ func TestParseableButInvalidSegmentEntriesAreFenced(t *testing.T) {
 			r["state"] = "cleaning"
 			destination(r)["state"] = "submitting"
 		}},
+		// The id derives from these fields, and cleanup finds the active
+		// segment by prefix and index, so a record whose fields do not give
+		// its id is not trusted.
+		{"prefix that does not give the id", func(r map[string]any) { r["prefix"] = "other-trace" }},
+		{"index that does not give the id", func(r map[string]any) { r["index"] = 7 }},
+		{"size that does not give the id", func(r map[string]any) { r["size"] = 4096 }},
+		{"content hash that does not give the id", func(r map[string]any) { r["sha256"] = strings.Repeat("0", 64) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

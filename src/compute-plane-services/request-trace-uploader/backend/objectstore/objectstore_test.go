@@ -478,9 +478,6 @@ func TestSubmitUploadsAFilesOnlyRequest(t *testing.T) {
 // a large object on a slow link is never cut.
 func TestSubmitStopsWaitingForAStoreThatNeverAnswers(t *testing.T) {
 	withHostname(t, "pod-a")
-	original := responseHeaderTimeout
-	responseHeaderTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { responseHeaderTimeout = original })
 	release := make(chan struct{})
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -490,6 +487,7 @@ func TestSubmitStopsWaitingForAStoreThatNeverAnswers(t *testing.T) {
 	defer close(release)
 
 	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b","session_token":"c"}`), server.URL)
+	cfg.ObjectStore.ResponseTimeout = 200 * time.Millisecond
 	client, err := newClient(cfg, server.Client().Transport)
 	if err != nil {
 		t.Fatalf("newClient() error = %v", err)
@@ -518,5 +516,31 @@ func TestAClientFromNewWorksWithoutUseTransport(t *testing.T) {
 	}()
 	if _, err := client.Submit(context.Background(), backend.SubmitRequest{Path: writeSegment(t, "compressed-fixture")}); err == nil {
 		t.Fatal("Submit() to a closed port succeeded")
+	}
+}
+
+// A Config built by hand, with no response timeout, still bounds the wait for
+// the store's answer: zero uses the default and never means no bound.
+func TestAConfigBuiltByHandStillBoundsTheWaitForAnAnswer(t *testing.T) {
+	withHostname(t, "pod-a")
+	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b"}`), "https://127.0.0.1:0")
+	built, err := newClient(cfg, nil)
+	if err != nil {
+		t.Fatalf("newClient() error = %v", err)
+	}
+	httpClient, ok := built.(*Client).s3.Options().HTTPClient.(*http.Client)
+	if !ok {
+		t.Fatalf("HTTP client is %T, want *http.Client", built.(*Client).s3.Options().HTTPClient)
+	}
+	swap, ok := httpClient.Transport.(*swappableTransport)
+	if !ok {
+		t.Fatalf("transport is %T, want *swappableTransport", httpClient.Transport)
+	}
+	transport, ok := swap.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("base transport is %T, want *http.Transport", swap.base)
+	}
+	if got := transport.ResponseHeaderTimeout; got != config.DefaultObjectStoreResponseTimeout {
+		t.Fatalf("response header timeout = %v, want the default %v", got, config.DefaultObjectStoreResponseTimeout)
 	}
 }

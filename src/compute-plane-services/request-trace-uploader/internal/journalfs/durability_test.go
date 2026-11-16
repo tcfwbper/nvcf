@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
@@ -78,6 +79,31 @@ func TestNewStateDirectoriesAreLinkedDurably(t *testing.T) {
 	}
 }
 
+// A state directory whose link sync failed is linked again by the next
+// Open, which finds the directory already there.
+func TestOpenRetriesTheStateDirectoryLinkThatFailedToSync(t *testing.T) {
+	h := newHarness(t)
+	failSpool := hooks{beforeSyncDir: func(dir string) error {
+		if dir == h.cfg.SpoolDir {
+			return errCrash
+		}
+		return nil
+	}}
+	if _, err := openWithHooks(h, failSpool); !errors.Is(err, errCrash) {
+		t.Fatalf("Open error = %v, want the directory sync failure", err)
+	}
+
+	var events []recorded
+	store, err := openWithHooks(h, hooks{event: func(kind, path string) { events = append(events, recorded{kind, path}) }})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if indexOfEvent(events, "sync-dir", h.cfg.SpoolDir) < 0 {
+		t.Fatalf("second Open did not sync the spool, where the state directory is linked: %v", events)
+	}
+}
+
 func TestFenceLinksItsDirectoryBeforeMovingFilesIntoIt(t *testing.T) {
 	h := newHarness(t)
 	store := h.open()
@@ -100,7 +126,14 @@ func TestFenceLinksItsDirectoryBeforeMovingFilesIntoIt(t *testing.T) {
 	linked := indexOfEvent(events, "sync-dir", unreadable)
 	moved := indexOfEvent(events, "rename", filepath.Join(fence, info.Name))
 	fenceSynced := indexOfEvent(events, "sync-dir", fence)
-	spoolSynced := indexOfEvent(events, "sync-dir", h.cfg.SpoolDir)
+	// Open also syncs the spool, where the state directory is linked, so
+	// look for the fence's spool sync after the move.
+	spoolSynced := -1
+	if moved >= 0 {
+		if i := indexOfEvent(events[moved:], "sync-dir", h.cfg.SpoolDir); i >= 0 {
+			spoolSynced = moved + i
+		}
+	}
 	if linked < 0 || moved < 0 || fenceSynced < 0 || spoolSynced < 0 {
 		t.Fatalf("fence steps missing: %v", events)
 	}
@@ -200,4 +233,12 @@ func TestARecordRenamedIntoPlaceIsKeptWhenTheDirectorySyncFails(t *testing.T) {
 			t.Fatal("segment on disk is missing from memory")
 		}
 	})
+}
+
+// Directory sync errors reach the startup log, so they carry no paths.
+func TestDirectorySyncErrorsCarryNoPaths(t *testing.T) {
+	err := syncDir(filepath.Join(t.TempDir(), "missing-dir"))
+	if err == nil || strings.Contains(err.Error(), "missing-dir") {
+		t.Fatalf("syncDir() = %v, want an error with no path", err)
+	}
 }

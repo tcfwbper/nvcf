@@ -150,6 +150,9 @@ func ncaHeaders(raw string) ([]string, error) {
 	return headers, nil
 }
 
+// explicitRules parses EnvSuppressionRules. Errors give a rule's position and
+// canonical field names only: the decoder's own text can quote a field name
+// as configured, and rule and header names are configured text too.
 func explicitRules(raw string) ([]suppress.Rule, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -162,33 +165,38 @@ func explicitRules(raw string) ([]suppress.Rule, error) {
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	var items []json.RawMessage
 	if err := decoder.Decode(&items); err != nil {
-		return nil, fmt.Errorf("%s is not a JSON list of rules: %w", EnvSuppressionRules, err)
+		var syntax *json.SyntaxError
+		switch {
+		case errors.As(err, &syntax):
+			return nil, fmt.Errorf("%s is not valid JSON (error at byte %d)", EnvSuppressionRules, syntax.Offset)
+		case errors.Is(err, io.ErrUnexpectedEOF):
+			return nil, fmt.Errorf("%s is not valid JSON (it ends early)", EnvSuppressionRules)
+		}
+		return nil, fmt.Errorf("%s is not a JSON list of rules", EnvSuppressionRules)
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%s has data after the rule list", EnvSuppressionRules)
 	}
-	specs := make([]ruleSpec, len(items))
+	rules := make([]suppress.Rule, 0, len(items))
 	for i, item := range items {
 		if err := checkRepeatedFields(item); err != nil {
 			return nil, fmt.Errorf("%s rule %d: %w", EnvSuppressionRules, i, err)
 		}
-		decoder := json.NewDecoder(bytes.NewReader(item))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&specs[i]); err != nil {
-			return nil, fmt.Errorf("%s is not a JSON list of rules: %w", EnvSuppressionRules, err)
+		var spec ruleSpec
+		itemDecoder := json.NewDecoder(bytes.NewReader(item))
+		itemDecoder.DisallowUnknownFields()
+		if err := itemDecoder.Decode(&spec); err != nil {
+			return nil, fmt.Errorf("%s rule %d: %s", EnvSuppressionRules, i, decodeProblem(err))
 		}
-	}
-	rules := make([]suppress.Rule, 0, len(specs))
-	for i, spec := range specs {
 		if !ruleNamePattern.MatchString(spec.Name) {
 			return nil, fmt.Errorf("%s rule %d: name must match %s", EnvSuppressionRules, i, ruleNamePattern)
 		}
 		action := suppress.Action(spec.Action)
 		if action != suppress.StripPayload && action != suppress.DropRecord {
-			return nil, fmt.Errorf("%s rule %q: action must be %q or %q", EnvSuppressionRules, spec.Name, suppress.StripPayload, suppress.DropRecord)
+			return nil, fmt.Errorf("%s rule %d: action must be %q or %q", EnvSuppressionRules, i, suppress.StripPayload, suppress.DropRecord)
 		}
 		if err := checkValues(spec.Values); err != nil {
-			return nil, fmt.Errorf("%s rule %q value %w", EnvSuppressionRules, spec.Name, err)
+			return nil, fmt.Errorf("%s rule %d: values %w", EnvSuppressionRules, i, err)
 		}
 		headers := make([]string, len(spec.Headers))
 		for j, header := range spec.Headers {
@@ -197,6 +205,11 @@ func explicitRules(raw string) ([]suppress.Rule, error) {
 			headers[j] = strings.ToLower(strings.TrimSpace(header))
 		}
 		rules = append(rules, suppress.Rule{Name: spec.Name, Headers: headers, Values: spec.Values, Action: action})
+	}
+	// Checked alone first, so a problem in these rules is reported by its
+	// position in this list rather than after the NCA id rule.
+	if err := (suppress.Config{Rules: rules}).Validate(); err != nil {
+		return nil, fmt.Errorf("%s: %w", EnvSuppressionRules, err)
 	}
 	return rules, nil
 }
@@ -231,4 +244,21 @@ func checkRepeatedFields(item json.RawMessage) error {
 		}
 	}
 	return nil
+}
+
+// decodeProblem says why a rule object did not decode, naming a field only
+// by its canonical name.
+func decodeProblem(err error) string {
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) {
+		// The rule is valid JSON, so the decoder refused a field name.
+		return fmt.Sprintf("has a field that is not one of %s", strings.Join(ruleFields, ", "))
+	}
+	written, _, _ := strings.Cut(typeErr.Field, ".")
+	for _, field := range ruleFields {
+		if written != "" && strings.EqualFold(written, field) {
+			return fmt.Sprintf("field %s has the wrong JSON type", field)
+		}
+	}
+	return "is not a JSON object"
 }

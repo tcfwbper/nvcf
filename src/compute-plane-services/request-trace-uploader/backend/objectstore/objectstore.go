@@ -6,6 +6,7 @@
 package objectstore
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -84,11 +85,6 @@ func New(cfg config.Config) (backend.Client, error) {
 	return newClient(cfg, nil)
 }
 
-// responseHeaderTimeout bounds the wait for the response headers once a
-// request, body included, is sent. It is per request, not a total deadline
-// for a submit or the SDK's retries. A var so a test can shorten it.
-var responseHeaderTimeout = 5 * time.Minute
-
 // newClient builds the backend with an optional transport override, so a test
 // can point it at an httptest.Server whose TLS certificate the default
 // transport would not trust. A nil transport uses Go's default one. Either
@@ -144,7 +140,7 @@ func newClient(cfg config.Config, transport http.RoundTripper) (backend.Client, 
 	}
 	// The base transport is never nil, so a client works on its own, before
 	// or without UseTransport, and the core's wrapper keeps the bound.
-	transport = boundedTransport(transport)
+	transport = boundedTransport(transport, cmp.Or(cfg.ObjectStore.ResponseTimeout, config.DefaultObjectStoreResponseTimeout))
 	calls := &swappableTransport{base: transport}
 	calls.current.Store(&transport)
 	options.HTTPClient = &http.Client{
@@ -162,12 +158,14 @@ func newClient(cfg config.Config, transport http.RoundTripper) (backend.Client, 
 }
 
 // boundedTransport returns transport, or Go's default one when nil, with the
-// wait for the response headers bounded by responseHeaderTimeout. The clock
+// wait for the response headers bounded by timeout, the objectstore response
+// timeout setting. It is per request, not a total deadline for a submit or
+// the SDK's retries. The clock
 // starts once the request, body included, is sent, so it never cuts an
 // upload on a slow link; it ends a wait on a store that took the object and
 // never answers, which would otherwise hold every later submit. A transport
 // that is not an *http.Transport is used as given.
-func boundedTransport(transport http.RoundTripper) http.RoundTripper {
+func boundedTransport(transport http.RoundTripper, timeout time.Duration) http.RoundTripper {
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
@@ -176,7 +174,7 @@ func boundedTransport(transport http.RoundTripper) http.RoundTripper {
 		return transport
 	}
 	bounded := base.Clone()
-	bounded.ResponseHeaderTimeout = responseHeaderTimeout
+	bounded.ResponseHeaderTimeout = timeout
 	return bounded
 }
 

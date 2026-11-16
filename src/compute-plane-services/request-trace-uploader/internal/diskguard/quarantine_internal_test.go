@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -68,7 +69,13 @@ func TestAdmitLinksTheEntryBeforeMovingFiles(t *testing.T) {
 			if err := NewQuarantine(dir).Admit("seg-3", source); err != nil {
 				t.Fatalf("Admit: %v", err)
 			}
-			if want := []string{spool, dir, entry, spool}; !slices.Equal(*synced, want) {
+			// Each MkdirDurable call that makes a level first syncs the link of
+			// the deepest directory that already exists.
+			want := []string{spool, dir, entry, spool}
+			if !tc.existing {
+				want = []string{filepath.Dir(spool), spool, spool, dir, entry, spool}
+			}
+			if !slices.Equal(*synced, want) {
 				t.Fatalf("synced directories = %v, want %v", *synced, want)
 			}
 		})
@@ -141,7 +148,7 @@ func TestAdmitSyncsEarlierMovesWhenALaterMoveFails(t *testing.T) {
 	if !errors.Is(err, busy) {
 		t.Fatalf("Admit error = %v, want the failed move reported", err)
 	}
-	if want := []string{spool, dir, entry, filepath.Dir(moved)}; !slices.Equal(*synced, want) {
+	if want := []string{filepath.Dir(spool), spool, spool, dir, entry, filepath.Dir(moved)}; !slices.Equal(*synced, want) {
 		t.Fatalf("synced directories = %v, want %v", *synced, want)
 	}
 	if readFile(t, filepath.Join(entry, "seg.jsonl.gz")) != "source" || readFile(t, stuck) != "transport" {
@@ -244,5 +251,40 @@ func TestEnforceNeverSeesAHalfAdmittedEntry(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s left outside the quarantine", filepath.Base(path))
 		}
+	}
+}
+
+// A retried Admit finishes when a source's directory was removed after its
+// file moved: that directory has nothing left to sync, and a source
+// directory that still exists is synced again.
+func TestAdmitRetrySkipsASourceDirectoryThatIsGone(t *testing.T) {
+	spool := t.TempDir()
+	dir := filepath.Join(spool, "quarantine")
+	entry := filepath.Join(dir, "seg-3")
+	kept, removed := filepath.Join(spool, "a", "seg.jsonl.gz"), filepath.Join(spool, "b", "seg.parquet")
+	writeFile(t, kept, "source")
+	writeFile(t, removed, "transport")
+	q := NewQuarantine(dir)
+	if err := q.Admit("seg-3", kept, removed); err != nil {
+		t.Fatalf("first Admit: %v", err)
+	}
+	if err := os.Remove(filepath.Dir(removed)); err != nil {
+		t.Fatal(err)
+	}
+	synced := recordSyncs(t)
+
+	if err := q.Admit("seg-3", kept, removed); err != nil {
+		t.Fatalf("retried Admit: %v", err)
+	}
+	if want := []string{spool, dir, entry, filepath.Dir(kept)}; !slices.Equal(*synced, want) {
+		t.Fatalf("synced directories = %v, want %v", *synced, want)
+	}
+}
+
+// Directory sync errors reach the logs, so they carry no paths.
+func TestDirectorySyncErrorsCarryNoPaths(t *testing.T) {
+	err := syncDir(filepath.Join(t.TempDir(), "missing-dir"))
+	if err == nil || strings.Contains(err.Error(), "missing-dir") {
+		t.Fatalf("syncDir() = %v, want an error with no path", err)
 	}
 }

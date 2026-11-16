@@ -4,6 +4,7 @@
 // Package atomicfile writes a file under a temporary name and publishes it
 // under its final name only once it is complete and synced, so a reader never
 // sees a partial file. Every writer that publishes a local file uses it.
+// MkdirDurable creates the directories those files go into, durably.
 //
 // Errors carry no file system paths, because callers log them.
 package atomicfile
@@ -16,13 +17,92 @@ import (
 	"path/filepath"
 )
 
-// syncDir syncs a directory so a rename in it is durable. Tests replace it.
-var syncDir = func(dir string) error {
+// SyncDir syncs a directory, so a link made in it by a rename or a mkdir
+// survives a power loss.
+func SyncDir(dir string) error {
 	handle, err := os.Open(dir)
 	if err != nil {
-		return err
+		return Pathless(err)
 	}
-	return errors.Join(handle.Sync(), handle.Close())
+	return Pathless(errors.Join(handle.Sync(), handle.Close()))
+}
+
+// syncDir is the sync Publish uses. Tests replace it.
+var syncDir = SyncDir
+
+// MkdirDurable creates dir and any missing parents one level at a time, top
+// down, and syncs each new directory's parent before it makes the next level,
+// so every new link survives a power loss before anything is made below it.
+// A creation that fails part way therefore leaves only durable links. When
+// dir already exists it syncs dir's parent anyway: an earlier attempt, or an
+// older build, may have made dir without a sync. For the same reason, when
+// only part of the path exists, it first syncs the link of the deepest
+// directory that does.
+//
+// When a sync fails, MkdirDurable removes the directory it just made, which
+// is still empty, so the next attempt makes it again and syncs its link. It
+// never removes a directory it did not make. A concurrent caller that found
+// that directory in the meantime gets an error when it writes there; if the
+// removal fails, the next attempt cannot tell, and this attempt's error is
+// the only sign. sync is the caller's directory sync, so callers keep their
+// own error text and test hooks.
+func MkdirDurable(dir string, sync func(dir string) error) error {
+	dir = filepath.Clean(dir)
+	var missing []string // deepest first
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Stat(d); err == nil {
+			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return Pathless(err)
+		}
+		missing = append(missing, d)
+		if filepath.Dir(d) == d {
+			break
+		}
+	}
+	if len(missing) == 0 {
+		// Fails when dir is not a directory.
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return Pathless(err)
+		}
+		return sync(filepath.Dir(dir))
+	}
+	// The deepest directory that exists may come from an attempt that failed
+	// before its sync, or from a build that did not sync, so its link is
+	// synced before anything is made below it.
+	// It is made absolute first: a relative path can stop at ".", whose
+	// parent filepath.Dir cannot name.
+	if existing := filepath.Dir(missing[len(missing)-1]); existing != missing[len(missing)-1] {
+		existing, err := filepath.Abs(existing)
+		if err != nil {
+			return Pathless(err)
+		}
+		if err := sync(filepath.Dir(existing)); err != nil {
+			return err
+		}
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		d := missing[i]
+		err := os.Mkdir(d, 0o750)
+		made := err == nil
+		if errors.Is(err, fs.ErrExist) {
+			// Made by someone else since the scan: accepted only if it is a
+			// directory.
+			err = os.MkdirAll(d, 0o750)
+		}
+		if err != nil {
+			return Pathless(err)
+		}
+		if err := sync(filepath.Dir(d)); err != nil {
+			if made {
+				if rmErr := os.Remove(d); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+					return errors.Join(err, Pathless(rmErr))
+				}
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // File is a file being written under a temporary name.

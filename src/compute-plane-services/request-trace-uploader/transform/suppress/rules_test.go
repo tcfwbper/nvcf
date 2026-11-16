@@ -5,6 +5,7 @@ package suppress
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/jsonvalue"
@@ -189,5 +190,37 @@ func TestDropBeatsStripWhenBothMatch(t *testing.T) {
 	got, outcome := engine.Apply(mustDecode(t, `{"event_type":"request_payload","payload":{"http_request_headers":{"nvcf-ncaid":"acme","x-tenant":"t1"}}}`))
 	if got != nil || outcome.Action != DropRecord || outcome.Rule != "tenants" || outcome.ID != "t1" {
 		t.Fatalf("got = %v outcome = %+v, want the record dropped by tenants", got, outcome)
+	}
+}
+
+// Validate errors give positions, never configured text, which can hold
+// customer identifiers.
+func TestConfigValidateErrorsQuoteNoConfiguredText(t *testing.T) {
+	rule := func(name, header string, action Action) Rule {
+		return Rule{Name: name, Headers: []string{header}, Values: []string{"t1"}, Action: action}
+	}
+	tests := []struct {
+		name   string
+		cfg    Config
+		quoted string
+	}{
+		{name: "repeated rule name", quoted: "acme-rule", cfg: Config{Rules: []Rule{
+			rule("acme-rule", "x-tenant", DropRecord), rule("acme-rule", "x-org", DropRecord),
+		}}},
+		{name: "unknown action", quoted: "acme-action", cfg: Config{Rules: []Rule{rule("a", "x-tenant", "acme-action")}}},
+		{name: "upper case header", quoted: "X-Acme", cfg: Config{Rules: []Rule{rule("a", "X-Acme", DropRecord)}}},
+		{name: "header that is not a header name", quoted: "acme header", cfg: Config{Rules: []Rule{rule("a", "acme header", DropRecord)}}},
+		{name: "unknown headerless policy", quoted: "acme-policy", cfg: Config{Headerless: "acme-policy"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate() error = nil, want an error")
+			}
+			if strings.Contains(err.Error(), tt.quoted) {
+				t.Fatalf("Validate() error = %q, quotes %q", err, tt.quoted)
+			}
+		})
 	}
 }

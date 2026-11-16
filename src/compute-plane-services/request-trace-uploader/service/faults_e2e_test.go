@@ -4,9 +4,11 @@
 package service_test
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -710,5 +712,46 @@ func TestFailedJobsCountAcrossNewBatchesAndRestarts(t *testing.T) {
 	}
 	if state != journal.StateQuarantined || fake.SubmitCalls() != faults.SegmentScopeFailures {
 		t.Fatalf("state = %q after %d failed jobs with a restart after each, want quarantined at the %dth", state, fake.SubmitCalls(), faults.SegmentScopeFailures)
+	}
+}
+
+// A record over the configured size is not parsed: its raw bytes go to the
+// local reject file and it is counted, and the rest of the segment is still
+// exported.
+func TestARecordOverTheSizeLimitIsRejectedUnparsed(t *testing.T) {
+	big := `{"event_type":"request_end","pad":"` + strings.Repeat("a", 3<<19) + `"}`
+	spool, _ := spoolWith(t, []string{big, uploadertest.RequestEnd("b", 1)})
+	exporter := newCapture(t, backendtest.NewFake())
+	metrics := newMetrics(t)
+	uploader := newUploader(t, spool, exporter, service.Options{Metrics: metrics}, map[string]string{config.EnvRecordMaxBytes: "1048576"})
+
+	if err := uploader.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass() error = %v", err)
+	}
+	if got, _ := metrics.Value(telemetry.RecordsUnreadable, telemetry.Labels{"reason": "line_too_long"}); got != 1 {
+		t.Errorf("records_unreadable{line_too_long} = %v, want 1", got)
+	}
+	if got := len(exporter.exported()); got != 1 {
+		t.Errorf("exported %d records, want only the record under the limit", got)
+	}
+	artifacts, err := filepath.Glob(filepath.Join(spool.Dir, "request-trace-uploader-quarantine", "rejects", "*.jsonl.gz"))
+	if err != nil || len(artifacts) != 1 {
+		t.Fatalf("reject artifacts = %v, %v; want one", artifacts, err)
+	}
+	file, err := os.Open(artifacts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	reader, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(kept) != big+"\n" {
+		t.Errorf("reject artifact holds %d bytes, want the %d-byte record unchanged", len(kept), len(big)+1)
 	}
 }
