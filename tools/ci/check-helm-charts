@@ -4,111 +4,124 @@
 #
 # Lint and render every chart that has a CI values file.
 #
-# tools/ci/helm-validate-values/<name>.yaml holds the CI-only values for one
-# chart. The chart directory is not derivable from the file name, so the
-# mapping is spelled out in chart_map below. Both directions are checked: a
-# values file with no entry fails, and an entry whose chart directory is gone
-# fails. Otherwise a new values file could land with nothing validating it.
+# tools/ci/helm-validate-values/<name>.yaml holds one CI-only values scenario.
+# tools/ci/helm-chart-values.yaml maps each scenario to its chart directory
+# (relative to the repository root); one chart may have several scenarios.
+# Both directions are checked: a values file with no entry fails, and an entry
+# whose values file or chart directory is gone fails. Otherwise a new values
+# file could land with nothing validating it.
 #
-# Every chart runs even after one fails, so a single run reports every broken
-# chart instead of only the first.
+# Every scenario runs even after one fails, so a single run reports every
+# broken chart instead of only the first.
+#
+# Requires yq v4 (to read the map) and helm v3.
 #
 # Usage:
 #   tools/ci/check-helm-charts
-#   tools/ci/check-helm-charts --values-dir DIR --chart-root DIR
+#   tools/ci/check-helm-charts --values-dir DIR --map FILE --repo-root DIR
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
-values_dir="${repo_root}/tools/ci/helm-validate-values"
-chart_root="${repo_root}/deploy/helm"
+values_dir=""
+map_file=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --values-dir) values_dir="$2"; shift 2 ;;
-        --chart-root) chart_root="$2"; shift 2 ;;
+        --map) map_file="$2"; shift 2 ;;
+        --repo-root) repo_root="$2"; shift 2 ;;
         -h|--help)
-            echo "usage: check-helm-charts [--values-dir DIR] [--chart-root DIR]"
+            echo "usage: check-helm-charts [--values-dir DIR] [--map FILE] [--repo-root DIR]"
             exit 0
             ;;
         *) echo "check-helm-charts: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
 
-# "<values file stem> <chart directory relative to deploy/helm>"
-chart_map=(
-    "admin-token-issuer-proxy admin-token-issuer-proxy/chart"
-    "api-keys-colocated       api-keys-colocated/api-keys"
-    "cassandra                cassandra/helm"
-    "cloud-functions          cloud-functions/nvcf-api"
-    "container-cache          container-cache/deploy"
-    "ess                      encrypted-secret-store/ess-api"
-    "function-autoscaler      function-autoscaler"
-    "gateway-routes-vanity    gateway-routes/chart"
-    "grpc-proxy               grpc-proxy/grpc-proxy"
-    "helm-reval               helm-reval"
-    "http-invocation          http-invocation/nvcf-invocation-service"
-    "icms                     icms/icms-api"
-    "llm-api-gateway          llm-api-gateway/llm-api-gateway"
-    "llm-request-router       llm-request-router/llm-request-router"
-    "notary                   notary/nvcf-notary-service"
-    "nvca-operator            nvca-operator/nvca-operator"
-    "openbao                  openbao/helm"
-    "ratelimiter              ratelimiter/nvcf-ratelimiter"
-    "vanity-gateway           vanity-gateway/helm-nvcf-vanity-gateway"
-    "worker-callback-proxy    worker-callback-proxy/worker-callback-proxy"
-)
-
-chart_for() {  # chart_for <values stem> -> chart directory relative to chart_root
-    local stem="$1" entry
-    for entry in "${chart_map[@]}"; do
-        if [ "${entry%% *}" = "${stem}" ]; then
-            printf '%s' "${entry##* }"
-            return 0
-        fi
-    done
-    return 1
-}
+# Derived after parsing so --repo-root alone moves the map and values too.
+values_dir="${values_dir:-${repo_root}/tools/ci/helm-validate-values}"
+map_file="${map_file:-${repo_root}/tools/ci/helm-chart-values.yaml}"
 
 # ---------------------------------------------------------------------------
 # Wiring: every values file maps to a chart, and every mapping is still live.
 # ---------------------------------------------------------------------------
 
+if ! command -v yq >/dev/null 2>&1 || ! yq --version 2>/dev/null | grep -q 'mikefarah'; then
+    echo "check-helm-charts: yq v4 (github.com/mikefarah/yq) not found on PATH." >&2
+    echo "  Install the version pinned as YQ_VERSION in .github/workflows/build-test.yml" >&2
+    echo "  from https://github.com/mikefarah/yq/releases, or with" >&2
+    echo "  'go install github.com/mikefarah/yq/v4@v<YQ_VERSION>'." >&2
+    exit 1
+fi
+
 if [ ! -d "${values_dir}" ]; then
     echo "check-helm-charts: values directory not found: ${values_dir}" >&2
     exit 1
 fi
+if [ ! -f "${map_file}" ]; then
+    echo "check-helm-charts: chart values map not found: ${map_file}" >&2
+    exit 1
+fi
 
-stems=()
+values_files=()
 while IFS= read -r path; do
-    stems+=("$(basename "${path}" .yaml)")
+    values_files+=("$(basename "${path}")")
 done < <(find "${values_dir}" -maxdepth 1 -type f -name '*.yaml' | sort)
 
-if [ "${#stems[@]}" -eq 0 ]; then
+if [ "${#values_files[@]}" -eq 0 ]; then
     echo "check-helm-charts: no values files in ${values_dir}" >&2
     exit 1
 fi
 
+# One "<chart dir> <values file>" line per entry. A missing field becomes an
+# empty string so the entry is reported below instead of silently dropped.
+if ! map_lines="$(yq -r '.scenarios[] | (.chart // "") + " " + (.values // "")' "${map_file}")" ||
+   [ "$(yq -r '.scenarios | tag' "${map_file}")" != "!!seq" ]; then
+    echo "check-helm-charts: ${map_file} must hold a 'scenarios' list of {chart, values} entries." >&2
+    exit 1
+fi
+if [ -z "${map_lines}" ]; then
+    echo "check-helm-charts: ${map_file} has no scenarios." >&2
+    exit 1
+fi
+
+entry_charts=()
+entry_values=()
+while IFS=' ' read -r chart values; do
+    entry_charts+=("${chart}")
+    entry_values+=("${values}")
+done <<<"${map_lines}"
+
 wiring_errors=0
 
-for stem in "${stems[@]}"; do
-    if ! chart_for "${stem}" >/dev/null; then
-        echo "check-helm-charts: ${stem}.yaml has no chart mapping." >&2
-        echo "  Add \"${stem} <chart dir under deploy/helm>\" to chart_map in ${BASH_SOURCE[0]}." >&2
+for file in "${values_files[@]}"; do
+    mapped=0
+    for values in "${entry_values[@]}"; do
+        [ "${values}" = "${file}" ] && mapped=1 && break
+    done
+    if [ "${mapped}" -eq 0 ]; then
+        echo "check-helm-charts: ${file} has no chart mapping." >&2
+        echo "  Add '- {chart: <chart dir from repo root>, values: ${file}}' to ${map_file}." >&2
         wiring_errors=1
     fi
 done
 
-for entry in "${chart_map[@]}"; do
-    stem="${entry%% *}"
-    chart_dir="${chart_root}/${entry##* }"
-    if [ ! -f "${values_dir}/${stem}.yaml" ]; then
-        echo "check-helm-charts: chart_map entry '${stem}' has no ${values_dir}/${stem}.yaml." >&2
+for i in "${!entry_charts[@]}"; do
+    chart="${entry_charts[$i]}"
+    values="${entry_values[$i]}"
+    if [ -z "${chart}" ] || [ -z "${values}" ]; then
+        echo "check-helm-charts: map entry $((i + 1)) needs both 'chart' and 'values'." >&2
+        wiring_errors=1
+        continue
+    fi
+    if [ ! -f "${values_dir}/${values}" ]; then
+        echo "check-helm-charts: map entry '${values}' has no ${values_dir}/${values}." >&2
         echo "  Remove the stale entry or restore the values file." >&2
         wiring_errors=1
     fi
-    if [ ! -f "${chart_dir}/Chart.yaml" ]; then
-        echo "check-helm-charts: chart_map entry '${stem}' points at ${chart_dir}, which has no Chart.yaml." >&2
+    if [ ! -f "${repo_root}/${chart}/Chart.yaml" ]; then
+        echo "check-helm-charts: map entry '${values}' points at ${repo_root}/${chart}, which has no Chart.yaml." >&2
         echo "  Update the entry to the chart's current directory." >&2
         wiring_errors=1
     fi
@@ -234,13 +247,19 @@ render_and_check() {  # render_and_check <stem> <chart dir> <values file>
 }
 
 failed=()
+built_charts=" "
 
-for stem in "${stems[@]}"; do
-    chart_dir="${chart_root}/$(chart_for "${stem}")"
-    values_file="${values_dir}/${stem}.yaml"
+for i in "${!entry_charts[@]}"; do
+    chart="${entry_charts[$i]}"
+    chart_dir="${repo_root}/${chart}"
+    values_file="${values_dir}/${entry_values[$i]}"
+    stem="${entry_values[$i]%.yaml}"
     chart_failed=0
 
-    if grep -qE '^dependencies:' "${chart_dir}/Chart.yaml"; then
+    # A chart with several scenarios fetches its dependencies once.
+    if grep -qE '^dependencies:' "${chart_dir}/Chart.yaml" &&
+       [[ "${built_charts}" != *" ${chart} "* ]]; then
+        built_charts+="${chart} "
         # The chart declares subcharts. helm lint only warns when they are
         # absent, so without this fetch helm template fails on a missing
         # dependency and lint alone would not have caught it.
@@ -265,7 +284,7 @@ for stem in "${stems[@]}"; do
     fi
 
     if [ "${chart_failed}" -eq 0 ]; then
-        printf 'ok   %s (%s)\n' "${stem}" "$(chart_for "${stem}")"
+        printf 'ok   %s (%s)\n' "${stem}" "${chart}"
     else
         failed+=("${stem}")
     fi
@@ -273,9 +292,9 @@ done
 
 echo
 if [ "${#failed[@]}" -ne 0 ]; then
-    printf 'check-helm-charts: %d of %d charts failed: %s\n' \
-        "${#failed[@]}" "${#stems[@]}" "${failed[*]}" >&2
+    printf 'check-helm-charts: %d of %d scenarios failed: %s\n' \
+        "${#failed[@]}" "${#entry_charts[@]}" "${failed[*]}" >&2
     exit 1
 fi
 
-printf 'check-helm-charts: %d charts linted and rendered\n' "${#stems[@]}"
+printf 'check-helm-charts: %d scenarios linted and rendered\n' "${#entry_charts[@]}"

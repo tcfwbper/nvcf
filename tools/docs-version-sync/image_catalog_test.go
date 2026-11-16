@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,80 +14,210 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// imageCatalogFixture supplies a synthetic dependency version for inheritance tests.
+// imageCatalogFixture builds a snapshot whose chart declares the nats and
+// cert-manager dependencies, with a synthetic cert-manager appVersion.
 func imageCatalogFixture(t *testing.T, values string) imageChartSnapshot {
 	t.Helper()
 	var tree map[string]any
 	if err := yaml.Unmarshal([]byte(values), &tree); err != nil {
 		t.Fatal(err)
 	}
-	return imageChartSnapshot{Values: tree, AppVersions: map[string]string{"dependency": "v8.2.1"}}
-}
-
-// TestImageCatalogResolveDefaultsAndOwnership checks inherited versions and fully qualified overrides.
-func TestImageCatalogResolveDefaultsAndOwnership(t *testing.T) {
-	snapshot := imageCatalogFixture(t, "thirdPartyImages:\n  dependency: dependency.image\nownedImages:\n  server: server.image\ndependency:\n  imageRegistry: quay.io\n  imageNamespace: example\n  image:\n    name: dependency\nserver:\n  image:\n    registry: registry.example:5000\n    repository: team/server\n    tag: v2\n")
-	images, err := resolveChartImageCatalog(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(images) != 2 || images[0].Reference != "quay.io/example/dependency:v8.2.1" ||
-		images[1].Reference != "registry.example:5000/team/server:v2" ||
-		images[1].Ownership != "ownedImages" {
-		t.Fatalf("unexpected catalog: %+v", images)
-	}
-	// A fully qualified repository works even when the shared registry is empty.
-	dependency := snapshot.Values["dependency"].(map[string]any)
-	dependency["imageRegistry"] = ""
-	dependency["image"].(map[string]any)["repository"] = "override.example/specific/image"
-	images, err = resolveChartImageCatalog(snapshot)
-	if err != nil || images[0].Reference != "override.example/specific/image:v8.2.1" {
-		t.Fatalf("explicit repository: %+v, %v", images, err)
+	return imageChartSnapshot{
+		Values:       tree,
+		AppVersions:  map[string]string{"cert-manager": "v8.2.1"},
+		Dependencies: map[string]bool{"nats": true, "cert-manager": true},
 	}
 }
 
-// TestImageCatalogResolvesNativeImagePrecedence distinguishes NATS digest/full
-// references from cert-manager's support for a tag and digest together.
-func TestImageCatalogResolvesNativeImagePrecedence(t *testing.T) {
-	digest := "sha256:" + strings.Repeat("a", 64)
+var fixtureDigest = "sha256:" + strings.Repeat("a", 64)
+
+// TestImageFormatResolution exercises each format table entry's precedence.
+func TestImageFormatResolution(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		values string
 		want   string
 	}{
 		{
-			name:   "nats full reference",
-			values: "thirdPartyImages: {server: nats.container.image}\nnats:\n  container:\n    image: {registry: stale.example, repository: ignored, tag: stale, digest: " + digest + ", fullImageName: selected.example/nats:custom}\n",
+			name:   "standard registry, repository and tag",
+			values: "ownedImages: {server: server.image}\nserver:\n  image: {registry: registry.example:5000, repository: team/server, tag: v2}\n",
+			want:   "registry.example:5000/team/server:v2",
+		},
+		{
+			name:   "standard tag and digest",
+			values: "ownedImages: {server: server.image}\nserver:\n  image: {registry: r.example, repository: server, tag: v2, digest: " + fixtureDigest + "}\n",
+			want:   "r.example/server:v2@" + fixtureDigest,
+		},
+		{
+			name:   "nats full reference wins",
+			values: "thirdPartyImages: {server: nats.container.image}\nnats:\n  container:\n    image: {registry: stale.example, repository: ignored, tag: stale, digest: " + fixtureDigest + ", fullImageName: selected.example/nats:custom}\n",
 			want:   "selected.example/nats:custom",
 		},
 		{
-			name:   "nats digest precedes tag",
-			values: "thirdPartyImages: {server: nats.container.image}\nnats:\n  container:\n    image: {registry: selected.example, repository: nats, tag: stale, digest: " + digest + "}\n",
-			want:   "selected.example/nats@" + digest,
+			name:   "nats digest replaces tag",
+			values: "thirdPartyImages: {server: nats.container.image}\nnats:\n  container:\n    image: {registry: selected.example, repository: nats, tag: stale, digest: " + fixtureDigest + "}\n",
+			want:   "selected.example/nats@" + fixtureDigest,
 		},
 		{
-			name:   "cert-manager tag and digest",
-			values: "thirdPartyImages: {server: cert-manager.image}\ncert-manager:\n  imageRegistry: selected.example\n  imageNamespace: team\n  image: {name: controller, tag: fixture, digest: " + digest + "}\n",
-			want:   "selected.example/team/controller:fixture@" + digest,
+			name:   "cert-manager inherits appVersion",
+			values: "thirdPartyImages: {controller: cert-manager.image}\ncert-manager:\n  imageRegistry: quay.io\n  imageNamespace: jetstack\n  image: {name: controller, tag: \"\"}\n",
+			want:   "quay.io/jetstack/controller:v8.2.1",
 		},
 		{
-			name:   "invalid nats full reference",
-			values: "thirdPartyImages: {server: nats.container.image}\nnats:\n  container:\n    image: {registry: source.example, repository: nats, tag: fixture, fullImageName: missing-tag}\n",
+			name:   "cert-manager tag and digest together",
+			values: "thirdPartyImages: {controller: cert-manager.image}\ncert-manager:\n  imageRegistry: selected.example\n  imageNamespace: team\n  image: {name: controller, tag: fixture, digest: " + fixtureDigest + "}\n",
+			want:   "selected.example/team/controller:fixture@" + fixtureDigest,
+		},
+		{
+			name:   "cert-manager explicit repository with empty shared registry",
+			values: "thirdPartyImages: {controller: cert-manager.image}\ncert-manager:\n  imageRegistry: \"\"\n  image: {name: controller, repository: override.example/specific/image}\n",
+			want:   "override.example/specific/image:v8.2.1",
+		},
+		{
+			name:   "cert-manager image.registry prefixes the repository",
+			values: "thirdPartyImages: {controller: cert-manager.image}\ncert-manager:\n  imageRegistry: quay.io\n  image: {registry: legacy.example, repository: team/controller, tag: v1}\n",
+			want:   "legacy.example/team/controller:v1",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			images, err := resolveChartImageCatalog(imageCatalogFixture(t, test.values))
-			if test.want == "" {
-				if err == nil {
-					t.Fatal("expected invalid full reference to fail")
-				}
-				return
-			}
 			if err != nil {
 				t.Fatal(err)
 			}
 			if len(images) != 1 || images[0].Reference != test.want {
-				t.Fatalf("image precedence: got %+v, want %s", images, test.want)
+				t.Fatalf("got %+v, want %s", images, test.want)
+			}
+		})
+	}
+}
+
+// TestImageFormatOverridesRoundTrip merges each format's override fields over
+// a fixture default the way Helm coalesces an ordinary values file (fields the
+// override omits keep their defaults) and requires the format to resolve the
+// target, so reading and writing a format cannot drift apart. Defaults that
+// set a digest or a full reference must not survive the override: a kept
+// digest would render "<tag>@<new>@<old>", and a kept NATS fullImageName or
+// digest would still take precedence.
+func TestImageFormatOverridesRoundTrip(t *testing.T) {
+	oldDigest := "sha256:" + strings.Repeat("c", 64)
+	for _, test := range []struct {
+		name, format, path, defaults string
+	}{
+		{"standard tag", "standard", "server.image", "server:\n  image: {registry: r.example, repository: server, tag: v1}\n"},
+		{"standard digest only", "standard", "server.image", "server:\n  image: {registry: r.example, repository: server, digest: " + oldDigest + "}\n"},
+		{"standard tag and digest", "standard", "server.image", "server:\n  image: {registry: r.example, repository: server, tag: v1, digest: " + oldDigest + "}\n"},
+		{"nats tag", "nats", "nats.container.image", "nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1}\n"},
+		{"nats digest", "nats", "nats.container.image", "nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1, digest: " + oldDigest + "}\n"},
+		{"nats full reference", "nats", "nats.container.image", "nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1, fullImageName: r.example/nats:old}\n"},
+		{"cert-manager inherited tag", "cert-manager", "cert-manager.image", "cert-manager:\n  imageRegistry: quay.io\n  image: {name: controller}\n"},
+		{"cert-manager tag and digest", "cert-manager", "cert-manager.image", "cert-manager:\n  imageRegistry: quay.io\n  image: {name: controller, registry: legacy.example, tag: v1, digest: " + oldDigest + "}\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := imageCatalogFixture(t, "thirdPartyImages: {image: "+test.path+"}\n"+test.defaults)
+			images, err := resolveChartImageCatalog(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if images[0].Format.name != test.format {
+				t.Fatalf("path %s selected format %s", test.path, images[0].Format.name)
+			}
+			node, err := imageCatalogValue(snapshot.Values, test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for key, value := range images[0].Format.override("mirror.example:5000", "renamed/image", "v2", fixtureDigest) {
+				node[key] = value
+			}
+			overridden, err := resolveChartImageCatalog(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := "mirror.example:5000/renamed/image:v2@" + fixtureDigest; overridden[0].Reference != want {
+				t.Fatalf("override resolved %s, want %s", overridden[0].Reference, want)
+			}
+		})
+	}
+}
+
+// TestImageFormatRequiresDeclaredDependency fails a table key the chart does
+// not declare, instead of silently using the standard format.
+func TestImageFormatRequiresDeclaredDependency(t *testing.T) {
+	snapshot := imageCatalogFixture(t, "thirdPartyImages: {server: nats.container.image}\nnats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1}\n")
+	snapshot.Dependencies = map[string]bool{"nats-renamed": true}
+	if _, err := resolveChartImageCatalog(snapshot); err == nil || !strings.Contains(err.Error(), "declared nats dependency") {
+		t.Fatalf("undeclared format key accepted: %v", err)
+	}
+	// An ordinary resolution error on an entry that sorts first ("aa") must
+	// not mask the key error on "server".
+	snapshot.Values["thirdPartyImages"] = map[string]any{"server": "nats.container.image", "aa": "broken.image"}
+	if _, err := resolveChartImageCatalog(snapshot); err == nil || !strings.Contains(err.Error(), "declared nats dependency") {
+		t.Fatalf("format key error masked: %v", err)
+	}
+	for key := range imageValueFormats {
+		if _, err := imageFormatFor(key+".image", map[string]bool{key: true}); err != nil {
+			t.Errorf("declared %s rejected: %v", key, err)
+		}
+	}
+}
+
+// TestImageFormatKeyErrorWinsOverDeclarationErrors keeps a malformed index
+// entry from masking an undeclared format key on a pending-fix chart. Each
+// case pairs the key error on "server" with a declaration error that sorts
+// or is walked first, and requires the chart's final outcome to fail the run
+// rather than count as an expected failure.
+func TestImageFormatKeyErrorWinsOverDeclarationErrors(t *testing.T) {
+	const natsImage = "nats:\n  container:\n    image: {registry: r.example, repository: nats, tag: v1}\n"
+	for _, test := range []struct{ name, index string }{
+		{"empty path", "thirdPartyImages: {aa: \"\", server: nats.container.image}\n"},
+		{"non-string path", "thirdPartyImages: {aa: [x], server: nats.container.image}\n"},
+		{"duplicate identity", "ownedImages: {server: nats.container.image}\nthirdPartyImages: {server: nats.container.image}\n"},
+		{"category is not a map", "thirdPartyImages: [x]\nownedImages: {server: nats.container.image}\n"},
+		{"unresolvable value", "thirdPartyImages: {aa: missing.image, server: nats.container.image}\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := imageCatalogFixture(t, test.index+natsImage)
+			snapshot.Dependencies = map[string]bool{}
+			_, err := resolveChartImageCatalog(snapshot)
+			var keyError *imageFormatKeyError
+			if !errors.As(err, &keyError) {
+				t.Fatalf("format key error masked by %v", err)
+			}
+			check := &chartCheck{chart: "c"}
+			check.catalogFailure(err.Error(), err, "", "")
+			findings, expected := pendingFixOutcome(check, chartImageExclusion{Reason: reasonPendingFix})
+			if expected != "" || len(findings) != 1 || findings[0].Category != findingInvalidEntry {
+				t.Fatalf("pending-fix outcome: findings %+v, expected label %q", findings, expected)
+			}
+		})
+	}
+}
+
+// TestImageFormatWrapperVisibility requires each format's defaults in the wrapper values.
+func TestImageFormatWrapperVisibility(t *testing.T) {
+	for _, test := range []struct {
+		name, values, path string
+		visible            bool
+	}{
+		{"standard complete", "server: {image: {registry: r.example, repository: server, tag: v1}}", "server.image", true},
+		{"standard without registry", "server: {image: {repository: server, tag: v1}}", "server.image", false},
+		{"nats full reference", "nats: {container: {image: {fullImageName: r.example/nats:1}}}", "nats.container.image", true},
+		{"nats without repository", "nats: {container: {image: {registry: r.example, tag: v1}}}", "nats.container.image", false},
+		{"cert-manager shared registry and name", "cert-manager: {imageRegistry: quay.io, image: {name: controller}}", "cert-manager.image", true},
+		{"cert-manager name inherited from subchart", "cert-manager: {imageRegistry: quay.io, image: {tag: v1}}", "cert-manager.image", false},
+		{"cert-manager registry inherited from subchart", "cert-manager: {image: {name: controller}}", "cert-manager.image", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := imageCatalogFixture(t, test.values)
+			format, err := imageFormatFor(test.path, snapshot.Dependencies)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent, node, err := imageCatalogNodes(snapshot.Values, test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := format.visible(parent, node); (err == nil) != test.visible {
+				t.Fatalf("visible=%v, err=%v", test.visible, err)
 			}
 		})
 	}
@@ -100,7 +231,9 @@ func TestImageCatalogRejectsInvalidDeclarations(t *testing.T) {
 		"thirdPartyImages: {server: missing.image}",
 		"thirdPartyImages: {server: server.image}\nserver: {image: broken}",
 		"thirdPartyImages: {server: server.image}\nserver: {image: {repository: nginx, tag: latest}}",
+		"thirdPartyImages: {server: server.image}\nserver: {image: {registry: r.example, repository: nginx}}",
 		"thirdPartyImages: {server: server.image}\nownedImages: {server: server.image}\nserver: {image: {repository: nginx, tag: v1}}",
+		"thirdPartyImages: {server: nats.container.image}\nnats:\n  container:\n    image: {registry: source.example, repository: nats, tag: fixture, fullImageName: missing-tag}\n",
 	} {
 		if _, err := resolveChartImageCatalog(imageCatalogFixture(t, input)); err == nil {
 			t.Errorf("accepted invalid declaration %s", input)
@@ -129,263 +262,110 @@ func TestImageCatalogCoverageIncludesIndirectImages(t *testing.T) {
 	}
 }
 
-// TestImageCatalogCharts exercises real Helm defaults and ordinary values overrides
-// from an isolated Helm configuration, including indirect workload settings.
-func TestImageCatalogCharts(t *testing.T) {
+// TestNATSAndOpenBaoChartImageGuards covers chart-owned behaviour that the
+// generic coverage test does not: native NATS image override forms, and the
+// OpenBao guards against client version skew and an untagged auto-unseal
+// sidecar. Generic coverage and override checks live in TestChartImageCoverage.
+func TestNATSAndOpenBaoChartImageGuards(t *testing.T) {
 	if os.Getenv("NVCF_IMAGE_CATALOG_E2E") != "1" {
-		t.Skip("set NVCF_IMAGE_CATALOG_E2E=1 to render the four real charts with Helm")
+		t.Skip("set NVCF_IMAGE_CATALOG_E2E=1 to render the NATS and OpenBao charts with Helm")
 	}
-	helmConfiguration := t.TempDir()
-	t.Setenv("HELM_REPOSITORY_CONFIG", filepath.Join(helmConfiguration, "repositories.yaml"))
-	t.Setenv("HELM_REPOSITORY_CACHE", filepath.Join(helmConfiguration, "cache"))
-	t.Setenv("HELM_REGISTRY_CONFIG", filepath.Join(helmConfiguration, "registry.json"))
-	for _, test := range []struct {
-		name   string
-		path   string
-		count  int
-		values string
-	}{
-		{"nats", "nats", 3, "{}"},
-		{"cert-manager", "cert-manager", 5, "{}"},
-		{"openbao", "openbao/helm", 4, "{}"},
-		{"cassandra", "cassandra/helm", 2, "{}"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			chart := filepath.Join(t.TempDir(), "chart")
-			source := filepath.Join("..", "..", "deploy", "helm", test.path)
-			if err := copyResolvedInventoryStack(source, chart); err != nil {
-				t.Fatal(err)
+	isolateHelmConfiguration(t)
+	t.Run("nats native overrides", func(t *testing.T) {
+		chart := prepareGuardChart(t, "nats")
+		for _, fields := range []map[string]any{
+			{"fullImageName": "explicit.example/customer/box:custom"},
+			{"registry": "explicit.example", "repository": "customer/box", "digest": "sha256:" + strings.Repeat("b", 64)},
+		} {
+			values := make(map[string]any)
+			setImageValues(values, "nats.natsBox.container.image", fields)
+			rendered := renderGuardChart(t, chart, values)
+			want := "explicit.example/customer/box@" + fmt.Sprint(fields["digest"])
+			if full, ok := fields["fullImageName"].(string); ok {
+				want = full
 			}
-			// Dependency downloads stay in the test-owned chart copy.
-			if test.name == "nats" || test.name == "openbao" {
-				registerImageCatalogRepositories(t, chart)
-				if _, err := imageCatalogCommand("helm", "dependency", "build", "--skip-refresh", chart); err != nil {
-					t.Fatal(err)
-				}
-			}
-			valuesPath := filepath.Join(t.TempDir(), "values.yaml")
-			if err := os.WriteFile(valuesPath, []byte(test.values), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			sourceSnapshot, err := renderImageChart(chart, []string{valuesPath})
+			actual, err := extractResolvedImages(rendered.Manifest)
 			if err != nil {
 				t.Fatal(err)
 			}
-			images, err := resolveChartImageCatalog(sourceSnapshot)
-			if err != nil {
-				t.Fatal(err)
+			found := false
+			for _, image := range actual {
+				found = found || image.Reference == want
 			}
-			// Every indexed image must be visible in the wrapper values,
-			// rather than requiring an operator to discover dependency defaults.
-			rawDefaults, err := os.ReadFile(filepath.Join(chart, "values.yaml"))
-			if err != nil {
-				t.Fatal(err)
+			if !found {
+				t.Fatalf("native NATS image override %s did not reach the box workload", want)
 			}
-			defaults := imageCatalogFixture(t, string(rawDefaults))
-			defaults.AppVersions = sourceSnapshot.AppVersions
-			prefilled, err := resolveChartImageCatalog(defaults)
-			if err != nil {
-				t.Fatalf("wrapper image defaults are incomplete: %v", err)
-			}
-			if len(prefilled) != len(images) {
-				t.Fatal("wrapper and effective image catalogs differ")
-			}
-			for i, image := range images {
-				if prefilled[i].Reference != image.Reference {
-					t.Fatalf("%s wrapper default %s differs from effective image %s", image.ID, prefilled[i].Reference, image.Reference)
+		}
+	})
+	t.Run("openbao guards", func(t *testing.T) {
+		chart := prepareGuardChart(t, "openbao/helm")
+		defaults, err := renderImageChart(chart, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		catalog, err := resolveChartImageCatalog(defaults)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The guards run on top of a full mirror override, as an operator would.
+		mirrorPath := filepath.Join(t.TempDir(), "mirror.yaml")
+		if _, err := writeImageOverrides(catalog, mirrorOverride, mirrorPath); err != nil {
+			t.Fatal(err)
+		}
+		for _, image := range []string{
+			"",
+			"mirror.example/openbao",
+			"mirror.example:5000/openbao",
+			"mirror.example:5000/openbao:",
+			"mirror.example:5000/openbao@sha256:" + strings.Repeat("a", 64),
+		} {
+			t.Run("untagged sidecar "+image, func(t *testing.T) {
+				path := writeGuardValues(t, fmt.Sprintf("openbao:\n  server:\n    extraContainers:\n      - name: auto-unseal-sidecar\n        image: %q\n", image))
+				_, err := renderImageChart(chart, []string{mirrorPath, path})
+				if err == nil || !strings.Contains(err.Error(), "auto-unseal sidecar image requires an explicit tag") {
+					t.Fatalf("sidecar image %q did not fail the explicit-tag guard: %v", image, err)
 				}
+			})
+		}
+		for _, skew := range []string{
+			"openbao:\n  injector:\n    agentImage:\n      tag: incompatible\n",
+			"openbao:\n  server:\n    extraContainers:\n      - name: auto-unseal-sidecar\n        image: mirror.example:5000/server:incompatible\n",
+		} {
+			_, err := renderImageChart(chart, []string{mirrorPath, writeGuardValues(t, skew)})
+			if err == nil || !strings.Contains(err.Error(), "OpenBao image tag mismatch") {
+				t.Fatalf("OpenBao client version skew was accepted: %v", err)
 			}
-			if len(images) != test.count {
-				t.Fatalf("catalog has %d identities, want %d", len(images), test.count)
-			}
-			if err := checkChartImageCoverage(images, sourceSnapshot.Manifest); err != nil {
-				t.Fatal(err)
-			}
-			// Use ordinary Helm values, without a mapping file or generator.
-			overrides := make(map[string]any)
-			want := make(map[string]string)
-			for _, image := range images {
-				parsed, err := parseResolvedImageReference(image.Reference)
-				if err != nil {
-					t.Fatal(err)
-				}
-				repository := "renamed/" + strings.ToLower(image.ID)
-				digest := "sha256:" + strings.Repeat("a", 64)
-				fields := map[string]any{"registry": "mirror.example:5000", "repository": repository, "tag": parsed.Version + "@" + digest}
-				if image.digest {
-					fields = map[string]any{"registry": "", "repository": "mirror.example:5000/" + repository, "tag": parsed.Version, "digest": digest}
-				}
-				setTestImageValues(t, overrides, image.Path, fields)
-				want[image.ID] = "mirror.example:5000/" + repository + ":" + parsed.Version + "@" + digest
-			}
-			overridePath := filepath.Join(t.TempDir(), "mirror.yaml")
-			encoded, _ := yaml.Marshal(overrides)
-			if err := os.WriteFile(overridePath, encoded, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			mirrorSnapshot, err := renderImageChart(chart, []string{valuesPath, overridePath})
-			if err != nil {
-				t.Fatal(err)
-			}
-			mirrored, err := resolveChartImageCatalog(mirrorSnapshot)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, image := range mirrored {
-				if image.Reference != want[image.ID] {
-					t.Fatalf("%s override: got %s, want %s", image.ID, image.Reference, want[image.ID])
-				}
-				if !strings.Contains(string(mirrorSnapshot.Manifest), image.Reference) {
-					t.Fatalf("%s override did not reach a workload or indirect image setting", image.ID)
-				}
-			}
-			if err := checkChartImageCoverage(mirrored, mirrorSnapshot.Manifest); err != nil {
-				t.Fatal(err)
-			}
-			// Values supplied after a registry profile remain explicit
-			// operator overrides, including the indirect solver/agent paths.
-			selected := images[0]
-			explicitFields, _ := imageCatalogValue(overrides, selected.Path)
-			explicitFields["repository"] = "explicit.example/customer/custom"
-			if selected.split {
-				explicitFields["registry"], explicitFields["repository"] = "explicit.example", "customer/custom"
-			}
-			explicitPath := filepath.Join(t.TempDir(), "explicit.yaml")
-			explicit := make(map[string]any)
-			setTestImageValues(t, explicit, selected.Path, explicitFields)
-			encoded, _ = yaml.Marshal(explicit)
-			if err := os.WriteFile(explicitPath, encoded, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			overrideSnapshot, err := renderImageChart(chart, []string{valuesPath, overridePath, explicitPath})
-			if err != nil {
-				t.Fatal(err)
-			}
-			overridden, err := resolveChartImageCatalog(overrideSnapshot)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.HasPrefix(overridden[0].Reference, "explicit.example/customer/custom:") {
-				t.Fatalf("explicit override was lost: %+v", overridden[0])
-			}
-			if err := checkChartImageCoverage(overridden, overrideSnapshot.Manifest); err != nil {
-				t.Fatal(err)
-			}
-			if test.name == "nats" {
-				for _, fields := range []map[string]any{
-					{"fullImageName": "explicit.example/customer/box:custom"},
-					{"registry": "explicit.example", "repository": "customer/box", "digest": "sha256:" + strings.Repeat("b", 64)},
-				} {
-					values := make(map[string]any)
-					setTestImageValues(t, values, "nats.natsBox.container.image", fields)
-					encoded, _ := yaml.Marshal(values)
-					path := filepath.Join(t.TempDir(), "native-image-override.yaml")
-					if err := os.WriteFile(path, encoded, 0o600); err != nil {
-						t.Fatal(err)
-					}
-					rendered, err := renderImageChart(chart, []string{path})
-					if err != nil {
-						t.Fatal(err)
-					}
-					catalog, err := resolveChartImageCatalog(rendered)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := checkChartImageCoverage(catalog, rendered.Manifest); err != nil {
-						t.Fatal(err)
-					}
-					want := "explicit.example/customer/box@" + fmt.Sprint(fields["digest"])
-					if full, ok := fields["fullImageName"].(string); ok {
-						want = full
-					}
-					actual, err := extractResolvedImages(rendered.Manifest)
-					if err != nil {
-						t.Fatal(err)
-					}
-					found := false
-					for _, image := range actual {
-						found = found || image.Reference == want
-					}
-					if !found {
-						t.Fatalf("native NATS image override %s did not reach the box workload", want)
-					}
-				}
-			}
-			if test.name == "openbao" {
-				for _, image := range []string{
-					"",
-					"mirror.example/openbao",
-					"mirror.example:5000/openbao",
-					"mirror.example:5000/openbao:",
-					"mirror.example:5000/openbao@sha256:" + strings.Repeat("a", 64),
-				} {
-					t.Run("untagged sidecar "+image, func(t *testing.T) {
-						values := fmt.Sprintf("openbao:\n  server:\n    extraContainers:\n      - name: auto-unseal-sidecar\n        image: %q\n", image)
-						path := filepath.Join(t.TempDir(), "untagged-sidecar.yaml")
-						if err := os.WriteFile(path, []byte(values), 0o600); err != nil {
-							t.Fatal(err)
-						}
-						_, err := renderImageChart(chart, []string{valuesPath, overridePath, path})
-						if err == nil || !strings.Contains(err.Error(), "auto-unseal sidecar image requires an explicit tag") {
-							t.Fatalf("sidecar image %q did not fail the explicit-tag guard: %v", image, err)
-						}
-					})
-				}
-				for _, skew := range []string{
-					"openbao:\n  injector:\n    agentImage:\n      tag: incompatible\n",
-					"openbao:\n  server:\n    extraContainers:\n      - name: auto-unseal-sidecar\n        image: mirror.example:5000/server:incompatible\n",
-				} {
-					skewPath := filepath.Join(t.TempDir(), "version-skew.yaml")
-					if err := os.WriteFile(skewPath, []byte(skew), 0o600); err != nil {
-						t.Fatal(err)
-					}
-					_, err := renderImageChart(chart, []string{valuesPath, overridePath, skewPath})
-					if err == nil || !strings.Contains(err.Error(), "OpenBao image tag mismatch") {
-						t.Fatalf("OpenBao client version skew was accepted: %v", err)
-					}
-				}
-			}
-		})
-	}
+		}
+	})
 }
 
-// registerImageCatalogRepositories registers HTTPS dependencies in the test's
-// isolated Helm configuration. OCI dependencies need no repository registration.
-func registerImageCatalogRepositories(t *testing.T, chart string) {
+func prepareGuardChart(t *testing.T, chart string) string {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(chart, "Chart.yaml"))
+	prepared, err := prepareImageChart(filepath.Join("..", "..", "deploy", "helm", chart), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	var metadata struct {
-		Dependencies []struct {
-			Repository string
-		}
-	}
-	if err := yaml.Unmarshal(raw, &metadata); err != nil {
-		t.Fatal(err)
-	}
-	for index, dependency := range metadata.Dependencies {
-		if !strings.HasPrefix(dependency.Repository, "https://") {
-			continue
-		}
-		name := "image-catalog-" + fmt.Sprint(index)
-		if _, err := imageCatalogCommand("helm", "repo", "add", name, dependency.Repository); err != nil {
-			t.Fatal(err)
-		}
-	}
+	return prepared
 }
 
-// setTestImageValues replaces an image object in an override file; Helm performs
-// the merge with chart defaults when that file is rendered.
-func setTestImageValues(t *testing.T, values map[string]any, path string, fields map[string]any) {
+func renderGuardChart(t *testing.T, chart string, values map[string]any) imageChartSnapshot {
 	t.Helper()
-	keys := strings.Split(path, ".")
-	for _, key := range keys[:len(keys)-1] {
-		if values[key] == nil {
-			values[key] = make(map[string]any)
-		}
-		values = values[key].(map[string]any)
+	encoded, err := yaml.Marshal(values)
+	if err != nil {
+		t.Fatal(err)
 	}
-	values[keys[len(keys)-1]] = fields
+	rendered, err := renderImageChart(chart, []string{writeGuardValues(t, string(encoded))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rendered
+}
+
+func writeGuardValues(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "values.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

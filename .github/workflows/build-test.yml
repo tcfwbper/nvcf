@@ -108,13 +108,16 @@ jobs:
       # that renders today keeps rendering the same way tomorrow. helmfile
       # v1.2.0+ processes helmfile.d/ in parallel and breaks the ordering the
       # self-managed stack relies on, so stay on v1.1.x. deploy/stacks
-      # requires helm v3.x.
-      - name: Install helm and helmfile (pinned, checksum-verified)
+      # requires helm v3.x. check-helm-charts reads its chart values map with
+      # yq v4 (mikefarah).
+      - name: Install helm, helmfile and yq (pinned, checksum-verified)
         env:
           HELM_VERSION: "3.21.4"
           HELM_SHA256: "61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14"
           HELMFILE_VERSION: "1.1.9"
           HELMFILE_SHA256: "ee71196bb12460905b8cbe0ef67b28db51ef681b777cc212d8c0956475b51905"
+          YQ_VERSION: "4.47.1"
+          YQ_SHA256: "0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
         run: |
           set -euo pipefail
           cd "${RUNNER_TEMP}"
@@ -128,8 +131,13 @@ jobs:
           echo "${HELMFILE_SHA256}  helmfile.tar.gz" | sha256sum -c -
           tar xzf helmfile.tar.gz helmfile
 
+          curl -sSL --retry 3 -o yq \
+            "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  yq" | sha256sum -c -
+          chmod +x yq
+
           mkdir -p "${RUNNER_TEMP}/bin"
-          mv linux-amd64/helm helmfile "${RUNNER_TEMP}/bin/"
+          mv linux-amd64/helm helmfile yq "${RUNNER_TEMP}/bin/"
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
 
       - name: Check tool versions
@@ -137,6 +145,7 @@ jobs:
           set -euo pipefail
           helm version --short
           helmfile --version
+          yq --version
 
       - name: Test the chart mapping guard
         run: bash tools/ci/test-check-helm-charts
@@ -175,10 +184,15 @@ jobs:
           NVCF_RECEIPT_INVENTORY_E2E: "1"
         run: go test -C tools/docs-version-sync -run '^TestReceiptInventoryIncludesBundledChartAndDefaultHookImage$' -count=1
 
-      - name: Verify prefilled images and Helm overrides for core dependencies
+      - name: Check image coverage for every tracked Helm chart
         env:
           NVCF_IMAGE_CATALOG_E2E: "1"
-        run: go test -C tools/docs-version-sync -run '^TestImageCatalogCharts$' -count=1
+        run: go test -C tools/docs-version-sync -run '^(TestChartImageCoverage|TestChartImageCoverageReportsEachFailure|TestImageCatalogRepositoriesReuseNamesAcrossCharts)$' -count=1
+
+      - name: Test NATS and OpenBao chart image guards
+        env:
+          NVCF_IMAGE_CATALOG_E2E: "1"
+        run: go test -C tools/docs-version-sync -run '^TestNATSAndOpenBaoChartImageGuards$' -count=1
 
       - name: Run observability Helmfile profile tests
         run: make -C deploy/stacks/observability test

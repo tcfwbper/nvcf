@@ -1,0 +1,92 @@
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Chart image coverage exclusions, read by TestChartImageCoverage.
+#
+# Every tracked Chart.yaml must either declare an image index (thirdPartyImages
+# or ownedImages in its values.yaml) and pass image coverage, or be listed here.
+# Keys are chart directories relative to the repository root.
+#
+# reason:
+#   pending-fix        Not yet remediated. Expected to fail coverage. Once the
+#                      chart passes, CI fails until this entry is removed.
+#   test-fixture       Testdata, validator test charts, and samples that no
+#                      NVCF stack deploys. Skipped.
+#   no-runtime-image   Renders no image in its defaults or any CI values
+#                      scenario in tools/ci/helm-chart-values.yaml. Confirmed
+#                      by rendering.
+#   vendored-subchart  Lives at <parent>/charts/<name>, where <parent> is
+#                      itself a chart. Skipped.
+#
+# issue (optional, pending-fix only): a free-form note, such as a tracking
+# link. It is not validated. This file is public, so keep private tracker IDs
+# and URLs out of it.
+#
+# A chart with an image index may only be listed as pending-fix. Indirect
+# images (arguments, environment, injected agents) are visible only through
+# the patterns registered in the release inventory scanner. See the
+# indirect-image convention in tools/docs-version-sync/AGENTS.md.
+
+# pending-fix
+deploy/helm/admin-token-issuer-proxy/chart: {reason: pending-fix}
+deploy/helm/api-keys-colocated/api-keys: {reason: pending-fix}
+deploy/helm/cloud-functions/nvcf-api: {reason: pending-fix}
+deploy/helm/cloud-tasks/nvct-api: {reason: pending-fix}
+deploy/helm/container-cache/deploy: {reason: pending-fix}
+deploy/helm/encrypted-secret-store/ess-api: {reason: pending-fix}
+deploy/helm/event-ledger: {reason: pending-fix}
+deploy/helm/function-autoscaler: {reason: pending-fix}
+deploy/helm/grpc-proxy/grpc-proxy: {reason: pending-fix}
+deploy/helm/helm-reval: {reason: pending-fix}
+deploy/helm/http-invocation/nvcf-invocation-service: {reason: pending-fix}
+deploy/helm/icms/icms-api: {reason: pending-fix}
+deploy/helm/llm-api-gateway/llm-api-gateway: {reason: pending-fix}
+deploy/helm/llm-request-router/llm-request-router: {reason: pending-fix}
+deploy/helm/nats-auth-callout: {reason: pending-fix}
+deploy/helm/notary/nvcf-notary-service: {reason: pending-fix}
+deploy/helm/nvca-operator/nvca-operator: {reason: pending-fix}
+deploy/helm/nvcf-unbound: {reason: pending-fix}
+deploy/helm/ratelimiter/nvcf-ratelimiter: {reason: pending-fix}
+deploy/helm/vanity-gateway/helm-nvcf-vanity-gateway: {reason: pending-fix}
+deploy/helm/worker-callback-proxy/worker-callback-proxy: {reason: pending-fix}
+deploy/stacks/observability/charts/nvcf-otel-collector: {reason: pending-fix}
+deploy/stacks/self-managed/charts/nvcf-upgrade-receipt: {reason: pending-fix}
+deploy/stacks/stargate-dev/charts/stargate-dev-auth: {reason: pending-fix}
+deploy/stacks/stargate-dev/charts/stargate-dev-mockdc: {reason: pending-fix}
+src/compute-plane-services/nvsnap/deploy/helm/nvsnap: {reason: pending-fix}
+# Listed conservatively; revisit if this turns out to be a sample.
+src/compute-plane-services/nvsnap/deploy/k8s/charts/vllm-workers: {reason: pending-fix}
+src/compute-plane-services/nvstor/deploy/helm/nvstor: {reason: pending-fix}
+src/uis/nvcf-ui/helm: {reason: pending-fix}
+
+# vendored-subchart
+deploy/helm/cert-manager/charts/cert-manager: {reason: vendored-subchart}
+
+# no-runtime-image
+deploy/helm/gateway-routes/chart: {reason: no-runtime-image}
+deploy/helm/nvcf-pki: {reason: no-runtime-image}
+deploy/stacks/nvcf-compute-plane/charts/nvcf-cluster-topology: {reason: no-runtime-image}
+deploy/stacks/observability/charts/nvcf-default-monitors: {reason: no-runtime-image}
+
+# test-fixture
+examples/function-samples/helmchart-samples/dynamo-operator-sample/dynamo-operator-test: {reason: test-fixture}
+examples/function-samples/helmchart-samples/inference-test-sample/inference-test: {reason: test-fixture}
+examples/function-samples/helmchart-samples/multi-node-helm-function-test/multi-node-test: {reason: test-fixture}
+examples/function-samples/helmchart-samples/ray-serve-sample/ray-serve: {reason: test-fixture}
+examples/task-samples/multi-node-helm-task-test/multi-node-task-test: {reason: test-fixture}
+examples/task-samples/task-helmchart-byoo-sample/task-helmchart-byoo: {reason: test-fixture}
+examples/task-samples/task-helmchart-sample/task-helmchart-test: {reason: test-fixture}
+src/compute-plane-services/byoo-otel-collector/validator/charts/dummy-function: {reason: test-fixture}
+src/compute-plane-services/byoo-otel-collector/validator/charts/kube-state-metrics: {reason: test-fixture}
+src/compute-plane-services/byoo-otel-collector/validator/charts/otel-collector: {reason: test-fixture}
+src/compute-plane-services/nvca/examples/image-segmentation: {reason: test-fixture}
+src/compute-plane-services/nvca/examples/inference-test: {reason: test-fixture}
+src/compute-plane-services/nvca/test/testdata/helmcharts/badchart-role: {reason: test-fixture}
+src/compute-plane-services/nvca/test/testdata/helmcharts/goodchart: {reason: test-fixture}
+src/compute-plane-services/nvsnap/tests/criu-matrix/chart: {reason: test-fixture}
+src/control-plane-services/helm-reval/reval/testdata/test-chart: {reason: test-fixture}
+src/control-plane-services/helm-reval/reval/testdata/test-chart-extra-gvks-only: {reason: test-fixture}
+src/control-plane-services/helm-reval/reval/testdata/test-chart-multi-service: {reason: test-fixture}
+src/libraries/go/lib/validator/otelconfig/charts/dummy-function: {reason: test-fixture}
+src/libraries/go/lib/validator/otelconfig/charts/kube-state-metrics: {reason: test-fixture}
+src/libraries/go/lib/validator/otelconfig/charts/otel-collector: {reason: test-fixture}
