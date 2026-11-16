@@ -27,6 +27,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/segment"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/redact"
 )
 
 // fileIdentity tells one spool file from a later one that reuses its name.
@@ -247,21 +248,32 @@ type formatVersioner interface {
 	FormatVersion() string
 }
 
+// redactionVersion is the redaction algorithm's version. Tests replace it.
+var redactionVersion = redact.Version
+
 // recordPolicy fingerprints everything that decides what a transport holds:
-// the read bounds, suppression rules and headerless policy, redaction, the
-// record schema, and the format with its writer version. Only the hash is
-// kept or logged, never the configured values.
+// the read bounds, suppression rules and headerless policy, redaction with
+// its algorithm's version, the record schema, and the format with its writer
+// version. Only the hash is kept or logged, never the configured values.
 func recordPolicy(cfg transform.Config, factory format.Factory) (string, error) {
 	writerVersion := ""
 	if versioned, ok := factory.(formatVersioner); ok {
 		writerVersion = versioned.FormatVersion()
 	}
+	// A redaction that catches more makes transports prepared before it
+	// stale. With redaction off the field is left out, so that policy is
+	// the one written before the field existed.
+	redaction := ""
+	if cfg.Redact {
+		redaction = redactionVersion
+	}
 	raw, err := json.Marshal(struct {
-		Transform     transform.Config
-		RecordSchema  int
-		Format        backend.Format
-		WriterVersion string
-	}{cfg, recordSchemaVersion, factory.Format(), writerVersion})
+		Transform        transform.Config
+		RecordSchema     int
+		Format           backend.Format
+		WriterVersion    string
+		RedactionVersion string `json:",omitempty"`
+	}{cfg, recordSchemaVersion, factory.Format(), writerVersion, redaction})
 	if err != nil {
 		return "", fmt.Errorf("fingerprint the record policy: %w", err)
 	}

@@ -29,7 +29,9 @@ volume, so every step survives a restart.
 3. Record handling: suppression, then redaction, then the backend's format
    writer. A backend chooses its transport format by implementing
    `format.Factory` on its client; a backend that takes gzip JSON lines on
-   one destination gets the default writer.
+   one destination gets the default writer. An unsent transport prepared
+   under other record settings, or under an earlier redaction version, is
+   prepared again from its source.
 4. Batching: prepared segments are grouped per destination within the
    backend's file and byte limits, and lanes are flushed every pass. A batch
    is recorded before the backend is called, and a returned job id is saved

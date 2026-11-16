@@ -6,13 +6,20 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/backendtest"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/format"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/segment"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform"
 )
 
 // A discovered segment can be swapped before it is fingerprinted. The first
@@ -47,5 +54,68 @@ func TestFingerprintRefusesWhatIsNotARegularFile(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("fingerprint(%s) blocked", filepath.Base(path))
 		}
+	}
+}
+
+// A transport prepared under an older redaction version has a different
+// record policy, so it is prepared again from its source rather than sent.
+// With redaction off the version does not matter.
+func TestRecordPolicyFollowsTheRedactionVersion(t *testing.T) {
+	factory, err := format.For(backendtest.NewFake())
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := redactionVersion
+	t.Cleanup(func() { redactionVersion = real })
+	policy := func(redact bool, version string) string {
+		t.Helper()
+		redactionVersion = version
+		cfg := transform.DefaultConfig()
+		cfg.Redact = redact
+		p, err := recordPolicy(cfg, factory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if policy(true, real) == policy(true, "v2") {
+		t.Fatal("a transport prepared under redaction v2 has the current record policy, so it would be sent unchanged")
+	}
+	if policy(false, real) != policy(false, "v2") {
+		t.Fatal("with redaction off, the redaction version changed the record policy")
+	}
+}
+
+// With redaction off, the record policy is the one written before it named
+// the redaction version, so upgrading does not prepare every unsent
+// transport again.
+func TestRecordPolicyWithRedactionOffIsUnchangedByTheUpgrade(t *testing.T) {
+	factory, err := format.For(backendtest.NewFake())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := transform.DefaultConfig()
+	cfg.Redact = false
+	got, err := recordPolicy(cfg, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerVersion := ""
+	if versioned, ok := factory.(formatVersioner); ok {
+		writerVersion = versioned.FormatVersion()
+	}
+	// The fields and order of the policy before this release.
+	raw, err := json.Marshal(struct {
+		Transform     transform.Config
+		RecordSchema  int
+		Format        backend.Format
+		WriterVersion string
+	}{cfg, recordSchemaVersion, factory.Format(), writerVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	if want := hex.EncodeToString(sum[:16]); got != want {
+		t.Fatalf("recordPolicy = %s, want %s, the policy before the redaction version", got, want)
 	}
 }

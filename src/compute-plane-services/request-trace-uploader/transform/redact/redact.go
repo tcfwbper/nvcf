@@ -4,28 +4,30 @@
 // Package redact replaces multimodal media in request trace records with
 // markers, so images, audio, video and files never leave the pod.
 //
-// It is an exact port of the earlier Python uploader's redaction (version 2):
+// It is an exact port of the earlier Python uploader's redaction (version 3):
 // the same media detection, marker object, inline token, MIME sniffing, and
 // part count, so redacted rows keep their shape. Media is found three ways:
 //
 //  1. Media content parts keep their type and get a marker in place of their
 //     media field; every other field of the part is dropped.
 //  2. Fields known to hold raw media (images, b64_json, multi_modal_data,
-//     inline audio data and similar) are replaced by a marker.
+//     inline audio data and similar) are replaced by a marker. In
+//     multi_modal_data and mm_data, decoded media, such as audio samples as
+//     a list of numbers or an object, is replaced as a whole; a number beside
+//     it, such as the sampling rate, stays.
 //  3. In any other string, each media data URL and each long base64 run is
 //     replaced. A string that is only that media becomes the marker;
-//     otherwise only the media text becomes an inline token.
+//     otherwise only the media text becomes an inline token. Base64 counts
+//     as media when its characters look like media or when it decodes to
+//     known media magic bytes, which catches quiet uncompressed audio.
 //
 // Lengths, thresholds and the marker's "bytes" count Unicode code points, as
 // Python's len() does, and "sha256" hashes the media text's UTF-8 bytes.
 //
-// Two differences are on purpose. A MIME type next to the media, such as
+// One difference is on purpose. A MIME type next to the media, such as
 // media_type, an audio format or a data URL's own type, goes into the marker
 // only when it is a media type; the earlier uploader copied any, so a hint
-// holding media or other text survived redaction. And an object entry of
-// multi_modal_data, such as {"data": ...}, has its media fields replaced as
-// inline_data's are; the earlier uploader left them to the general scan,
-// which keeps base64 shorter than its threshold.
+// holding media or other text survived redaction.
 package redact
 
 import (
@@ -39,7 +41,7 @@ import (
 
 // Version identifies this redaction algorithm. A transport prepared with a
 // different version must be rebuilt from its source.
-const Version = "v2"
+const Version = "v3"
 
 func set(values ...string) map[string]bool {
 	out := make(map[string]bool, len(values))
@@ -109,11 +111,22 @@ var magicMIME = []struct {
 	{0, "%PDF", "application/pdf"},
 	{8, "WEBP", "image/webp"},
 	{8, "WAVE", "audio/wav"},
+	{8, "AIFF", "audio/aiff"},
+	{8, "AIFC", "audio/aiff"},
 	{8, "AVI ", "video/x-msvideo"},
 	{0, "ID3", "audio/mpeg"},
+	{0, "\xff\xfb", "audio/mpeg"},
+	{0, "\xff\xf3", "audio/mpeg"},
+	{0, "\xff\xf2", "audio/mpeg"},
+	{0, "\xff\xf1", "audio/aac"},
+	{0, "\xff\xf9", "audio/aac"},
 	{0, "fLaC", "audio/flac"},
 	{0, "OggS", "audio/ogg"},
+	{0, "caff", "audio/x-caf"},
+	{0, ".snd", "audio/basic"},
+	{0, "#!AMR", "audio/amr"},
 	{0, "\x1aE\xdf\xa3", "video/webm"},
+	{4, "ftypM4A", "audio/mp4"},
 	{4, "ftyp", "video/mp4"},
 	{0, "PK\x03\x04", "application/zip"},
 }
@@ -482,18 +495,29 @@ func redactRawMediaField(node *jsonvalue.Value, key string, value *jsonvalue.Val
 		}
 		for _, member := range value.Members() {
 			modality, item := member.Key, member.Value
-			switch item.Kind() {
-			case jsonvalue.Array:
+			switch {
+			case isNumberList(item):
+				// One clip as its samples: [0.01, -0.02, ...].
+				value.Set(modality, valueMarker(item, modality, mimeType{}).value())
+				count++
+			case item.Kind() == jsonvalue.Array:
 				for i, entry := range item.Items() {
-					if entry.Kind() == jsonvalue.Object {
-						count += redactMediaObject(entry, modality == "audio")
-					} else if m, ok := rawMediaMarker(entry, modality, mimeType{}); ok {
-						item.SetItem(i, m.value())
+					switch entry.Kind() {
+					case jsonvalue.Array, jsonvalue.Object:
+						// Decoded media, such as audio samples as a list of
+						// floats; a scalar beside it (the sample rate) stays.
+						item.SetItem(i, valueMarker(entry, modality, mimeType{}).value())
 						count++
+					default:
+						if m, ok := rawMediaMarker(entry, modality, mimeType{}); ok {
+							item.SetItem(i, m.value())
+							count++
+						}
 					}
 				}
-			case jsonvalue.Object:
-				count += redactMediaObject(item, modality == "audio")
+			case item.Kind() == jsonvalue.Object:
+				value.Set(modality, valueMarker(item, modality, mimeType{}).value())
+				count++
 			default:
 				if m, ok := rawMediaMarker(item, modality, mimeType{}); ok {
 					value.Set(modality, m.value())
@@ -529,7 +553,7 @@ func redactMediaObject(value *jsonvalue.Value, audio bool) int {
 func redactString(text string) (*jsonvalue.Value, int) {
 	spans := mediaSpans(text)
 	if len(spans) == 0 {
-		if isBase64String(text) && len(text) >= base64StringMinChars && hasBase64Classes(text, 0, len(text)) {
+		if isBase64String(text) && len(text) >= base64StringMinChars && isBase64Media(text, 0, len(text)) {
 			return stringMarker(pyStrip(text), "", mimeType{}).value(), 1
 		}
 		return nil, 0
@@ -601,4 +625,18 @@ func prefixCodePoints(text string, n int) string {
 		i += size
 	}
 	return text[:i]
+}
+
+// isNumberList reports a non-empty list of numbers only, such as one audio
+// clip as its samples.
+func isNumberList(v *jsonvalue.Value) bool {
+	if v.Kind() != jsonvalue.Array || len(v.Items()) == 0 {
+		return false
+	}
+	for _, item := range v.Items() {
+		if item.Kind() != jsonvalue.Int && item.Kind() != jsonvalue.Float {
+			return false
+		}
+	}
+	return true
 }

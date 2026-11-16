@@ -136,12 +136,24 @@ func base64Runs(text string, start, end int) []span {
 		for pad := 0; pad < 2 && runEnd < end && text[runEnd] == '='; pad++ {
 			runEnd++
 		}
-		if hasBase64Classes(text, runStart, runEnd) {
+		if isBase64Media(text, runStart, runEnd) {
 			runs = append(runs, span{start: runStart, end: runEnd, kind: "inline"})
 		}
 		i = runEnd
 	}
 	return runs
+}
+
+// isBase64Media reports base64 of media in text[start:end]: its characters
+// look like base64 of media, or it decodes to known media magic bytes.
+// Uncompressed audio of speech is mostly near-silent samples, whose 0xFF and
+// 0x00 bytes encode to "/" and "A" densely enough to fail the class check.
+func isBase64Media(text string, start, end int) bool {
+	if hasBase64Classes(text, start, end) {
+		return true
+	}
+	_, ok := sniffMIME(text[start:min(start+64, end)])
+	return ok
 }
 
 // hasBase64Classes reports whether text[start:end] mixes upper case, lower
