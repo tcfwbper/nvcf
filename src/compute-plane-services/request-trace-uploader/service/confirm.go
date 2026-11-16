@@ -43,7 +43,7 @@ func (u *Uploader) pollRound(ctx context.Context) error {
 		u.lastPolled[b.ID] = now
 		u.stateMu.Unlock()
 		statusCtx, cancel := withTimeout(ctx, u.cfg.RetryPolicy.AttemptTimeout)
-		status, err := u.client.Status(statusCtx, b.Receipt.ID)
+		status, err := u.pollJob(statusCtx, b.Receipt.ID)
 		cancel()
 		if err := u.applyStatus(b, status, err, now); err != nil {
 			slog.Error("record job status", "batch", shortID(b.ID), "error", safeError(err))

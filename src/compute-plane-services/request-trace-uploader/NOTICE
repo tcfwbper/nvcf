@@ -2,8 +2,17 @@ This project includes dependencies on the following open-source projects:
 
 - OpenTelemetry Go (https://github.com/open-telemetry/opentelemetry-go)
   go.opentelemetry.io/otel, otel/metric, otel/sdk, otel/sdk/metric,
-  otel/trace, otel/exporters/otlp/otlpmetric/otlpmetricgrpc and
-  otel/exporters/otlp/otlpmetric/otlpmetrichttp
+  otel/trace, otel/log, otel/sdk/log,
+  otel/exporters/otlp/otlpmetric/otlpmetricgrpc,
+  otel/exporters/otlp/otlpmetric/otlpmetrichttp,
+  otel/exporters/otlp/otlptrace, otel/exporters/otlp/otlptrace/otlptracegrpc,
+  otel/exporters/otlp/otlptrace/otlptracehttp,
+  otel/exporters/otlp/otlplog/otlploggrpc and
+  otel/exporters/otlp/otlplog/otlploghttp
+  Licensed under the Apache License, Version 2.0
+
+- OpenTelemetry Go Contrib (https://github.com/open-telemetry/opentelemetry-go-contrib)
+  go.opentelemetry.io/contrib/bridges/otelslog
   Licensed under the Apache License, Version 2.0
 
 - OpenTelemetry Go Auto SDK (https://github.com/open-telemetry/opentelemetry-go-instrumentation)

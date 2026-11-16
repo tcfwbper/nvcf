@@ -16,8 +16,9 @@ backend and deletes each source only after the backend confirmed it. See
 - `batch/`, `journal/`: batching and the durable state machine
 - `backend/`: export destination contract and the backend registry
 - `telemetry/`, `credentials/`: hooks other modules use
-- `telemetry/otlp/`: the OTLP metrics exporter, kept out of `telemetry` so the
-  interface package does not pull in the OpenTelemetry SDK
+- `telemetry/otlp/`: the OTLP metrics, logs and traces exporters, kept out
+  of `telemetry` so the interface package does not pull in the OpenTelemetry
+  SDK
 - `internal/`: journal store, cleanup, disk guard, fault policy, health,
   atomic file publish
 - `uploadertest/`, `backend/backendtest/`: fixtures, crash helper, fake backend
@@ -46,8 +47,16 @@ after changing Go imports or Bazel metadata.
 - Do not add a Prometheus scrape endpoint. Metrics go through `telemetry`.
   The OTLP resource reads `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_SERVICE_NAME`,
   which the chart uses for function and pod identity.
-- Do not log request payloads, credentials, paths, or remote upload IDs. Log
-  backend faults by class, scope and reason, not by their error text.
+- Metrics, logs and traces each go over OTLP only when that signal's
+  `OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT` is set; a failed export never
+  blocks an upload or readiness. Logs are JSON lines on stderr either way.
+- Do not log request payloads, credentials, paths, NCA ids, request ids, or
+  remote upload IDs. Log backend faults by class, scope and reason, not by
+  their error text. Spans carry the same bounded fields and never record
+  error text.
+- A backend that calls its destination over HTTP takes the core's
+  transport through `telemetry.TransportReceiver`, so each call is a child
+  span with per-call metrics.
 - New settings fail startup on a bad value; never add a silent fallback.
 - `config`, `segment`, `backend`, `format`, `telemetry`, `telemetry/otlp`,
   `runner`, and `service` are consumed by other modules that link their own backends.

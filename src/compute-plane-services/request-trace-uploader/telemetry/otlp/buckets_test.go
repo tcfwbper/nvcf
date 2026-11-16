@@ -20,11 +20,14 @@ func TestOTLPExportsEachHistogramWithItsBoundaries(t *testing.T) {
 	r, endpoint := httpReceiver(t)
 	exporter := newOTLP(t, endpoint, ProtocolHTTP)
 	for _, instrument := range histograms {
-		// Every label a histogram takes is enumerated, so its first value
-		// makes a valid observation.
+		// An enumerated label's first value, or a sample value for a label
+		// a backend names, makes a valid observation.
 		labels := telemetry.Labels{}
 		for _, key := range instrument.Labels {
-			labels[key] = instrument.Values[key][0]
+			labels[key] = "sample"
+			if values := instrument.Values[key]; len(values) > 0 {
+				labels[key] = values[0]
+			}
 		}
 		exporter.Observe(instrument.Name, 1, labels)
 	}

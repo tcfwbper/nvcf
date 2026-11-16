@@ -12,6 +12,7 @@ go_library(
         "service.go",
         "submit.go",
         "suppression.go",
+        "tracing.go",
         "tuning.go",
         "uploader.go",
     ],
@@ -33,6 +34,11 @@ go_library(
         "//src/compute-plane-services/request-trace-uploader/telemetry",
         "//src/compute-plane-services/request-trace-uploader/transform",
         "//src/compute-plane-services/request-trace-uploader/transform/suppress",
+        "@io_opentelemetry_go_otel//attribute",
+        "@io_opentelemetry_go_otel//codes",
+        "@io_opentelemetry_go_otel//propagation",
+        "@io_opentelemetry_go_otel_trace//:trace",
+        "@io_opentelemetry_go_otel_trace//noop",
     ],
 )
 
@@ -60,6 +66,7 @@ go_test(
         "stranded_e2e_test.go",
         "suppression_e2e_test.go",
         "timing_e2e_test.go",
+        "tracing_e2e_test.go",
         "tuning_e2e_test.go",
         "tuning_internal_test.go",
         "unconfirmed_e2e_test.go",
@@ -82,6 +89,9 @@ go_test(
         "//src/compute-plane-services/request-trace-uploader/telemetry",
         "//src/compute-plane-services/request-trace-uploader/transform",
         "//src/compute-plane-services/request-trace-uploader/uploadertest",
+        "@io_opentelemetry_go_otel//codes",
+        "@io_opentelemetry_go_otel_sdk//trace",
+        "@io_opentelemetry_go_otel_sdk//trace/tracetest",
     ] + select({
         "@rules_go//go/platform:aix": [
             "//src/compute-plane-services/request-trace-uploader/segment",

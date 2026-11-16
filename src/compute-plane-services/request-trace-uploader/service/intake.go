@@ -17,6 +17,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/format"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
@@ -115,7 +118,13 @@ func (u *Uploader) take(ctx context.Context, item segment.Segment) error {
 		if !allowed {
 			return errPreparePaused
 		}
-		return u.prepare(ctx, item, seg)
+		ctx, span := u.startSpan(ctx, "prepare")
+		defer span.End()
+		err = u.prepare(ctx, item, seg)
+		if err != nil {
+			failSpan(span, "error", "")
+		}
+		return err
 	case journal.StateQuarantined:
 		// A crash between the journal record and the move left the source
 		// on the spool. Admit skips what is already moved.
@@ -202,12 +211,16 @@ func (u *Uploader) prepare(ctx context.Context, item segment.Segment, seg journa
 	u.recordPrepared(result)
 	u.recordRead(item, result)
 
+	span := trace.SpanFromContext(ctx)
 	switch {
 	case result.Quarantine != "":
+		span.SetAttributes(attrStatus("quarantined"), attribute.String("reason", result.Quarantine))
 		return u.quarantineSegment(seg.ID, item.Index, result.Quarantine, item.Path)
 	case len(outputs) == 0:
+		span.SetAttributes(attrStatus("empty"))
 		return u.store.MarkEmpty(seg.ID)
 	}
+	span.SetAttributes(attrStatus("prepared"))
 	transports := make(map[string]journal.Transport, len(outputs))
 	for _, output := range outputs {
 		transports[laneOf(output.Destination)] = journal.Transport{Path: output.Path, SHA256: output.SHA256, Rows: output.Rows, Bytes: output.Bytes, Policy: u.prepPolicy}

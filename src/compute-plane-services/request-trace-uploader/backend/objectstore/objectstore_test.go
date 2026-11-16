@@ -501,3 +501,22 @@ func TestSubmitStopsWaitingForAStoreThatNeverAnswers(t *testing.T) {
 		t.Fatalf("Submit() error = %v, context error = %v; want the bounded wait for the answer to end it", err, ctx.Err())
 	}
 }
+
+// A client from New works on its own, without the core's UseTransport: a
+// failed store call is an error, never a panic.
+func TestAClientFromNewWorksWithoutUseTransport(t *testing.T) {
+	withHostname(t, "pod-a")
+	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b","session_token":"c"}`), "https://127.0.0.1:1")
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Submit panicked: %v", r)
+		}
+	}()
+	if _, err := client.Submit(context.Background(), backend.SubmitRequest{Path: writeSegment(t, "compressed-fixture")}); err == nil {
+		t.Fatal("Submit() to a closed port succeeded")
+	}
+}

@@ -91,8 +91,9 @@ segments again, counts `quarantine_resumed`, and starts a fresh run, so a
 fault that is still there trips the breaker again. A success ends a run
 but does not close a tripped breaker. A backend that records its own metrics implements
 `telemetry.Receiver` and gets the shared recorder. This binary exports
-metrics over OTLP when an endpoint is set (see Metrics below); a distribution
-can pass its own recorder in `service.Options.Metrics`.
+metrics, logs and traces over OTLP, each when its endpoint is set (see
+Metrics, Logs and Traces below); a distribution can pass its own recorder
+in `service.Options.Metrics` and its own tracer in `service.Options.Tracer`.
 
 ## Metrics
 
@@ -132,11 +133,71 @@ Rate, errors and duration of the export path:
   Dynamo v1.4.0 event type, or `unknown` for an unparseable line, an older
   release's record, or an event type this build does not know.
 
-`prepare_duration` buckets run from 5 ms to 1 hour; the other durations run
-from 50 ms to 24 hours. Metrics are pushed every 60
-seconds and once more after the shutdown drain, for up to 5 seconds, so the
-pod's grace period must cover the drain timeout plus 5 seconds. A failed
-export never blocks an upload or changes readiness.
+- `backend_calls` (`operation`, `status`) and `backend_call.duration`
+  (`operation`, `status`), seconds: each HTTP call a backend makes through
+  the transport the core hands it (see Traces), by the operation the
+  backend names and the status class (`2xx` to `5xx`, or `error` when no
+  response came back).
+
+`prepare_duration` and `backend_call.duration` buckets run from 5 ms to 1
+hour; the other durations run from 50 ms to 24 hours. Metrics are pushed
+every 60 seconds and once more after the shutdown drain. A failed export
+never blocks an upload or changes readiness.
+
+## Logs
+
+Every log line is one JSON object on stderr. When they are known, each line
+carries the workload's identity: `function_id` and `function_version_id`
+from `NVCF_FUNCTION_ID` and `NVCF_FUNCTION_VERSION_ID`, or from
+`nvcf.function.id` and `nvcf.function.version.id` in
+`OTEL_RESOURCE_ATTRIBUTES`, and `pod` and `cluster` from `k8s.pod.name` and
+`k8s.cluster.name` there. Lines name segments and batches by their local
+number or short id. They never carry credentials, record payloads, NCA ids,
+request ids, remote job ids or local file paths; a backend fault is logged by its
+class, scope and reason.
+
+The same records also go to the collector over OTLP when its endpoint is
+set, with the shared resource instead of the identity fields. The resource
+carries the same identity: `nvcf.function.id` and
+`nvcf.function.version.id` from the NVCF function variables when they are
+set, as on the local lines, and the rest of `OTEL_RESOURCE_ATTRIBUTES`:
+
+- `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` and `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`:
+  as for metrics. Unset turns OTLP logs off; the JSON lines stay.
+
+## Traces
+
+Spans go to the collector over OTLP when its endpoint is set:
+
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
+  `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`: as for metrics. Unset turns traces
+  off.
+
+The pipeline makes one span per step: `request-trace-uploader.prepare` for
+one segment, `request-trace-uploader.submit` for one backend submit, and
+`request-trace-uploader.poll` for one job status read. Spans carry only
+`backend`, an outcome `status`, and a fault's `class`, `scope` and `reason`;
+a failure sets the error status with the reason as its description and
+never records error text. Every span is sampled.
+
+A backend that calls its destination over HTTP implements
+`telemetry.TransportReceiver` and wraps each HTTP client's transport with
+the function it receives, naming the operation, such as `submit` or
+`status`. Each call is then a `request-trace-uploader.backend_call` client
+span, a child of the step that made it, carries the W3C trace context, and
+is counted in `backend_calls` and `backend_call.duration`. The `objectstore`
+backend routes every store call through it, as operation `upload`, keeping
+its redirect check and TLS settings. Batch and queue sizes are fixed, so an
+`OTEL_BSP_*` or `OTEL_BLRP_*` variable cannot change them.
+
+## Shutdown
+
+After the shutdown drain, spans, metrics and logs are exported once more,
+together within 5 seconds, so the pod's grace period must cover the drain
+timeout plus 5 seconds. Each OTLP signal is configured on its own: an
+endpoint without its protocol stops startup, and each signal's export runs
+in the background, so a collector that is down costs telemetry, never an
+upload or readiness.
 
 The `backend` package defines the export destination contract and a registry.
 Submit and status are separate operations so a slow confirmation cannot block

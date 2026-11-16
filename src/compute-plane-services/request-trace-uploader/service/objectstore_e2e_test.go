@@ -4,6 +4,8 @@
 package service_test
 
 import (
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -20,14 +22,16 @@ import (
 	_ "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/objectstore"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/service"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/uploadertest"
 )
 
 // objectStore is a minimal S3-compatible server: it keeps every object a
 // path-style PutObject stores.
 type objectStore struct {
-	mu      sync.Mutex
-	objects map[string][]byte
+	mu           sync.Mutex
+	objects      map[string][]byte
+	traceparents []string
 }
 
 func (s *objectStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +46,7 @@ func (s *objectStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.objects[r.URL.Path] = body
+	s.traceparents = append(s.traceparents, r.Header.Get("traceparent"))
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
@@ -97,11 +102,26 @@ func TestObjectStoreBackendExportsEverySegmentEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("backend.New() error = %v", err)
 	}
-	uploader := newUploader(t, spool, client, service.Options{}, env)
+	metrics := newMetrics(t)
+	provider := sdktrace.NewTracerProvider()
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	uploader := newUploader(t, spool, client, service.Options{Metrics: metrics, Tracer: provider.Tracer("test")}, env)
 
 	if err := uploader.Pass(context.Background()); err != nil {
 		t.Fatalf("Pass() error = %v", err)
 	}
+	// Every store call goes through the core's transport: it carries the
+	// trace context and is counted.
+	if got, _ := metrics.Value(telemetry.BackendCalls, telemetry.Labels{"operation": "upload", "status": "2xx"}); got < 1 {
+		t.Errorf("backend_calls{upload,2xx} = %v, want the store calls counted", got)
+	}
+	store.mu.Lock()
+	for _, traceparent := range store.traceparents {
+		if traceparent == "" {
+			t.Error("a store call carried no trace context")
+		}
+	}
+	store.mu.Unlock()
 
 	got := store.records(t)
 	if len(got) != 3 {

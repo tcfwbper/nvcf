@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -75,22 +76,11 @@ type Config struct {
 // enabled false, with no error, when the endpoint is unset or blank. With an
 // endpoint, the protocol is required: grpc, http or http/protobuf.
 func ConfigFromEnv(lookup func(string) (string, bool)) (Config, bool, error) {
-	endpoint, _ := lookup(EnvMetricsEndpoint)
-	endpoint = strings.TrimSpace(endpoint)
-	if endpoint == "" {
-		return Config{}, false, nil
+	signal, enabled, err := signalFromEnv(lookup, EnvMetricsEndpoint, EnvMetricsProtocol)
+	if err != nil || !enabled {
+		return Config{}, false, err
 	}
-	raw, _ := lookup(EnvMetricsProtocol)
-	var protocol Protocol
-	switch strings.TrimSpace(raw) {
-	case "grpc":
-		protocol = ProtocolGRPC
-	case "http", "http/protobuf":
-		protocol = ProtocolHTTP
-	default:
-		return Config{}, false, fmt.Errorf("%s must be grpc, http or http/protobuf when %s is set", EnvMetricsProtocol, EnvMetricsEndpoint)
-	}
-	cfg := Config{Endpoint: endpoint, Protocol: protocol, Interval: DefaultExportInterval}
+	cfg := Config{Endpoint: signal.Endpoint, Protocol: signal.Protocol, Interval: DefaultExportInterval}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, false, err
 	}
@@ -142,25 +132,12 @@ func New(ctx context.Context, cfg Config, backend string) (*Exporter, error) {
 	if err := telemetry.ValidLabelValue(backend); err != nil {
 		return nil, err
 	}
-	otel.SetErrorHandler(newErrorHandler(errorLogInterval, time.Now))
-	otel.SetLogger(logr.New(newSDKSink(errorLogInterval, time.Now)))
+	installDiagnostics()
 	exporter, err := newExporter(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create OTLP metrics exporter: %w", err)
 	}
-	// The default service name comes first, so OTEL_SERVICE_NAME and
-	// OTEL_RESOURCE_ATTRIBUTES, which a deployment uses to name the function
-	// and the pod, override it.
-	res, err := resource.New(ctx,
-		resource.WithTelemetrySDK(),
-		resource.WithAttributes(attribute.String("service.name", ServiceName)),
-		resource.WithFromEnv())
-	if errors.Is(err, resource.ErrPartialResource) && res != nil {
-		// A malformed entry costs only that attribute: metrics never stop
-		// uploads. The SDK's error quotes the value, so it is not logged.
-		slog.Warn("some OTEL_RESOURCE_ATTRIBUTES entries could not be read and were left out of the metrics resource")
-		err = nil
-	}
+	res, err := newResource(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("build metrics resource: %w", err)
 	}
@@ -194,24 +171,104 @@ func New(ctx context.Context, cfg Config, backend string) (*Exporter, error) {
 	return e, nil
 }
 
+// installDiagnostics replaces the process-wide OpenTelemetry error handler and
+// internal logger. The SDK's defaults print the collector URL, its response
+// body, and the values of variables it failed to parse; these log a bounded
+// reason, rate limited.
+func installDiagnostics() {
+	otel.SetErrorHandler(newErrorHandler(errorLogInterval, time.Now))
+	otel.SetLogger(logr.New(newSDKSink(errorLogInterval, time.Now)))
+}
+
+// newResource is the resource every signal shares. The default service name
+// comes first, so OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES, which a
+// deployment uses to name the function and the pod, override it. The
+// function identity NVCF sets in the pod comes last and wins, as it does on
+// the local log lines.
+func newResource(ctx context.Context) (*resource.Resource, error) {
+	res, err := resource.New(ctx,
+		resource.WithTelemetrySDK(),
+		resource.WithAttributes(attribute.String("service.name", ServiceName)),
+		resource.WithFromEnv(),
+		resource.WithAttributes(functionIdentity()...))
+	if errors.Is(err, resource.ErrPartialResource) && res != nil {
+		// A malformed entry costs only that attribute: telemetry never stops
+		// uploads. The SDK's error quotes the value, so it is not logged.
+		slog.Warn("some OTEL_RESOURCE_ATTRIBUTES entries could not be read and were left out of the telemetry resource")
+		err = nil
+	}
+	return res, err
+}
+
+// functionIdentity returns the function and function version NVCF sets in a
+// function pod, as resource attributes, leaving out what is not set.
+func functionIdentity() []attribute.KeyValue {
+	var attrs []attribute.KeyValue
+	for _, v := range []struct{ env, key string }{
+		{env: "NVCF_FUNCTION_ID", key: "nvcf.function.id"},
+		{env: "NVCF_FUNCTION_VERSION_ID", key: "nvcf.function.version.id"},
+	} {
+		if value := strings.TrimSpace(os.Getenv(v.env)); value != "" {
+			attrs = append(attrs, attribute.String(v.key, value))
+		}
+	}
+	return attrs
+}
+
+// signalFromEnv reads one signal's endpoint and protocol. It reports
+// enabled false, with no error, when the endpoint is unset or blank. With an
+// endpoint, the protocol is required: grpc, http or http/protobuf, and the
+// endpoint must be an http or https URL with a host.
+func signalFromEnv(lookup func(string) (string, bool), endpointEnv, protocolEnv string) (SignalConfig, bool, error) {
+	endpoint, _ := lookup(endpointEnv)
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return SignalConfig{}, false, nil
+	}
+	raw, _ := lookup(protocolEnv)
+	var protocol Protocol
+	switch strings.TrimSpace(raw) {
+	case "grpc":
+		protocol = ProtocolGRPC
+	case "http", "http/protobuf":
+		protocol = ProtocolHTTP
+	default:
+		return SignalConfig{}, false, fmt.Errorf("%s must be grpc, http or http/protobuf when %s is set", protocolEnv, endpointEnv)
+	}
+	if u, err := url.Parse(endpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return SignalConfig{}, false, fmt.Errorf("%s must be an http or https URL with a host", endpointEnv)
+	}
+	return SignalConfig{Endpoint: endpoint, Protocol: protocol}, true, nil
+}
+
+// tlsFor is the TLS setting for an endpoint: none for http, which also
+// clears a certificate the environment named, and the system roots with no
+// client certificate for https.
+func tlsFor(endpoint string) *tls.Config {
+	if strings.HasPrefix(endpoint, "https://") {
+		return &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	return nil
+}
+
+// grpcCredentials is tlsFor for a gRPC exporter.
+func grpcCredentials(endpoint string) credentials.TransportCredentials {
+	if tlsConfig := tlsFor(endpoint); tlsConfig != nil {
+		return credentials.NewTLS(tlsConfig)
+	}
+	return insecure.NewCredentials()
+}
+
 // newExporter passes every setting the exporters would otherwise read from
 // OTEL_EXPORTER_OTLP_* variables, so only the endpoint and protocol decide
 // the export. TLS is set for both schemes: an http endpoint gets none, which
 // also clears a certificate the environment named, and an https endpoint
 // gets the system roots with no client certificate.
 func newExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
-	var tlsConfig *tls.Config
-	if strings.HasPrefix(cfg.Endpoint, "https://") {
-		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	}
 	if cfg.Protocol == ProtocolGRPC {
-		transport := insecure.NewCredentials()
-		if tlsConfig != nil {
-			transport = credentials.NewTLS(tlsConfig)
-		}
 		return otlpmetricgrpc.New(ctx,
 			otlpmetricgrpc.WithEndpointURL(cfg.Endpoint),
-			otlpmetricgrpc.WithTLSCredentials(transport),
+			otlpmetricgrpc.WithTLSCredentials(grpcCredentials(cfg.Endpoint)),
 			otlpmetricgrpc.WithHeaders(map[string]string{}),
 			otlpmetricgrpc.WithTimeout(exportTimeout),
 			otlpmetricgrpc.WithCompressor(""),
@@ -221,7 +278,7 @@ func newExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
 	}
 	return otlpmetrichttp.New(ctx,
 		otlpmetrichttp.WithEndpointURL(cfg.Endpoint),
-		otlpmetrichttp.WithTLSClientConfig(tlsConfig),
+		otlpmetrichttp.WithTLSClientConfig(tlsFor(cfg.Endpoint)),
 		otlpmetrichttp.WithHeaders(map[string]string{}),
 		otlpmetrichttp.WithTimeout(exportTimeout),
 		otlpmetrichttp.WithCompression(otlpmetrichttp.NoCompression),

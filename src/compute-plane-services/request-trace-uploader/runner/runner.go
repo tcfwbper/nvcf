@@ -24,13 +24,15 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/service"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry/otlp"
 )
 
-// metricsFlushTimeout bounds the final metrics export after the drain.
-const metricsFlushTimeout = 5 * time.Second
+// telemetryFlushTimeout bounds the final export of traces, metrics and logs
+// after the drain, all three together.
+const telemetryFlushTimeout = 5 * time.Second
 
 // Option changes how Run loads configuration.
 type Option func(*options)
@@ -54,12 +56,14 @@ func WithDefaultBackend(backend config.Backend) Option {
 }
 
 // Run loads configuration, starts the service, and blocks until SIGINT or
-// SIGTERM. It then drains, sends the last metrics, and returns the process
-// exit code, so a main can pass it to os.Exit.
+// SIGTERM. It then drains, sends the last telemetry, and returns the process
+// exit code, so a main can pass it to os.Exit. Logs are JSON lines on
+// stderr.
 //
 // distribution names the build in the start log only. Which backends exist
 // is decided by what the calling main linked.
 func Run(distribution string, opts ...Option) int {
+	slog.SetDefault(newLogger(os.Stderr, os.LookupEnv))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return run(ctx, os.LookupEnv, os.Environ(), distribution, collect(opts))
@@ -74,11 +78,13 @@ func collect(opts []Option) options {
 }
 
 // run is Run with its environment and shutdown signal passed in. It returns
-// instead of exiting, so the final metrics export runs on every path.
+// instead of exiting, so the final telemetry export runs on every path.
 //
-// Metrics go out over OTLP when the metrics endpoint is set: the exporter is
-// wrapped in telemetry.Safe, and after the drain a final export runs for up
-// to metricsFlushTimeout.
+// Each OTLP signal goes out only when its own endpoint is set. Metrics are
+// wrapped in telemetry.Safe; spans and log records are exported in the
+// background. Log records also still go to the logger already installed.
+// After the drain, a final export of all three runs within
+// telemetryFlushTimeout. A failed export never changes the exit code.
 func run(ctx context.Context, lookup config.LookupFunc, environ []string, distribution string, o options) int {
 	cfg, err := loadConfig(lookup, environ, o)
 	if err != nil {
@@ -86,9 +92,29 @@ func run(ctx context.Context, lookup config.LookupFunc, environ []string, distri
 		return 1
 	}
 	metricsCfg, exportMetrics, err := otlp.ConfigFromEnv(lookup)
+	if err == nil {
+		err = errors.Join(checkSignal(otlp.TracesConfigFromEnv(lookup)), checkSignal(otlp.LogsConfigFromEnv(lookup)))
+	}
 	if err != nil {
 		slog.Error("invalid request trace uploader configuration", "error", err)
 		return 1
+	}
+	var shutdowns []signalShutdown
+	defer func() { flushTelemetry(shutdowns) }()
+	if logsCfg, on, _ := otlp.LogsConfigFromEnv(lookup); on {
+		logs, err := otlp.NewLogs(context.Background(), logsCfg)
+		if err != nil {
+			slog.Error("create request trace uploader log exporter", "error", atomicfile.Pathless(err))
+			return 1
+		}
+		local := slog.Default()
+		slog.SetDefault(slog.New(fanout{local.Handler(), logs.Handler()}))
+		// Logs are flushed last, after the local logger is back, so a
+		// warning about the final export still reaches the local log.
+		shutdowns = append(shutdowns, signalShutdown{name: "logs", shutdown: func(ctx context.Context) error {
+			slog.SetDefault(local)
+			return logs.Shutdown(ctx)
+		}})
 	}
 
 	slog.Info("request trace uploader starting",
@@ -98,40 +124,64 @@ func run(ctx context.Context, lookup config.LookupFunc, environ []string, distri
 
 	client, err := backend.New(cfg)
 	if err != nil {
-		slog.Error("create request trace uploader backend", "error", err)
+		slog.Error("create request trace uploader backend", "error", atomicfile.Pathless(err))
 		return 1
 	}
 	serviceOptions := service.Options{}
 	if exportMetrics {
 		exporter, err := otlp.New(context.Background(), metricsCfg, string(cfg.Backend))
 		if err != nil {
-			slog.Error("create request trace uploader metrics exporter", "error", err)
+			slog.Error("create request trace uploader metrics exporter", "error", atomicfile.Pathless(err))
 			return 1
 		}
-		defer flushMetrics(exporter)
+		shutdowns = append([]signalShutdown{{name: "metrics", shutdown: exporter.Shutdown}}, shutdowns...)
 		serviceOptions.Metrics = telemetry.Safe(exporter)
+	}
+	if tracesCfg, on, _ := otlp.TracesConfigFromEnv(lookup); on {
+		tracing, err := otlp.NewTracing(context.Background(), tracesCfg)
+		if err != nil {
+			slog.Error("create request trace uploader trace exporter", "error", atomicfile.Pathless(err))
+			return 1
+		}
+		shutdowns = append([]signalShutdown{{name: "traces", shutdown: tracing.Shutdown}}, shutdowns...)
+		serviceOptions.Tracer = tracing.Tracer()
 	}
 	uploader, err := service.NewUploader(cfg, client, serviceOptions)
 	if err != nil {
-		slog.Error("create request trace uploader", "error", err)
+		slog.Error("create request trace uploader", "error", atomicfile.Pathless(err))
 		return 1
 	}
 
 	if err := uploader.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		slog.Error("request trace uploader stopped", "error", err)
+		slog.Error("request trace uploader stopped", "error", atomicfile.Pathless(err))
 		return 1
 	}
 	return 0
 }
 
-// flushMetrics sends what is left after the drain. A failed export is
-// logged and never changes the exit code. The exporter's error names only a
-// bounded reason, so it is safe to log.
-func flushMetrics(exporter *otlp.Exporter) {
-	ctx, cancel := context.WithTimeout(context.Background(), metricsFlushTimeout)
+// checkSignal keeps only the error of a signal's configuration.
+func checkSignal(_ otlp.SignalConfig, _ bool, err error) error { return err }
+
+// signalShutdown is the final export of one OTLP signal.
+type signalShutdown struct {
+	name     string
+	shutdown func(context.Context) error
+}
+
+// flushTelemetry sends what is left after the drain: spans, then metrics,
+// then logs, all within telemetryFlushTimeout. A failed export is logged and
+// never changes the exit code. An exporter's error names only a bounded
+// reason, so it is safe to log.
+func flushTelemetry(shutdowns []signalShutdown) {
+	if len(shutdowns) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)
 	defer cancel()
-	if err := exporter.Shutdown(ctx); err != nil {
-		slog.Warn("final metrics export failed", "error", err)
+	for _, s := range shutdowns {
+		if err := s.shutdown(ctx); err != nil {
+			slog.Warn("final "+s.name+" export failed", "error", err)
+		}
 	}
 }
 

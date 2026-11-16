@@ -225,7 +225,10 @@ func (u *Uploader) send(ctx context.Context, b batch.Batch) (string, error) {
 			}
 		}
 	}
+	ctx, span := u.startSpan(ctx, "submit")
+	defer span.End()
 	if err := u.caps.Check(request); err != nil {
+		failFault(span, backend.Classify(u.client, err))
 		return "", err
 	}
 	started := time.Now()
@@ -234,6 +237,14 @@ func (u *Uploader) send(ctx context.Context, b batch.Batch) (string, error) {
 	// every retry. An upload deadline belongs to the backend.
 	id, err := u.client.Submit(ctx, request)
 	u.metrics.Observe(telemetry.UploadDuration, time.Since(started).Seconds(), uploadOutcome(id, err))
+	switch {
+	case id != "" && err == nil:
+		span.SetAttributes(attrStatus("success"))
+	case err == nil:
+		failSpan(span, "failure", "no_job_id")
+	default:
+		failFault(span, backend.Classify(u.client, err))
+	}
 	u.point(PointSubmitted)
 	return id, err
 }

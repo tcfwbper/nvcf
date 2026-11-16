@@ -15,6 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/batch"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
@@ -69,6 +72,8 @@ const (
 type Options struct {
 	// Metrics receives the pipeline's observations. Nil records nothing.
 	Metrics telemetry.Metrics
+	// Tracer starts the pipeline's spans. Nil starts none.
+	Tracer trace.Tracer
 	// HeaderCheckRecords overrides DefaultHeaderCheckRecords.
 	HeaderCheckRecords int
 	// Faults replaces the whole fault handling config, including the
@@ -99,6 +104,7 @@ type Options struct {
 // journal: a saved job id is polled, never submitted again.
 type Uploader struct {
 	cfg      config.Config
+	tracer   trace.Tracer
 	client   backend.Client
 	caps     backend.Capabilities
 	name     string
@@ -234,8 +240,13 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if now == nil {
 		now = time.Now
 	}
-	return &Uploader{
+	tracer := opts.Tracer
+	if tracer == nil {
+		tracer = noop.NewTracerProvider().Tracer("")
+	}
+	u := &Uploader{
 		cfg:          cfg,
+		tracer:       tracer,
 		client:       client,
 		caps:         caps,
 		batchConfig:  batchConfig,
@@ -260,7 +271,11 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 		solo:         map[string]bool{},
 		lastPolled:   map[string]time.Time{},
 		unsaved:      map[string]string{},
-	}, nil
+	}
+	if receiver, ok := client.(telemetry.TransportReceiver); ok {
+		receiver.UseTransport(u.wrapTransport)
+	}
+	return u, nil
 }
 
 // Handler returns the health endpoints.

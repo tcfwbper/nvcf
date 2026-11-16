@@ -2,12 +2,16 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "runner",
-    srcs = ["runner.go"],
+    srcs = [
+        "logging.go",
+        "runner.go",
+    ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/runner",
     visibility = ["//visibility:public"],
     deps = [
         "//src/compute-plane-services/request-trace-uploader/backend",
         "//src/compute-plane-services/request-trace-uploader/config",
+        "//src/compute-plane-services/request-trace-uploader/internal/atomicfile",
         "//src/compute-plane-services/request-trace-uploader/service",
         "//src/compute-plane-services/request-trace-uploader/telemetry",
         "//src/compute-plane-services/request-trace-uploader/telemetry/otlp",
@@ -22,14 +26,20 @@ alias(
 
 go_test(
     name = "runner_test",
-    srcs = ["runner_test.go"],
+    srcs = [
+        "logging_test.go",
+        "runner_test.go",
+    ],
     embed = [":runner"],
     deps = [
         "//src/compute-plane-services/request-trace-uploader/backend/debug",
         "//src/compute-plane-services/request-trace-uploader/config",
         "//src/compute-plane-services/request-trace-uploader/telemetry",
         "//src/compute-plane-services/request-trace-uploader/telemetry/otlp",
+        "//src/compute-plane-services/request-trace-uploader/uploadertest",
+        "@io_opentelemetry_go_proto_otlp//collector/logs/v1:logs",
         "@io_opentelemetry_go_proto_otlp//collector/metrics/v1:metrics",
+        "@io_opentelemetry_go_proto_otlp//collector/trace/v1:trace",
         "@org_golang_google_protobuf//proto",
     ],
 )
