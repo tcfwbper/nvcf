@@ -26,6 +26,16 @@ volume, so every step survives a restart.
    live and not ready until an operator acts.
 2. Intake: each closed segment is fingerprinted (SHA-256) and recorded
    before it is read. The highest indexed segment is never read or deleted.
+   Up to `REQUEST_TRACE_UPLOADER_PREPARE_WORKERS` segments are prepared at
+   once (default one). Results are recorded in spool order whatever order
+   they finish in, and a crash mid-prepare leaves each unfinished segment to
+   be prepared again from its source. Lines longer than 16 MiB share
+   `REQUEST_TRACE_UPLOADER_PREPARE_MEMORY_BYTES` at five times their size:
+   a prepare whose line does not fit waits, counted in
+   `prepare_memory_waits`, and the line that started first never waits, so
+   one line larger than the budget is still read. Each prepare also uses a
+   fixed amount for buffers and shorter lines, which depends on the format
+   writer.
 3. Record handling: suppression, then redaction, then the backend's format
    writer. A backend chooses its transport format by implementing
    `format.Factory` on its client; a backend that takes gzip JSON lines on
@@ -33,9 +43,12 @@ volume, so every step survives a restart.
    under other record settings, or under an earlier redaction version, is
    prepared again from its source.
 4. Batching: prepared segments are grouped per destination within the
-   backend's file and byte limits, and lanes are flushed every pass. A batch
-   is recorded before the backend is called, and a returned job id is saved
-   before the error is looked at.
+   backend's file and byte limits, and lanes are flushed every pass. While
+   intake is preparing a backlog, each batch that fills up is submitted at
+   once, beside intake, so uploads overlap preparing; a batch that is not
+   full waits for the end of the pass. A batch is recorded before the
+   backend is called, and a returned job id is saved before the error is
+   looked at.
 5. Polling: one loop polls every open job on the status interval. A job is
    pending, succeeded, failed or not found. A job with a saved id is polled,
    never submitted again under that id. A job still pending, or whose status
@@ -52,7 +65,8 @@ volume, so every step survives a restart.
    name that no longer holds a regular file is kept. A backend that does not
    export, such as `debug` or a dry run, never deletes a source; after a
    restart under a backend that exports, that source is prepared and sent
-   again.
+   again. A cleanup round reads the spool's highest index once per segment
+   family, not once per deletion.
 7. Shutdown: on SIGTERM the uploader lets work in progress finish, scans
    the spool one last time so a segment that closed after the last scan is
    not left behind, submits what is prepared, polls once more, and releases
@@ -64,17 +78,20 @@ volume, so every step survives a restart.
    oldest entries until quarantine is under 20% of the spool. A reject
    artifact still being written is left alone, but counts toward that share.
    If the spool is still above the high watermark (85% by default), segments
-   are not deleted then: intake deletes them at its next segment boundary,
-   or at the start of the next pass, so no segment is deleted while one is
-   being prepared. The eviction policy deletes data until the spool is down
-   to the low watermark (75% by default): by default quarantine first, then
-   the oldest closed segments that are in no batch. Between the two
-   watermarks nothing is deleted, so deletion is a backstop for a nearly
-   full spool. A segment in a batch that may have been sent, and the active
-   segment, are never deleted. Preparing pauses while the spool is above the
-   high watermark, while free space is under 512 MiB or twice the next
-   segment's size, or while 16 prepared segments, or the batch segment
-   setting if larger, wait for a batch; prepared work is still sent. Every
+   are not deleted then: intake deletes them at its next segment boundary or
+   when it ends, once every running prepare is recorded, or at the start of
+   the next pass, so no segment is deleted while one is being prepared. The
+   eviction policy deletes data until the spool is down to the low watermark
+   (75% by default): by default quarantine first, then the oldest closed
+   segments that are in no batch. Between the two watermarks nothing is
+   deleted, so deletion is a backstop for a nearly full spool. A segment in
+   a batch that may have been sent, and the active segment, are never
+   deleted. Preparing pauses while the spool is above the high watermark,
+   while free space is under 512 MiB or twice the next segment's size, or
+   while 16 prepared segments, or the batch segment setting if larger, wait
+   for a batch; prepared work is still sent. Segments being prepared count
+   toward free space. While full batches are sent during a backlog, intake
+   waits at that bound for the next batch instead of stopping. Every
    deletion is counted in `segments_evicted` or `quarantine_evicted`.
    On a small spool the free-space floor is lower: at most half of what
    the high watermark leaves free, 7.5% of the spool at the default 85%, so
@@ -193,10 +210,12 @@ Spans go to the collector over OTLP when its endpoint is set:
 
 The pipeline makes one span per step: `request-trace-uploader.prepare` for
 one segment, `request-trace-uploader.submit` for one backend submit, and
-`request-trace-uploader.poll` for one job status read. Spans carry only
-`backend`, an outcome `status`, and a fault's `class`, `scope` and `reason`;
-a failure sets the error status with the reason as its description and
-never records error text. Every span is sampled.
+`request-trace-uploader.poll` for one job status read. With more than one
+prepare worker, a prepare span ends when its result is recorded, in spool
+order, so it can include time spent waiting for an earlier segment. Spans
+carry only `backend`, an outcome `status`, and a fault's `class`, `scope`
+and `reason`; a failure sets the error status with the reason as its
+description and never records error text. Every span is sampled.
 
 A backend that calls its destination over HTTP implements
 `telemetry.TransportReceiver` and wraps each HTTP client's transport with
@@ -336,6 +355,11 @@ Optional, with defaults:
   `268435456` (256 MiB), from `1048576` (1 MiB) to `536870912` (512 MiB). A
   longer record is not parsed: its raw bytes go to the local reject file and
   it is counted as `records_unreadable` with reason `line_too_long`.
+- `REQUEST_TRACE_UPLOADER_PREPARE_WORKERS`: how many segments are prepared
+  at once; default `1`, from `1` to `16`. Each worker can use one core.
+- `REQUEST_TRACE_UPLOADER_PREPARE_MEMORY_BYTES`: memory that lines longer
+  than 16 MiB share across workers, in bytes; default `1073741824`
+  (1 GiB), from `67108864` (64 MiB) to `68719476736` (64 GiB)
 
 Time settings are Go durations with a unit, such as `30s`, `5m` or `1h`. A
 bare number, a negative value, zero where zero is not allowed, or a value

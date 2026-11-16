@@ -115,6 +115,9 @@ const (
 	// submit or status read.
 	BackendCalls        = "backend_calls"
 	BackendCallDuration = "backend_call.duration"
+	// PrepareMemoryWaits counts prepares that waited for room in the memory
+	// that concurrent prepares share for long lines.
+	PrepareMemoryWaits = "prepare_memory_waits"
 )
 
 // Labels are the attributes of one observation, without BackendLabel.
@@ -239,6 +242,7 @@ var catalog = cloneAll([]Instrument{
 		Values: map[string][]string{"reason": QuarantineReasons}},
 	{Name: PrepareDuration, Kind: Histogram, Unit: "s", Buckets: stepBuckets},
 	{Name: ExportLatency, Kind: Histogram, Unit: "s", Buckets: secondsBuckets},
+	{Name: PrepareMemoryWaits, Kind: Counter, Unit: "1"},
 })
 
 var byName = func() map[string]Instrument {

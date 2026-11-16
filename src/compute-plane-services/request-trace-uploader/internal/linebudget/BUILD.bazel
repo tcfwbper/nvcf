@@ -1,0 +1,23 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "linebudget",
+    srcs = ["linebudget.go"],
+    importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/linebudget",
+    visibility = ["//src/compute-plane-services/request-trace-uploader:__subpackages__"],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":linebudget",
+    visibility = ["//src/compute-plane-services/request-trace-uploader:__subpackages__"],
+)
+
+go_test(
+    name = "linebudget_test",
+    srcs = ["linebudget_test.go"],
+    deps = [
+        ":linebudget",
+        "//src/compute-plane-services/request-trace-uploader/record",
+    ],
+)

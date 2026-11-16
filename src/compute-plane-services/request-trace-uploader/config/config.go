@@ -139,6 +139,9 @@ type Config struct {
 	// RecordMaxBytes is the most bytes one source record may have. Zero, as
 	// in a Config built by hand, uses DefaultRecordMaxBytes.
 	RecordMaxBytes int64
+	// Prepare bounds preparing segments in parallel. The zero value, as in a
+	// Config built by hand, prepares one segment at a time.
+	Prepare PreparePolicy
 }
 
 // ObjectStorePolicy configures the generic S3-compatible backend. Bucket and
@@ -309,6 +312,10 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 	if err != nil {
 		return Config{}, nil, err
 	}
+	prepare, err := preparePolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
 
 	return Config{
 		SourceDir:     sourceDir,
@@ -343,6 +350,7 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		Spool:            spool,
 		SpoolBudgetBytes: spoolBudget,
 		RecordMaxBytes:   recordMaxBytes,
+		Prepare:          prepare,
 	}, warnings, nil
 }
 

@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "config.go",
         "pipeline.go",
+        "prepare.go",
         "spool.go",
         "suppression.go",
         "tuning.go",
@@ -23,6 +24,7 @@ go_test(
     srcs = [
         "config_test.go",
         "duration_test.go",
+        "prepare_test.go",
         "settings_test.go",
         "spool_test.go",
         "status_test.go",

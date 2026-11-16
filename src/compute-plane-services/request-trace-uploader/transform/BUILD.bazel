@@ -27,14 +27,21 @@ go_test(
     name = "transform_test",
     srcs = [
         "files_test.go",
+        "memory_test.go",
         "pipeline_test.go",
+        "prepare_bench_test.go",
         "suppression_test.go",
         "transform_test.go",
     ],
     embed = [":transform"],
     deps = [
+        "//src/compute-plane-services/request-trace-uploader/backend",
+        "//src/compute-plane-services/request-trace-uploader/format",
+        "//src/compute-plane-services/request-trace-uploader/journal",
+        "//src/compute-plane-services/request-trace-uploader/record",
         "//src/compute-plane-services/request-trace-uploader/segment",
         "//src/compute-plane-services/request-trace-uploader/transform/jsonvalue",
         "//src/compute-plane-services/request-trace-uploader/transform/suppress",
+        "//src/compute-plane-services/request-trace-uploader/uploadertest",
     ],
 )

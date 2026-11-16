@@ -71,7 +71,7 @@ func (u *Uploader) pass(ctx context.Context, poll bool) error {
 		return u.locked(&u.submitMu, func() error { u.enforceDiskBounds(); return u.reprepareStale() })
 	}))
 	if !u.draining.Load() {
-		errs = append(errs, u.locked(&u.intakeMu, func() error { return u.intake(ctx, false) }))
+		errs = append(errs, u.locked(&u.intakeMu, func() error { return u.intakeSubmitting(ctx) }))
 	}
 	errs = append(errs, u.locked(&u.submitMu, func() error { return errors.Join(u.submitPrepared(ctx), u.resend(ctx)) }))
 	if poll {

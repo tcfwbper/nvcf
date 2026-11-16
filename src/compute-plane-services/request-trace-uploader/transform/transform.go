@@ -203,11 +203,25 @@ func (r Result) Bad() int { return r.Unparseable + r.LineTooLong + r.RowTooLarge
 // for concurrent use.
 type Preparer struct {
 	cfg    Config
+	opts   Options
 	engine *suppress.Engine
+}
+
+// Options tunes how a Preparer runs. They never change what it writes, so
+// they are kept apart from Config, which decides that.
+type Options struct {
+	// LineMemory, when set, returns the accounting for the long lines one
+	// Prepare call holds. It is called once per call, with its context.
+	LineMemory func(context.Context) record.LineMemory
 }
 
 // New validates cfg and builds a preparer.
 func New(cfg Config) (*Preparer, error) {
+	return NewWithOptions(cfg, Options{})
+}
+
+// NewWithOptions validates cfg and builds a preparer that runs with opts.
+func NewWithOptions(cfg Config, opts Options) (*Preparer, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("prepare config: %w", err)
 	}
@@ -215,7 +229,7 @@ func New(cfg Config) (*Preparer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Preparer{cfg: cfg, engine: engine}, nil
+	return &Preparer{cfg: cfg, opts: opts, engine: engine}, nil
 }
 
 // SuppressionActive reports whether any suppression rule is configured.
@@ -235,7 +249,11 @@ func (p *Preparer) Prepare(ctx context.Context, path string, w Writer, rejects i
 	}
 	// Lines drains oversized lines inside Next, through the reject writer,
 	// so the context is checked on every reject write too.
-	lines, err := record.OpenLines(path, record.LineOptions{MaxLineBytes: p.cfg.RawLineMax, Reject: contextWriter{ctx: ctx, w: rejects}})
+	lineOpts := record.LineOptions{MaxLineBytes: p.cfg.RawLineMax, Reject: contextWriter{ctx: ctx, w: rejects}}
+	if p.opts.LineMemory != nil {
+		lineOpts.Memory = p.opts.LineMemory(ctx)
+	}
+	lines, err := record.OpenLines(path, lineOpts)
 	if err != nil {
 		return result, errors.Join(err, w.Abort())
 	}

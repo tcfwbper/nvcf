@@ -13,8 +13,10 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
 )
 
-// cleanupRound finishes every confirmed or empty segment.
+// cleanupRound finishes every confirmed or empty segment. The round reads
+// the spool's highest indexes once, not once per deletion.
 func (u *Uploader) cleanupRound(ctx context.Context) error {
+	cleaner := u.cleaner.Round()
 	var errs []error
 	for _, seg := range u.store.Segments() {
 		if err := ctx.Err(); err != nil {
@@ -23,9 +25,9 @@ func (u *Uploader) cleanupRound(ctx context.Context) error {
 		var err error
 		switch seg.State {
 		case journal.StateConfirmed, journal.StateCleaning:
-			err = u.clean(ctx, seg)
+			err = u.clean(ctx, cleaner, seg)
 		case journal.StateEmpty:
-			err = u.cleanEmpty(ctx, seg)
+			err = u.cleanEmpty(ctx, cleaner, seg)
 		}
 		if err != nil {
 			slog.Warn("clean up request trace segment", "segment", seg.Index, "error", safeError(err))
@@ -61,10 +63,10 @@ func cleanupItem(sourceDir string, seg journal.Segment) cleanup.Item {
 // (only objectstore has a dry run, with one destination and idempotent
 // keys); a backend that does, and is not resubmit safe, would need exports
 // tracked per destination.
-func (u *Uploader) clean(ctx context.Context, seg journal.Segment) error {
+func (u *Uploader) clean(ctx context.Context, cleaner *cleanup.Cleaner, seg journal.Segment) error {
 	item := cleanupItem(u.cfg.SourceDir, seg)
 	if exportedEverywhere(seg) {
-		_, err := u.cleaner.Clean(ctx, item)
+		_, err := cleaner.Clean(ctx, item)
 		return err
 	}
 	if err := u.store.BeginCleaning(seg.ID); err != nil {
@@ -90,9 +92,9 @@ func exportedEverywhere(seg journal.Segment) bool {
 	return true
 }
 
-func (u *Uploader) cleanEmpty(ctx context.Context, seg journal.Segment) error {
+func (u *Uploader) cleanEmpty(ctx context.Context, cleaner *cleanup.Cleaner, seg journal.Segment) error {
 	if u.caps.Exports {
-		_, err := u.cleaner.CleanEmpty(ctx, cleanupItem(u.cfg.SourceDir, seg))
+		_, err := cleaner.CleanEmpty(ctx, cleanupItem(u.cfg.SourceDir, seg))
 		return err
 	}
 	// The source is kept, so a run that exports reads it again under its

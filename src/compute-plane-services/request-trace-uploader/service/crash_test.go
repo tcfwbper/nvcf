@@ -4,11 +4,13 @@
 package service_test
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,8 +35,11 @@ const (
 // dirBackend lands each job in a directory, so jobs outlive the process
 // that created them, as they do on a real destination. A job's files land
 // before Submit returns, the way an upload commits before its response
-// reaches the caller.
-type dirBackend struct{ root string }
+// reaches the caller. batchFiles bounds the files per job; zero means 16.
+type dirBackend struct {
+	root       string
+	batchFiles int
+}
 
 func (d dirBackend) Submit(_ context.Context, request backend.SubmitRequest) (string, error) {
 	var raw [8]byte
@@ -65,7 +70,7 @@ func (d dirBackend) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
 		AcceptedFormats: []backend.Format{backend.FormatGzipJSONL},
 		Exports:         true,
-		MaxBatchFiles:   16,
+		MaxBatchFiles:   cmp.Or(d.batchFiles, 16),
 	}
 }
 
@@ -250,33 +255,84 @@ func TestACrashAfterAnEvictionIsRecordedLeavesNoTransports(t *testing.T) {
 	}
 }
 
+// crashPoint is a named point a crash test stops the child at.
+type crashPoint struct {
+	name string
+	// mayRepeat reports that a crash at this point can land the same
+	// records twice: the job committed but its id was never saved, so
+	// the restart cannot tell and submits again (accepted, counted).
+	mayRepeat bool
+}
+
+var pipelinePoints = []crashPoint{
+	{name: service.PointPrepared},
+	{name: service.PointBatchRecorded},
+	{name: service.PointSubmitted, mayRepeat: true},
+	{name: service.PointReceiptSaved},
+	{name: service.PointConfirmed},
+	{name: service.PointCleaning},
+	{name: service.PointSourceDeleted},
+}
+
 func TestACrashAtAnyPointLosesAndDoubleDeletesNothing(t *testing.T) {
 	if uploadertest.CrashChild() {
 		t.Skip("runs only in the parent")
 	}
-	points := []struct {
-		name string
-		// mayRepeat reports that a crash at this point can land the same
-		// records twice: the job committed but its id was never saved, so
-		// the restart cannot tell and submits again (accepted, counted).
-		mayRepeat bool
-	}{
-		{name: service.PointPrepared},
-		{name: service.PointBatchRecorded},
-		{name: service.PointSubmitted, mayRepeat: true},
-		{name: service.PointReceiptSaved},
-		{name: service.PointConfirmed},
-		{name: service.PointCleaning},
-		{name: service.PointSourceDeleted},
+	crashAtEveryPoint(t, "TestCrashChildRunsThePipeline", pipelinePoints, nil,
+		[]string{uploadertest.RequestEnd("a", 1), uploadertest.RequestEnd("b", 2)},
+		[]string{uploadertest.RequestEnd("c", 3)},
+	)
+}
+
+// TestCrashChildRunsThePipelineInParallel is the crash child for an
+// uploader that prepares two segments at once and sends jobs of two, so a
+// full batch is submitted while later segments are still being prepared.
+func TestCrashChildRunsThePipelineInParallel(t *testing.T) {
+	if !uploadertest.CrashChild() {
+		t.Skip("runs only as a crash child")
+	}
+	spool := &uploadertest.Spool{Dir: os.Getenv(envCrashSpool), Prefix: config.DefaultSegmentPrefix}
+	client := dirBackend{root: os.Getenv(envCrashLanding), batchFiles: 2}
+	uploader := newUploader(t, spool, client, service.Options{Point: uploadertest.CrashPoint}, workersEnv("2"))
+	if err := uploader.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass() error = %v", err)
+	}
+}
+
+// With two workers a crash can leave several segments mid-prepare, some
+// with a finished transport the journal never recorded, or stop a submit
+// that ran beside intake. A restart prepares them again from their sources
+// and resumes the batch from the journal.
+func TestACrashWhilePreparingInParallelLosesAndDoubleDeletesNothing(t *testing.T) {
+	if uploadertest.CrashChild() {
+		t.Skip("runs only in the parent")
+	}
+	points := append([]crashPoint{{name: service.PointPreparingAlongside}}, pipelinePoints...)
+	crashAtEveryPoint(t, "TestCrashChildRunsThePipelineInParallel", points, workersEnv("2"),
+		[]string{uploadertest.RequestEnd("a", 1), uploadertest.RequestEnd("b", 2)},
+		[]string{uploadertest.RequestEnd("c", 3)},
+		[]string{uploadertest.RequestEnd("d", 4)},
+		[]string{uploadertest.RequestEnd("e", 5)},
+	)
+}
+
+// crashAtEveryPoint kills child at each point, restarts an uploader with env
+// on the same spool, and checks that every request landed once (or more,
+// where the point allows it), that every closed source was deleted, and
+// that the segment the writer still owns was left alone.
+func crashAtEveryPoint(t *testing.T, child string, points []crashPoint, env map[string]string, segments ...[]string) {
+	t.Helper()
+	requests := []string{"active"}
+	for _, lines := range segments {
+		for _, line := range lines {
+			requests = append(requests, requestIDOf(t, line))
+		}
 	}
 	for _, point := range points {
 		t.Run(point.name, func(t *testing.T) {
 			landing := t.TempDir()
-			spool, closed := spoolWith(t,
-				[]string{uploadertest.RequestEnd("a", 1), uploadertest.RequestEnd("b", 2)},
-				[]string{uploadertest.RequestEnd("c", 3)},
-			)
-			result := uploadertest.RunCrash(t, "TestCrashChildRunsThePipeline", point.name,
+			spool, closed := spoolWith(t, segments...)
+			result := uploadertest.RunCrash(t, child, point.name,
 				envCrashSpool+"="+spool.Dir, envCrashLanding+"="+landing)
 			if !result.Killed || result.Point != point.name {
 				t.Fatalf("child was not killed at %s:\n%s", point.name, result.Output)
@@ -284,10 +340,10 @@ func TestACrashAtAnyPointLosesAndDoubleDeletesNothing(t *testing.T) {
 
 			// The writer moved on while the uploader was down: the old
 			// active segment is closed now and must be uploaded too.
-			oldActive := filepath.Join(spool.Dir, config.DefaultSegmentPrefix+".000002.jsonl.gz")
+			oldActive := filepath.Join(spool.Dir, fmt.Sprintf("%s.%06d.jsonl.gz", config.DefaultSegmentPrefix, len(segments)))
 			newActive := spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("still-open", 9)).Bytes())
 
-			restarted := newUploader(t, spool, dirBackend{root: landing}, service.Options{}, nil)
+			restarted := newUploader(t, spool, dirBackend{root: landing}, service.Options{}, env)
 			for range 2 {
 				if err := restarted.Pass(context.Background()); err != nil {
 					t.Fatalf("Pass() after restart error = %v", err)
@@ -298,7 +354,7 @@ func TestACrashAtAnyPointLosesAndDoubleDeletesNothing(t *testing.T) {
 			}
 
 			landed := landedRequests(t, landing)
-			for _, id := range []string{"a", "b", "c", "active"} {
+			for _, id := range requests {
 				switch n := landed[id]; {
 				case n == 0:
 					t.Errorf("request %s was lost", id)
@@ -325,6 +381,19 @@ func TestACrashAtAnyPointLosesAndDoubleDeletesNothing(t *testing.T) {
 			}
 		})
 	}
+}
+
+func requestIDOf(t *testing.T, line string) string {
+	t.Helper()
+	var r struct {
+		Request struct {
+			RequestID string `json:"request_id"`
+		} `json:"request"`
+	}
+	if err := json.Unmarshal([]byte(line), &r); err != nil || r.Request.RequestID == "" {
+		t.Fatalf("no request id in %s", line)
+	}
+	return r.Request.RequestID
 }
 
 func retainFaults() *retry.Config {

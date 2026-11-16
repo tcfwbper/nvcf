@@ -24,6 +24,7 @@ go_test(
     srcs = [
         "lines_test.go",
         "lines_unix_test.go",
+        "memory_test.go",
         "reader_test.go",
     ],
     embed = [":record"],

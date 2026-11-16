@@ -142,6 +142,13 @@ func TestEvictionWaitsForTheNextSegmentBoundary(t *testing.T) {
 		[]string{uploadertest.RequestEnd("b", 2)},
 	)
 	slow := newSlowPrepare()
+	// A batch holds 16 segments, so no batch fills during the pass and the
+	// oldest segment is still in no batch when the boundary evicts.
+	slow.SetCapabilities(backend.Capabilities{
+		AcceptedFormats: []backend.Format{backend.FormatGzipJSONL},
+		Exports:         true,
+		MaxBatchFiles:   16,
+	})
 	metrics, err := telemetry.NewMemory("fake")
 	if err != nil {
 		t.Fatal(err)

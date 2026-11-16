@@ -115,6 +115,43 @@ func New(j Journal, spool Spool, opts Options) *Cleaner {
 	return c
 }
 
+// Round returns a cleaner for one cleanup round. It reads the highest index
+// of each segment family once, at its first use, and keeps it for the round,
+// so a round over a backlog scans the spool once per family instead of once
+// per deletion. A kept index is never higher than the spool's: a writer only
+// adds higher indexes, and cleanup and eviction never remove the highest.
+// So a segment the writer closed during the round is kept until the next
+// one, never deleted early. A failed read is not kept.
+func (c *Cleaner) Round() *Cleaner {
+	round := *c
+	round.spool = &roundSpool{spool: c.spool, highest: map[string]highestIndex{}}
+	return &round
+}
+
+type highestIndex struct {
+	index int
+	found bool
+}
+
+// roundSpool keeps each family's highest index for one round. A round runs
+// on one goroutine.
+type roundSpool struct {
+	spool   Spool
+	highest map[string]highestIndex
+}
+
+func (r *roundSpool) HighestIndex(prefix string) (int, bool, error) {
+	if kept, ok := r.highest[prefix]; ok {
+		return kept.index, kept.found, nil
+	}
+	index, found, err := r.spool.HighestIndex(prefix)
+	if err != nil {
+		return 0, false, err
+	}
+	r.highest[prefix] = highestIndex{index: index, found: found}
+	return index, found, nil
+}
+
 // Clean deletes the files of a segment that every destination confirmed,
 // then records Done. Each step can be repeated, so after a crash Clean is
 // simply called again for a segment found Confirmed or Cleaning.

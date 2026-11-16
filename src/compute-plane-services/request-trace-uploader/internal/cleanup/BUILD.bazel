@@ -25,9 +25,11 @@ go_test(
         "cleanup_unix_test.go",
         "contract_test.go",
         "hash_unix_test.go",
+        "round_test.go",
     ],
     embed = [":cleanup"],
     deps = [
         "//src/compute-plane-services/request-trace-uploader/internal/journalfs",
+        "//src/compute-plane-services/request-trace-uploader/segment",
     ],
 )

@@ -18,6 +18,23 @@ import (
 // DefaultMaxLineBytes is the default bound on one raw line held in memory.
 const DefaultMaxLineBytes = 512 << 20
 
+// DefaultMemoryStep is the line size at which a LineMemory is first asked.
+const DefaultMemoryStep = 16 << 20
+
+// LineMemory accounts for the memory long lines take, so concurrent passes
+// can share a budget.
+type LineMemory interface {
+	// Hold is called before the line held in memory grows past its last
+	// hold: first past the memory step, then past each doubling of it.
+	// size is what the line may reach before the next call, never more than
+	// the line limit. Hold may block. An error ends the pass, and Err
+	// reports it.
+	Hold(size int64) error
+	// Release is called once the held line is no longer needed: at the next
+	// Next, when it is rejected or cut, and at Close.
+	Release()
+}
+
 // LineOptions bounds a Lines pass.
 type LineOptions struct {
 	// MaxLineBytes bounds one raw line held in memory. A longer line is
@@ -28,6 +45,12 @@ type LineOptions struct {
 	// cut short by a damaged member, each followed by a newline. Nil drops
 	// them. The bytes can hold user data, so Reject must stay local.
 	Reject io.Writer
+	// Memory, when set, is asked before a line held in memory grows past
+	// MemoryStep. Nil asks nothing.
+	Memory LineMemory
+	// MemoryStep is the line size at which Memory is first asked. Zero
+	// means DefaultMemoryStep.
+	MemoryStep int64
 }
 
 // LineStats summarizes one pass.
@@ -65,6 +88,11 @@ type Lines struct {
 	src     *members
 	reject  io.Writer
 	maxLine int64
+	memory  LineMemory
+	step    int64
+	// held is the size the last Hold covered, or zero when no line is
+	// held.
+	held int64
 
 	buf       []byte
 	r, w      int
@@ -88,6 +116,13 @@ func OpenLines(path string, opts LineOptions) (*Lines, error) {
 	if opts.MaxLineBytes < 0 {
 		return nil, fmt.Errorf("max line bytes must not be negative, got %d", opts.MaxLineBytes)
 	}
+	if opts.MemoryStep < 0 {
+		return nil, fmt.Errorf("memory step must not be negative, got %d", opts.MemoryStep)
+	}
+	step := opts.MemoryStep
+	if step == 0 {
+		step = DefaultMemoryStep
+	}
 	maxLine := opts.MaxLineBytes
 	if maxLine == 0 {
 		maxLine = DefaultMaxLineBytes
@@ -99,6 +134,8 @@ func OpenLines(path string, opts LineOptions) (*Lines, error) {
 	l := &Lines{
 		reject:  opts.Reject,
 		maxLine: maxLine,
+		memory:  opts.Memory,
+		step:    step,
 		buf:     make([]byte, 64<<10),
 	}
 	l.src = newMembers(file, &l.stats)
@@ -107,6 +144,7 @@ func OpenLines(path string, opts LineOptions) (*Lines, error) {
 
 // Next advances to the next non-empty line, reporting whether there is one.
 func (l *Lines) Next() bool {
+	l.release()
 	for !l.done {
 		if line, ok := l.scan(); ok {
 			return l.deliver(line)
@@ -159,6 +197,9 @@ func (l *Lines) scan() (line []byte, ok bool) {
 			return nil, false
 		}
 		l.appendLine(chunk[:i])
+		if l.err != nil {
+			return nil, false
+		}
 		if chunk[i] == '\r' {
 			l.pendingCR = true
 		}
@@ -193,20 +234,59 @@ func (l *Lines) appendLine(chunk []byte) {
 		l.writeReject(chunk)
 		return
 	}
-	if int64(len(l.line))+int64(len(chunk)) > l.maxLine {
+	size := int64(len(l.line)) + int64(len(chunk))
+	if size > l.maxLine {
 		l.oversized = true
 		l.writeReject(l.line)
 		l.writeReject(chunk)
 		l.line = l.line[:0]
+		l.release()
+		return
+	}
+	if !l.hold(size) {
 		return
 	}
 	l.line = append(l.line, chunk...)
+}
+
+// hold asks the line memory before the held line grows to size bytes. It
+// covers the line up to the next doubling of the step, so a growing line
+// asks a few times, not on every read. It reports false when the memory
+// refused, which ends the pass.
+func (l *Lines) hold(size int64) bool {
+	if l.memory == nil || size <= max(l.held, l.step) {
+		return true
+	}
+	covered := max(l.held, l.step)
+	for covered < size {
+		covered *= 2
+	}
+	covered = min(covered, l.maxLine)
+	if err := l.memory.Hold(covered); err != nil {
+		l.err = fmt.Errorf("hold memory for a long line: %w", err)
+		return false
+	}
+	l.held = covered
+	return true
+}
+
+// release drops the held line, delivered or not, and then tells the line
+// memory, so the memory is free when another pass is let in.
+func (l *Lines) release() {
+	if l.held == 0 {
+		return
+	}
+	l.held = 0
+	l.current = nil
+	l.line = nil
+	l.memory.Release()
 }
 
 // cut drops a line left open by a damaged member. The fragment still takes
 // a line number, so later line numbers match the lines that were written.
 func (l *Lines) cut() {
 	l.pendingCR = false
+	defer l.release()
 	if l.oversized {
 		l.number++
 		l.endReject()
@@ -307,8 +387,11 @@ func (l *Lines) Sum() []byte {
 // is counted in Stats, not reported here.
 func (l *Lines) Err() error { return l.err }
 
-// Close releases the segment.
-func (l *Lines) Close() error { return l.src.close() }
+// Close releases the segment and any line still held.
+func (l *Lines) Close() error {
+	l.release()
+	return l.src.close()
+}
 
 // OpenRegular opens path for reading if it is a regular file. It does not
 // follow a final symlink and does not block on a pipe, and it checks the

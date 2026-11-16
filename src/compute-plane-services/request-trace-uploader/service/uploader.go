@@ -28,8 +28,10 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/health"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/journalfs"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/linebudget"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/retry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/record"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform"
 )
@@ -48,6 +50,17 @@ const lockMargin = 10 * time.Second
 const (
 	// PointPrepared follows the record of a prepared segment.
 	PointPrepared = "prepared"
+	// PointPreparingAlongside follows the record that a segment's prepare
+	// started while an earlier segment's prepare is still running. Only
+	// more than one prepare worker reaches it.
+	PointPreparingAlongside = "preparing-alongside"
+	// PointPrepareAheadWait comes when intake is at the prepare-ahead bound
+	// during a backlog, before it looks whether the submitter will record
+	// another batch.
+	PointPrepareAheadWait = "prepare-ahead-wait"
+	// PointBacklogRoundEnded follows each round of full-batch submits that
+	// runs beside intake during a backlog.
+	PointBacklogRoundEnded = "backlog-round-ended"
 	// PointBatchRecorded follows the record of a batch, before the backend
 	// is called.
 	PointBatchRecorded = "batch-recorded"
@@ -92,6 +105,7 @@ type Options struct {
 	// name.
 	Holder string
 	// Point, when set, is called at each named point. Only tests set it.
+	// It may be called from intake and a submit at the same time.
 	Point func(name string)
 	// Now, when set, replaces the clock that ages jobs. Only tests set it.
 	Now func() time.Time
@@ -150,6 +164,11 @@ type Uploader struct {
 	cleanupMu sync.Mutex
 	// fingerprints is used by intake only.
 	fingerprints map[fileIdentity]string
+	// backlog runs full-batch submits beside intake. Intake sets it before
+	// it starts them and clears it after they end; nil outside a scan.
+	// Submits read it under the submit lock, which intake does not hold, so
+	// it is atomic and each use loads it once.
+	backlog atomic.Pointer[backlogSubmits]
 	// stateMu guards the maps below, which several stages share.
 	stateMu    sync.Mutex
 	solo       map[string]bool
@@ -179,13 +198,34 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if err != nil {
 		return nil, err
 	}
+	metrics := opts.Metrics
+	if metrics == nil {
+		metrics = discardMetrics{}
+	}
+	metrics = telemetry.Safe(metrics)
+	if cfg.Prepare.Workers < 0 || cfg.Prepare.MemoryBytes < 0 {
+		return nil, fmt.Errorf("prepare workers %d and memory bytes %d must not be negative", cfg.Prepare.Workers, cfg.Prepare.MemoryBytes)
+	}
+	// Zero, as in a Config built by hand, takes the default.
+	memory := cfg.Prepare.MemoryBytes
+	if memory == 0 {
+		memory = config.DefaultPrepareMemoryBytes
+	}
+	budget, err := linebudget.New(memory, linebudget.Options{OnWait: func() {
+		metrics.Add(telemetry.PrepareMemoryWaits, 1, nil)
+	}})
+	if err != nil {
+		return nil, err
+	}
 	prepareConfig := transform.DefaultConfig()
 	prepareConfig.Suppression = cfg.Suppression
 	prepareConfig.Redact = !cfg.SkipRedaction
 	// A longer record is drained to the reject file without being held or
 	// parsed, so one huge line cannot exhaust the pod's memory.
 	prepareConfig.RawLineMax = cmp.Or(cfg.RecordMaxBytes, config.DefaultRecordMaxBytes)
-	preparer, err := transform.New(prepareConfig)
+	preparer, err := transform.NewWithOptions(prepareConfig, transform.Options{
+		LineMemory: func(ctx context.Context) record.LineMemory { return budget.Lease(ctx) },
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -222,11 +262,6 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if err != nil {
 		return nil, err
 	}
-	metrics := opts.Metrics
-	if metrics == nil {
-		metrics = discardMetrics{}
-	}
-	metrics = telemetry.Safe(metrics)
 	telemetry.Preset(metrics)
 	rules.preset(metrics)
 	metrics.Add(telemetry.RecordsDropped, 0, unsupportedVersionLabels())

@@ -66,10 +66,42 @@ func quarantineLabels(reason string) telemetry.Labels {
 
 // submitPrepared batches every prepared destination that is in no batch and
 // submits the batches. Lanes are flushed at the end of each call, so a
-// segment waits at most one scan interval, as with the earlier exporter. A
-// destination prepared under another record policy is never batched: it
-// waits for reprepareStale to prepare its segment again.
+// segment waits at most one scan interval, as with the earlier exporter.
 func (u *Uploader) submitPrepared(ctx context.Context) error {
+	return u.submitBatches(ctx, u.batcher, true)
+}
+
+// submitFull submits only the batches that fill up from what is prepared
+// now, so a backlog is sent while it is prepared. It batches on a batcher of
+// its own and drops the lanes that are not full: their members stay
+// prepared and in no batch, for a later call or the end of the pass.
+func (u *Uploader) submitFull(ctx context.Context) error {
+	batcher, err := u.fullBatcher()
+	if err != nil {
+		return err
+	}
+	return u.submitBatches(ctx, batcher, false)
+}
+
+// fullOnlyWait stands in for the batch wait in a full-only round, so a lane
+// closes only when it is full; the flush at the end of the pass sends what
+// has waited.
+const fullOnlyWait = 100 * 365 * 24 * time.Hour
+
+// fullBatcher returns the batcher of one full-only round. It never closes a
+// lane by age: members that waited would otherwise go one job each.
+func (u *Uploader) fullBatcher() (*batch.Batcher, error) {
+	cfg := u.batchConfig
+	cfg.MaxWait = fullOnlyWait
+	return batch.New(cfg, u.batchLimits, batch.Options{Metrics: batchMetrics{u.metrics}})
+}
+
+// submitBatches batches every prepared destination that is in no batch on
+// batcher and submits the batches that close. flush also closes and submits
+// every lane that is not full. A destination prepared under another record
+// policy is never batched, by either caller: it waits for reprepareStale to
+// prepare its segment again. A release that failed earlier is retried first.
+func (u *Uploader) submitBatches(ctx context.Context, batcher *batch.Batcher, flush bool) error {
 	u.retryUnsentReleases()
 	now := time.Now()
 	var batches []batch.Batch
@@ -92,7 +124,7 @@ func (u *Uploader) submitPrepared(ctx context.Context) error {
 				File:        batch.File{Path: dest.Transport.Path, SHA256: dest.Transport.SHA256, Bytes: dest.Transport.Bytes, Rows: dest.Transport.Rows},
 				PreparedAt:  preparedAt,
 			}
-			closed, err := u.batchMember(seg.ID, member, now)
+			closed, err := u.batchMember(batcher, seg.ID, member, now)
 			if errors.Is(err, batch.ErrMemberTooLarge) {
 				errs = append(errs, u.quarantineSegment(seg.ID, seg.Index, reasonTooLarge, filepath.Join(u.cfg.SourceDir, seg.Name), dest.Transport.Path))
 				continue
@@ -104,7 +136,9 @@ func (u *Uploader) submitPrepared(ctx context.Context) error {
 			batches = append(batches, closed...)
 		}
 	}
-	batches = append(batches, u.batcher.Due(now.Add(batch.DefaultMaxWait))...)
+	if flush {
+		batches = append(batches, batcher.Due(now.Add(batch.DefaultMaxWait))...)
+	}
 	for _, b := range batches {
 		if err := u.submit(ctx, b, false); err != nil {
 			errs = append(errs, err)
@@ -224,6 +258,9 @@ func (u *Uploader) submit(ctx context.Context, b batch.Batch, resend bool) error
 			err = errors.Join(err, u.releaseUnsent(b.ID))
 		}
 		return fmt.Errorf("record batch before submit: %w", err)
+	}
+	if backlog := u.backlog.Load(); backlog != nil {
+		backlog.batched()
 	}
 	receipt, err := batch.Send(ctx, j, u.name, b, u.send)
 	if receipt != "" {
@@ -387,13 +424,14 @@ func (u *Uploader) split(b journal.Batch, reason string) error {
 	return u.quarantineSegment(seg.ID, seg.Index, reason, filepath.Join(u.cfg.SourceDir, seg.Name), m.Path)
 }
 
-// batchMember adds a member to its lane, or closes a batch of it alone when
-// a split sent it alone. Both refuse a member over the batch byte limit.
-func (u *Uploader) batchMember(segmentID string, member batch.Member, now time.Time) ([]batch.Batch, error) {
+// batchMember adds a member to its lane on batcher, or closes a batch of it
+// alone when a split sent it alone. Both refuse a member over the batch byte
+// limit.
+func (u *Uploader) batchMember(batcher *batch.Batcher, segmentID string, member batch.Member, now time.Time) ([]batch.Batch, error) {
 	if !u.isSolo(segmentID) {
-		return u.batcher.Add(member, now)
+		return batcher.Add(member, now)
 	}
-	solo, err := u.batcher.Solo(member, now)
+	solo, err := batcher.Solo(member, now)
 	if err != nil {
 		return nil, err
 	}
