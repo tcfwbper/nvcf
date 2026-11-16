@@ -287,6 +287,28 @@ accepts parameters regardless of the router release. In that case, a model with
 parameters gets HTTP `400` on every request until the router is upgraded or
 the parameters are removed.
 
+## Audit cache-affinity key use
+
+Count keyed proxy attempts by model and routing method. The first filter
+removes terminal color codes:
+
+```bash
+kubectl logs -n nvcf deployment/llm-request-router --all-pods=true --since=24h \
+  | perl -pe 's/\e\[[0-9;]*m//g' \
+  | grep 'proxying request' \
+  | grep 'request.cache_affinity_key_present=true' \
+  | grep -oE ' (model_id|requested_algorithm|routing_algorithm)=("[^"]*"|[^ ]*)' \
+  | paste -d ' ' - - - | sort | uniq -c | sort -rn
+```
+
+Use `statefulset/llm-request-router` instead when the StatefulSet workload is
+explicitly selected. `kubectl logs` reads only the current log file, so the
+counts miss attempts before a log rotation. For a full audit, use your
+retained cluster logs.
+
+To read the result, see
+[Algorithms that use the cache-affinity key](https://github.com/NVIDIA/nvcf/blob/main/src/libraries/rust/stargate/docs/load-balancer-configuration.md#algorithms-that-use-the-cache-affinity-key).
+
 ## Keep router headers trusted
 
 The gateway can send the following headers to Stargate. Derive or validate

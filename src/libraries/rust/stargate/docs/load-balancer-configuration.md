@@ -122,6 +122,47 @@ Choose based on the routing goal and available backend statistics:
 Use `round-robin` for deterministic cycling and `random` for uniform random
 selection when routing should not depend on backend load statistics.
 
+## Algorithms that use the cache-affinity key
+
+| Algorithm | Uses `x-cache-affinity-key` |
+| --- | --- |
+| `pulsar`, `pulsar-wait-and-widen` | Yes. |
+| `wait-and-widen` | Only when `cache_affinity_backend_selection_count` is above `0`. |
+| `power-of-n`, `round-robin`, `random` | No. |
+
+Legacy names, such as `groq-multiregion` for `wait-and-widen`, follow their
+algorithm. Without an affinity group, requests with the same key can go to
+different clusters and miss the prefix cache.
+
+For example, this `wait-and-widen` expression keeps one key on one cluster:
+
+```text
+wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affinity_wait_ms=200
+```
+
+The affine cluster is full when its active requests reach
+`max_engine_concurrency` plus `max_queued`. In this example, if it stays full
+for 200 ms, the request can go to another cluster. If `max_engine_concurrency`
+is `0` (unknown), the cluster never counts as full. If it is above the engine's
+real capacity, the cluster counts as full only after requests queue inside the
+engine. See
+[Runtime stats interface](runtime-stats-interface.md#concurrency-fallback).
+
+### Audit key use
+
+The info log `proxying request`, written once per proxy attempt, has these
+fields:
+
+- `model_id`
+- `requested_algorithm`: the `x-routing-method` value, empty without the
+  header.
+- `routing_algorithm`: the canonical algorithm name.
+- `request.cache_affinity_key_present`: a request span field.
+
+A keyed request ignores the key when its algorithm does not use it, as listed
+above. For `wait-and-widen`, check that `requested_algorithm` sets
+`cache_affinity_backend_selection_count`.
+
 ## `power-of-n`
 
 `power-of-n` uniformly samples distinct eligible clusters and selects the
