@@ -27,7 +27,7 @@ use stargate_protocol::common::valid_last_mean_input_tps;
 use crate::metrics::StargateMetrics;
 
 use super::keys::RoutingTargetKey;
-use super::registration::{RegistrationClusterGeneration, RegistrationGeneration};
+use super::registration::{CapacityDomain, RegistrationClusterGeneration, RegistrationGeneration};
 use super::reservations::{
     PendingClusterReservation, RoutingReservation, apply_pending_cluster_reservations,
 };
@@ -266,8 +266,9 @@ impl ClusterRoutingGeneration {
         Some((backend_stats, rtt, active_backend_count))
     }
 
-    fn refresh_snapshot(&mut self, updated_backend_id: Option<&str>) {
+    fn refresh_snapshot(&mut self, updated_backend_id: Option<&str>, capacity: &CapacityDomain) {
         let Some((backend_stats, rtt, active_backend_count)) = self.backend_aggregate() else {
+            capacity.replace_reported_running(&mut self.capacity_share, 0);
             if let Some(state) = self.snapshot_state.take() {
                 for pending in state.pending_cluster_reservations {
                     pending.deactivate();
@@ -295,6 +296,10 @@ impl ClusterRoutingGeneration {
                     .map(|(index, _)| index)
             })
             .expect("non-empty cluster generation should have a source backend");
+        // Publish the new report before settling reservations it may include,
+        // so other model names never see the domain count too low.
+        capacity
+            .replace_reported_running(&mut self.capacity_share, backend_stats.num_running_queries);
         let source_backend = &self.backends[source_backend_index];
         let source_backend_id = source_backend.inference_server_id.clone();
         let mut pending_cluster_reservations = self
@@ -434,7 +439,7 @@ impl RoutedClusterState {
         let updated_backend_id = backend.inference_server_id.clone();
         let mut generation = self.generation.lock();
         let upsert = generation.upsert_backend(backend);
-        generation.refresh_snapshot(Some(&updated_backend_id));
+        generation.refresh_snapshot(Some(&updated_backend_id), &self.cluster_generation.capacity);
         upsert
     }
 
@@ -446,7 +451,7 @@ impl RoutedClusterState {
         if !generation.remove_backend(registration) {
             return ClusterBackendRemoval::Missing;
         }
-        generation.refresh_snapshot(None);
+        generation.refresh_snapshot(None, &self.cluster_generation.capacity);
         if generation.backends.is_empty() {
             ClusterBackendRemoval::Emptied
         } else {
@@ -455,14 +460,28 @@ impl RoutedClusterState {
     }
 
     pub(super) fn routing_snapshot(&self) -> Option<RoutedClusterSnapshot> {
-        self.generation.lock().routing_snapshot()
+        let mut snapshot = self.generation.lock().routing_snapshot()?;
+        // All model names in the capacity domain share one engine. This name's
+        // own count is the floor, so a saturated report stays saturated.
+        snapshot.stats.num_running_queries = snapshot
+            .stats
+            .num_running_queries
+            .max(self.cluster_generation.capacity.running_queries());
+        Some(snapshot)
     }
 
     /// Settles pending reservations when a retired generation leaves its
     /// routing target. In-flight selections can keep this state alive past
     /// the TTL, so clearing the snapshot also refuses new reservations.
     pub(super) fn detach(&self) {
-        let snapshot_state = self.generation.lock().snapshot_state.take();
+        let snapshot_state = {
+            let mut generation = self.generation.lock();
+            let generation = &mut *generation;
+            self.cluster_generation
+                .capacity
+                .replace_reported_running(&mut generation.capacity_share, 0);
+            generation.snapshot_state.take()
+        };
         for pending in snapshot_state
             .into_iter()
             .flat_map(|state| state.pending_cluster_reservations)
@@ -573,5 +592,16 @@ impl RoutedClusterState {
     #[cfg(test)]
     pub(super) fn backend_aggregate(&self) -> Option<(ModelStats, Duration, usize)> {
         self.generation.lock().backend_aggregate()
+    }
+}
+
+impl Drop for RoutedClusterState {
+    // A target state can leave its routing target without a detach, so its
+    // share of the domain's running count leaves with it.
+    fn drop(&mut self) {
+        let generation = self.generation.get_mut();
+        self.cluster_generation
+            .capacity
+            .replace_reported_running(&mut generation.capacity_share, 0);
     }
 }

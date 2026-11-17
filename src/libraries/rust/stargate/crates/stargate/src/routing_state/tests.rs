@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use super::registration::{
-    RegistrationClusterGeneration, test_registration_generation,
+    CapacityDomain, RegistrationClusterGeneration, test_registration_generation,
     test_registration_generation_in_cluster,
 };
 use super::reservations::{UNEXPIRING_TEST_RESERVATION_TTL, update_reserved_priority_queue_time};
@@ -3637,4 +3637,217 @@ async fn shared_cluster_selects_active_backends_round_robin() {
         .select_backend(&HashSet::from(["inst-a".to_string()]))
         .expect("remaining backend should be selected");
     assert_eq!(selected.inference_server_id, "inst-b");
+}
+
+fn engine_slot_stats(num_running_queries: u64) -> ModelStats {
+    ModelStats {
+        last_mean_input_tps: 100.0,
+        max_engine_concurrency: 1,
+        num_running_queries,
+        ..ModelStats::default()
+    }
+}
+
+/// Publishes one backend update that advertises `base` and `alias`, with
+/// `base_running` requests reported on `base` and none on `alias`.
+async fn publish_base_and_alias(
+    scenario: &RegistrationScenario,
+    running: &RunningRegistration,
+    base_running: u64,
+) {
+    let mut update = scenario.update(running, "base", Active, engine_slot_stats(base_running));
+    update.models.insert(
+        "alias".to_string(),
+        InferenceServerModelRegistration {
+            stats: Some(engine_slot_stats(0)),
+            status: Active as i32,
+        },
+    );
+    scenario.publish_connected(running, &update).await;
+}
+
+// Model names advertised by one backend share its engine slots, so load on
+// one name, whether reported by the backend or still in flight, fills the
+// slot for every name.
+#[tokio::test]
+async fn alias_names_on_one_backend_share_engine_slots() {
+    use stargate_protocol::common::has_available_engine_slot;
+
+    for (case, base_running, reserve_on_base) in [
+        ("in-flight reservation on base", 0, true),
+        ("reported running request on base", 1, false),
+    ] {
+        let scenario = RegistrationScenario::new(Some("rk-alias"));
+        let running = scenario.start("inst-alias", 8888);
+        publish_base_and_alias(&scenario, &running, base_running).await;
+
+        let _held = if reserve_on_base {
+            Some(
+                scenario
+                    .selected_cluster("base")
+                    .await
+                    .reserve_backend(&running.generation(), 10, 0)
+                    .expect("active backend should accept reservation"),
+            )
+        } else {
+            None
+        };
+
+        for model in ["base", "alias"] {
+            let stats = scenario.only_cluster(model).await.stats;
+            assert!(
+                !has_available_engine_slot(stats.num_running_queries, stats.max_engine_concurrency),
+                "{case}: {model} still sees a free slot: running={} max={}",
+                stats.num_running_queries,
+                stats.max_engine_concurrency
+            );
+        }
+    }
+}
+
+// The shared count must fall back when load on one name ends, or the domain
+// would stay full for every name.
+#[tokio::test]
+async fn alias_names_on_one_backend_free_engine_slots_when_load_ends() {
+    use stargate_protocol::common::has_available_engine_slot;
+
+    for (case, base_running, reserve_on_base) in [
+        ("released reservation on base", 0, true),
+        ("reported running request on base ends", 1, false),
+    ] {
+        let scenario = RegistrationScenario::new(Some("rk-alias"));
+        let running = scenario.start("inst-alias", 8888);
+        publish_base_and_alias(&scenario, &running, base_running).await;
+
+        if reserve_on_base {
+            scenario
+                .selected_cluster("base")
+                .await
+                .reserve_backend(&running.generation(), 10, 0)
+                .expect("active backend should accept reservation")
+                .release();
+        } else {
+            publish_base_and_alias(&scenario, &running, 0).await;
+        }
+
+        for model in ["base", "alias"] {
+            let stats = scenario.only_cluster(model).await.stats;
+            assert!(
+                has_available_engine_slot(stats.num_running_queries, stats.max_engine_concurrency),
+                "{case}: {model} has no free slot: running={} max={}",
+                stats.num_running_queries,
+                stats.max_engine_concurrency
+            );
+        }
+    }
+}
+
+// A name that leaves the domain must take its running count with it, or
+// every name in the domain stays full until Stargate restarts.
+#[tokio::test]
+async fn capacity_domain_drops_the_share_of_a_departed_name() {
+    let stats = |num_running_queries| ModelStats {
+        last_mean_input_tps: 100.0,
+        max_engine_concurrency: 8,
+        num_running_queries,
+        ..ModelStats::default()
+    };
+
+    for (case, alias_on_own_backend) in [
+        ("alias no longer advertised", false),
+        ("backend serving alias ends", true),
+    ] {
+        let scenario = RegistrationScenario::new(Some("rk-alias"));
+        let base = scenario.start_in("inst-base", "shared-engine", 8888);
+        let mut base_update = scenario.update(&base, "base", Active, stats(1));
+        let alias_backend = if alias_on_own_backend {
+            let alias = scenario.start_in("inst-alias", "shared-engine", 8889);
+            let alias_update = scenario.update(&alias, "alias", Active, stats(1));
+            scenario.publish_connected(&alias, &alias_update).await;
+            Some(alias)
+        } else {
+            base_update.models.insert(
+                "alias".to_string(),
+                InferenceServerModelRegistration {
+                    stats: Some(stats(1)),
+                    status: Active as i32,
+                },
+            );
+            None
+        };
+        scenario.publish_connected(&base, &base_update).await;
+        assert_eq!(
+            scenario
+                .only_cluster("base")
+                .await
+                .stats
+                .num_running_queries,
+            2,
+            "{case}: both names count"
+        );
+
+        match alias_backend {
+            Some(alias) => {
+                scenario.state.end_registration(alias).await;
+            }
+            None => {
+                let base_only = scenario.update(&base, "base", Active, stats(1));
+                scenario.publish_connected(&base, &base_only).await;
+            }
+        }
+
+        assert_eq!(
+            scenario
+                .only_cluster("base")
+                .await
+                .stats
+                .num_running_queries,
+            1,
+            "{case}: alias share left the domain"
+        );
+    }
+}
+
+// One request is always running while the writer moves it between "routed,
+// not yet reported" and "reported", so a concurrent read must never be 0.
+#[test]
+fn capacity_domain_read_never_misses_a_running_request() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let domain = Arc::new(CapacityDomain::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
+    domain.reservation_started();
+    let reader = {
+        let (domain, stop, reads) = (Arc::clone(&domain), Arc::clone(&stop), Arc::clone(&reads));
+        std::thread::spawn(move || {
+            let mut zero_reads = 0_u64;
+            while !stop.load(Ordering::Acquire) {
+                if domain.running_queries() == 0 {
+                    zero_reads += 1;
+                }
+                reads.fetch_add(1, Ordering::Relaxed);
+            }
+            zero_reads
+        })
+    };
+
+    // Keep writing until the reader has run, so the test cannot pass without
+    // concurrent reads.
+    let mut share = 0;
+    let mut cycles = 0;
+    while cycles < 200_000 || reads.load(Ordering::Relaxed) < 10_000 {
+        // Pylon reports the request, then its reservation settles.
+        domain.replace_reported_running(&mut share, 1);
+        domain.reservation_ended();
+        // Pylon reports the same request again, with no reservation left.
+        domain.replace_reported_running(&mut share, 1);
+        // A new request is routed, then Pylon reports the old one finished.
+        domain.reservation_started();
+        domain.replace_reported_running(&mut share, 0);
+        cycles += 1;
+    }
+    stop.store(true, Ordering::Release);
+
+    assert_eq!(reader.join().expect("reader thread panicked"), 0);
 }

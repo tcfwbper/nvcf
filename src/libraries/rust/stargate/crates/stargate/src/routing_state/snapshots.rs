@@ -208,6 +208,8 @@ pub(super) struct ClusterRoutingGeneration {
     // registration path.
     pub(super) backends: Vec<Arc<RoutedInferenceServerSnapshot>>,
     pub(super) snapshot_state: Option<ClusterSnapshotState>,
+    // This target's running count as last added to the capacity domain.
+    pub(super) capacity_share: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

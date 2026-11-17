@@ -69,6 +69,12 @@ impl PendingClusterReservation {
                 .routing_reservation_ttl_seconds(target.routing_key.as_deref(), &target.model_id)
                 .observe(ttl.as_secs_f64());
         }
+        if let Some(registration) = &registration {
+            registration
+                .cluster_generation
+                .capacity
+                .reservation_started();
+        }
         Arc::new(Self {
             inference_server_id,
             registration,
@@ -125,9 +131,14 @@ impl PendingClusterReservation {
         if self
             .active
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-            && let Some(metrics) = &self.metrics
+            .is_err()
         {
+            return;
+        }
+        if let Some(registration) = &self.registration {
+            registration.cluster_generation.capacity.reservation_ended();
+        }
+        if let Some(metrics) = &self.metrics {
             metrics.dec_routing_reservations_active(self.routing_key.as_deref(), &self.model);
         }
     }

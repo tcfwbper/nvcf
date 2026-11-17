@@ -17,7 +17,7 @@ use super::keys::{RegistrationIdentity, RoutingTargetKey};
 use super::*;
 use parking_lot::RwLock;
 use std::collections::{HashMap, hash_map::Entry};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::tunnel::RegistrationConnections;
 
@@ -62,6 +62,18 @@ struct ActiveRegistrationCluster {
 #[derive(Debug, Default)]
 pub(super) struct RegistrationClusterGeneration {
     retired: AtomicBool,
+    pub(super) capacity: CapacityDomain,
+}
+
+/// Engine load of one capacity domain, `(routing_key, cluster_id)`, shared
+/// by every model name it serves. Pylon counts each request under exactly one
+/// name, so the sum over names is the engine's running count.
+#[derive(Debug, Default)]
+pub(super) struct CapacityDomain {
+    // The running counts that each routed target state last reported, plus
+    // reservations routed under any name and not yet settled. One atomic, so
+    // a reader never combines two counts taken at different times.
+    running_queries: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -138,6 +150,34 @@ impl RegistrationClusterGeneration {
 
     pub(super) fn is_retired(&self) -> bool {
         self.retired.load(Ordering::Acquire)
+    }
+}
+
+impl CapacityDomain {
+    /// Running requests on the engine: reported by its backends, plus
+    /// requests routed to it that no backend has reported yet.
+    pub(super) fn running_queries(&self) -> u64 {
+        self.running_queries.load(Ordering::Acquire)
+    }
+
+    /// Replaces one routed target state's share of the reported running
+    /// count. `share` holds that state's last published value.
+    pub(super) fn replace_reported_running(&self, share: &mut u64, running: u64) {
+        // Bounding each share keeps the sum from wrapping, so every share can
+        // be subtracted exactly. Adding first means a reader can only see a
+        // brief overcount, which errs toward rejecting.
+        let running = running.min(u64::from(u32::MAX));
+        self.running_queries.fetch_add(running, Ordering::AcqRel);
+        self.running_queries.fetch_sub(*share, Ordering::AcqRel);
+        *share = running;
+    }
+
+    pub(super) fn reservation_started(&self) {
+        self.running_queries.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn reservation_ended(&self) {
+        self.running_queries.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
