@@ -543,7 +543,6 @@ impl CassandraServiceManager {
             prepared.set_consistency(Consistency::One);
             prepared.set_serial_consistency(Some(SerialConsistency::Serial));
             prepared.set_is_idempotent(true);
-            prepared.set_tracing(true);
             session
                 .execute_unpaged(
                     &prepared,
