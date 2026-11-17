@@ -63,11 +63,20 @@ public class TestAuthorizedPartiesService {
             UUID versionId,
             String ncaId,
             String name) {
+        return createTestFunction(id, versionId, ncaId, name, FunctionStatus.INACTIVE);
+    }
+
+    public FunctionEntity createTestFunction(
+            UUID id,
+            UUID versionId,
+            String ncaId,
+            String name,
+            FunctionStatus status) {
         var entity = FunctionEntity.builder()
                 .functionId(id)
                 .functionVersionId(versionId)
                 .functionName(name)
-                .functionStatus(FunctionStatus.INACTIVE)
+                .functionStatus(status)
                 .ncaId(ncaId)
                 .containerArgs(TEST_CONTAINER_ARGS)
                 .containerImage(TEST_NGC_CONTAINER_IMAGE.toString())

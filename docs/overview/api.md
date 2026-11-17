@@ -128,6 +128,7 @@ bearer" means which saved CLI credential type can be sent as
 | Function invocation | `POST /v2/nvcf/pexec/functions/{functionId}` | `NVCF_TOKEN` or `NVCF_API_KEY` | `invoke_function` |
 | Function invocation | `POST /v2/nvcf/pexec/functions/{functionId}/versions/{versionId}` | `NVCF_TOKEN` or `NVCF_API_KEY` | `invoke_function` |
 | Function invocation | `GET /v2/nvcf/pexec/status/{requestId}` | `NVCF_TOKEN` or `NVCF_API_KEY` | `invoke_function` |
+| Function invocation | `GET /v2/nvcf/invocable/functions/versions/ids` | `NVCF_TOKEN` or `NVCF_API_KEY` | `list_functions` |
 | Queue details | `GET /v2/nvcf/queues/{requestId}/position` | `NVCF_TOKEN` or `NVCF_API_KEY` | `queue_details` |
 | Queue details | `GET /v2/nvcf/queues/functions/{functionId}` | `NVCF_TOKEN` or `NVCF_API_KEY` | `queue_details` |
 | Queue details | `GET /v2/nvcf/queues/functions/{functionId}/versions/{versionId}` | `NVCF_TOKEN` or `NVCF_API_KEY` | `queue_details` |
