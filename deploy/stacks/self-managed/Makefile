@@ -39,6 +39,7 @@ test:
 	@tests/image-override-wiring.sh
 	@tests/sidecar-registry-wiring.sh
 	@tests/api-env-wiring.sh
+	@tests/account-bootstrap-wiring.sh
 	@tests/apikeys-env-wiring.sh
 	@tests/notary-env-wiring.sh
 	@tests/ess-base-url-wiring.sh
