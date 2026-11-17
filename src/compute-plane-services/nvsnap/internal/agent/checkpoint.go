@@ -656,6 +656,7 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 		// A failed capture leaves nothing a restore could use; its logs are
 		// kept to say why.
 		if retErr != nil {
+			writeToolOutput(checkpointDir, retErr)
 			keepFailureLogs(a.config.CheckpointDir, checkpointDir, log)
 			if err := os.RemoveAll(checkpointDir); err != nil {
 				log.WithError(err).WithField("dir", checkpointDir).Warn("cannot remove the failed capture's directory")
@@ -670,7 +671,7 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 	_, gpuSpan := tracing.Tracer().Start(ctx, "checkpoint.gpu_state")
 	// criu-v2: no pre-dump lock/checkpoint. The bundled cuda_plugin drives
 	// cuda-checkpoint for every GPU process during the in-namespace dump.
-	log.WithField("gpuPIDs", gpuPIDs).Info("criu-v2: GPU state handled by cuda_plugin during in-ns dump")
+	log.WithField("gpuPIDs", gpuPIDs).Info("criu-v2: GPU state is saved during the dump: by gpushare under the library, else by the CUDA plugin")
 	gpuSpan.End()
 
 	// Step 4.5: Copy all runtime-generated mapped files BEFORE CRIU dump

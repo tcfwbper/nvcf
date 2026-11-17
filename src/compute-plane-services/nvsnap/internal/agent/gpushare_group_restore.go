@@ -188,6 +188,9 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 	// (groupSpanBudget).
 	spans := make([]int64, len(req.Members))
 	spanKnown := make([]bool, len(req.Members))
+	// metas[i] is rank i's checkpoint metadata, for the learned span when
+	// a rank has no span of its own (learnedGroupSpan).
+	metas := make([]*CheckpointMetadata, len(req.Members))
 	bases := make([]string, len(req.Members))
 	// Every node fetches its rank's checkpoint at once: each is the size of
 	// its rank's GPU memory.
@@ -219,6 +222,7 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 			}
 			if md.GPUShareGroup != nil && !md.GPUShareGroup.Companion {
 				spans[i], spanKnown[i] = fetchRestoreSpan(ctx, fabricHTTPClient, base, m.CheckpointID)
+				metas[i] = md
 			}
 			entries[i] = groupRestoreEntry{Name: name, OldIP: md.SourcePodIP, NewIP: newIPs[i], Group: md.GPUShareGroup}
 			res.Members[i] = GroupRestoreMemberResult{CheckpointID: m.CheckpointID, Pod: name, OldIP: md.SourcePodIP, NewIP: newIPs[i]}
@@ -238,12 +242,31 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 	log = log.WithFields(logrus.Fields{"fabricSession": res.Session, "inetAddrMap": addrMap})
 	var rankSpans []int64
 	var rankKnown []bool
+	var rankMetas []*CheckpointMetadata
 	for i := range req.Members {
 		if !entries[i].Group.Companion {
 			rankSpans, rankKnown = append(rankSpans, spans[i]), append(rankKnown, spanKnown[i])
+			rankMetas = append(rankMetas, metas[i])
 		}
 	}
 	groupSpan := groupRestoreSpan(rankSpans, rankKnown)
+	// spanLearned: the ranks' span is the cluster's learned one, which each
+	// rank's estimate bounds.
+	spanLearned := false
+	if groupSpan == groupSpanUnknown && len(rankMetas) > 0 {
+		// A rank new to its node: the cluster's learned span, but never
+		// less than a rank's own last span (which is then the span, not
+		// bounded by an estimate).
+		if ms := a.learnedGroupSpan(ctx, rankMetas, log); ms != groupSpanUnknown {
+			spanLearned = true
+			for i, known := range rankKnown {
+				if known && rankSpans[i] >= ms {
+					ms, spanLearned = rankSpans[i], false
+				}
+			}
+			groupSpan = ms
+		}
+	}
 	log.WithField("rankSpanMs", groupSpan).Info("group restore: starting every member's restore")
 
 	// c-e. Restore every pod and unlock them together. The GPU ranks go
@@ -279,6 +302,7 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 				GPUShareFabricSession:    res.Session,
 				InetAddrMap:              addrMap,
 				GroupRestoreSpanMS:       rankSpan(entries[i].Group, groupSpan),
+				GroupRestoreSpanLearned:  spanLearned && rankSpan(entries[i].Group, groupSpan) > 0,
 			})
 			mu.Lock()
 			defer mu.Unlock()

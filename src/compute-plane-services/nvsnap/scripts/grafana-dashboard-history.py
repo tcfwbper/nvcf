@@ -90,7 +90,7 @@ y[0] += 8
 
 row("Restore")
 ts("Restore outcomes", "restored; failed (ran and failed); not-run (could not run, tried again); refused; gpu-fault (a GPU the probe found faulty).", [tgt(f'sum by (outcome, reason) (increase(nvsnap_restore_outcomes_total{{{G}}}[$__interval]))', "{{outcome}} {{reason}}")], 0, stack=True, bars=True)
-ts("Restore phases, p50", "criu: process restore; gpu: GPU state reload and resume; rank: a node's whole restore; group: placeholders running to every rank restored; ready: restored to Ready.", [tgt(q(0.5, "nvsnap_restore_phase_seconds", "phase", 'method="criu", ' + G), "{{phase}}")], 12, unit="s")
+ts("Restore phases, p50", "criu: process restore; gpu: GPU state reload and resume; clock_wait: the part of gpu spent waiting for the restored clocks; rank: a node's whole restore; group: placeholders running to every rank restored; ready: restored to Ready.", [tgt(q(0.5, "nvsnap_restore_phase_seconds", "phase", 'method="criu", ' + G), "{{phase}}")], 12, unit="s")
 y[0] += 8
 ts("Restore phases, p95", "As p50, the slowest 5%.", [tgt(q(0.95, "nvsnap_restore_phase_seconds", "phase", 'method="criu", ' + G), "{{phase}}")], 0, unit="s")
 ts("Checkpoint fetch to a node", "p50 time by where the bytes came from (left axis), and failed fetches (bars, right axis). A checkpoint already on the node is no fetch.",

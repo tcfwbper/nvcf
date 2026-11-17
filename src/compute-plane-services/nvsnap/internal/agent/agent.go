@@ -1169,6 +1169,9 @@ func (a *Agent) checkpointManifestHandler(w http.ResponseWriter, r *http.Request
 		if err != nil {
 			return err
 		}
+		if nodeLocalCheckpointFile(rel) {
+			return nil
+		}
 		files = append(files, manifestFile{
 			Path:  rel,
 			Size:  info.Size(),

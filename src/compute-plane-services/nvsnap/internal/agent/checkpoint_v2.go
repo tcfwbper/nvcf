@@ -318,6 +318,14 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	if fabricSession != "" && !gsOn {
 		return nil, errNoGPUProcess(fabricSession)
 	}
+	if !gsOn {
+		// A workload under the library is captured through it or not at
+		// all: its configuration then falls back to the cachedir, never to
+		// the CUDA plugin (gpushare_outside.go).
+		if oerr := gpushareOutsideSession(procBase, targetHostPID); oerr != nil {
+			return nil, oerr
+		}
+	}
 	// A multi-node session's directory lives in the pod's store and must be
 	// gone before the store is collected into the checkpoint.
 	fabricDir, closeFabric := "", func() {}
@@ -346,6 +354,24 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 		if oerr := ownGPUShareStore(procBase, targetHostPID, root, fabric); oerr != nil {
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
+		// ModelExpress drops its RDMA state, which the dump cannot save,
+		// right before the suspend (gpushare_mx.go). Deferred before the
+		// suspend's guard, its resume runs after the source's: mx refuses
+		// while launches are held.
+		modelExpress := usesModelExpress(procBase, sessionPIDs(procBase, targetHostPID))
+		paused, mxErr := pauseModelExpress(ctx, modelExpress, tools.gpuToolText(), hostPID, gsPIDs, log)
+		if mxErr != nil {
+			return nil, fmt.Errorf("gpushare: %w", mxErr)
+		}
+		if paused {
+			defer func() {
+				// Not on a source whose GPU resume failed: it is stopped,
+				// and is replaced (errSourceLeftSuspended).
+				if sourceRunsOn(dumped, leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
+					resumeModelExpress(ctx, hostPID, "", gsPIDs, log)
+				}
+			}()
+		}
 		gm, suspended, serr := gpushareSuspend(ctx, hostPID, gsPIDs, fabricDir, log)
 		if suspended {
 			// The source is stopped with its GPU memory released from
@@ -364,7 +390,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare suspend: %w", serr)
 		}
 		gpuMap = gm
-		gsInfo = &GPUShareInfo{PIDs: gsPIDs, StorePath: GPUShareStoreInContainer, LibPath: gsLib}
+		gsInfo = &GPUShareInfo{PIDs: gsPIDs, StorePath: GPUShareStoreInContainer, LibPath: gsLib, ModelExpress: paused}
 	}
 
 	final := finalOf(leaveRunning)

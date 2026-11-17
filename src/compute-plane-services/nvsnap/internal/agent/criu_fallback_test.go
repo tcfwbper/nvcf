@@ -727,3 +727,74 @@ func TestConsiderGPUShareFailure_KeepsAPodNothingRecreates(t *testing.T) {
 		}
 	}
 }
+
+// TestFailedStart_KeepsTheTerminationMessage: a container's own message
+// about its exit (its termination log) is part of its failure.
+func TestFailedStart_KeepsTheTerminationMessage(t *testing.T) {
+	p := crashing(enginePod(0), 2, 1)
+	p.Status.ContainerStatuses[0].LastTerminationState.Terminated.Message = "CUDA error: invalid device context"
+	if got := failedStart(p); !strings.HasSuffix(got, "exit code 1, signal 0: CUDA error: invalid device context") {
+		t.Errorf("failure %q lacks the termination message", got)
+	}
+}
+
+// TestConsiderGPUShareFailure_RecordsTheKubeletsKill: exit code 137 alone
+// does not say who killed the engine. When the kubelet did, as a probe
+// failed, its events say so and the record keeps it; an OOM kill, which
+// its reason already names, is not looked up, and another container's
+// events are not taken for the engine's.
+func TestConsiderGPUShareFailure_RecordsTheKubeletsKill(t *testing.T) {
+	ev := func(name, container, reason, msg string, at time.Time) *corev1.Event {
+		return &corev1.Event{
+			ObjectMeta:     metav1.ObjectMeta{Name: name, Namespace: "fn"},
+			InvolvedObject: corev1.ObjectReference{Kind: "Pod", Namespace: "fn", Name: "engine-0", UID: "uid-0", FieldPath: "spec.containers{" + container + "}"},
+			Reason:         reason, Message: msg, Type: corev1.EventTypeWarning, LastTimestamp: metav1.NewTime(at),
+		}
+	}
+	now := time.Now()
+	for name, tc := range map[string]struct {
+		reason   string
+		started  time.Time // the failed run's start; it ended at now
+		want     string
+		wantNone bool
+	}{
+		"probe kill": {reason: "Error", started: now.Add(-time.Minute), want: "the kubelet: Container engine failed liveness probe, will be restarted (Liveness probe failed: HTTP probe failed with statuscode: 503)"},
+		"oom kill":   {reason: "OOMKilled", started: now.Add(-time.Minute), wantNone: true},
+		// The probe killed an earlier run; this run, started after it,
+		// was killed by something else.
+		"an earlier run's kill": {reason: "Error", started: now.Add(30 * time.Second), wantNone: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, cs := fallbackAgent(t)
+			c := &criuAutoRestorer{a: a}
+			ctx := context.Background()
+			pod := withLibrary(crashing(enginePod(0), 2, 137))
+			term := pod.Status.ContainerStatuses[0].LastTerminationState.Terminated
+			term.Reason = tc.reason
+			term.StartedAt, term.FinishedAt = metav1.NewTime(tc.started), metav1.NewTime(maxTime(tc.started.Add(time.Second), now.Add(time.Second)))
+			pod.OwnerReferences = []metav1.OwnerReference{ownedBy("ReplicaSet", true)}
+			if _, err := cs.CoreV1().Pods("fn").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range []*corev1.Event{
+				ev("a", "engine", "Unhealthy", "Liveness probe failed: HTTP probe failed with statuscode: 503", now.Add(-time.Second)),
+				ev("b", "engine", "Killing", "Container engine failed liveness probe, will be restarted", now),
+				ev("c", "sidecar", "Killing", "Container sidecar failed liveness probe, will be restarted", now.Add(time.Second)),
+			} {
+				if _, err := cs.CoreV1().Events("fn").Create(ctx, e, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c.considerFallback(ctx, pod)
+			got := getRecord(t, a, criuGroupConfigMapName(fnKey(t, a)))[groupGPUShareFailureKey]
+			switch {
+			case !strings.Contains(got, "exit code 137"):
+				t.Fatalf("record %q lacks the failure", got)
+			case tc.wantNone && strings.Contains(got, "kubelet"):
+				t.Errorf("record %q names the kubelet for a kill that is not this run's probe kill", got)
+			case !tc.wantNone && !strings.HasSuffix(got, "; "+tc.want):
+				t.Errorf("record %q\nwant it to end %q", got, tc.want)
+			}
+		})
+	}
+}

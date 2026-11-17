@@ -627,6 +627,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	var injectPatches []PatchOp
 	// The identity of the spec as received, before any patch below.
 	injectPatches = append(injectPatches, m.admittedConfigPatches(pod)...)
+	injectPatches = append(injectPatches, m.processConfigPatches(pod)...)
 	// A configuration CRIU cannot serve falls back to the caches; one that
 	// does not start under the gpushare library goes without it.
 	fallback, isFallback := m.criuFallback(ctx, pod)
@@ -718,6 +719,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 			return mergePatchPlan(injectPatches), nil
 		}
 		plog.WithField("checkpoint", id).Info("CRIU restore: pod admitted as the restore placeholder")
+		cp = append(cp, m.processConfigPatches(pod)...)
 		// Not injectPatches: a gpushare restore mounts the checkpoint's
 		// chunk store, not the pod's own empty one.
 		return mergePatchPlan(withPIDReserve(pod, cp)), nil

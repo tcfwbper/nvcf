@@ -903,7 +903,7 @@
     {
       "type": "timeseries",
       "title": "Restore phases, p50",
-      "description": "criu: process restore; gpu: GPU state reload and resume; rank: a node's whole restore; group: placeholders running to every rank restored; ready: restored to Ready.",
+      "description": "criu: process restore; gpu: GPU state reload and resume; clock_wait: the part of gpu spent waiting for the restored clocks; rank: a node's whole restore; group: placeholders running to every rank restored; ready: restored to Ready.",
       "id": 17,
       "datasource": {
         "type": "prometheus",

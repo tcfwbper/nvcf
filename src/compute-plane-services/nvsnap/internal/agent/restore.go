@@ -165,6 +165,10 @@ type RestoreRequest struct {
 	// rank of a group restore, for one clock budget (groupSpanBudget):
 	// the slowest rank's last restore, or -1 when a rank has none.
 	GroupRestoreSpanMS int64 `json:"groupRestoreSpanMs,omitempty"`
+	// GroupRestoreSpanLearned is whether GroupRestoreSpanMS is the
+	// cluster's learned span (restore_span_learned.go), which each rank's
+	// estimate bounds.
+	GroupRestoreSpanLearned bool `json:"groupRestoreSpanLearned,omitempty"`
 
 	// PlaceholderContainerName picks the container in a multi-container
 	// placeholder pod; empty takes the first one.
@@ -490,7 +494,7 @@ func (a *Agent) Restore(ctx context.Context, req RestoreRequest) (*RestoreResult
 		return a.restoreV2(ctx, &metadata, checkpointDir, placeholderInfo, startTime, restoreV2Group{
 			Session: req.GPUShareFabricSession, InetAddrMap: req.InetAddrMap,
 			Namespace: req.PlaceholderNamespace, Pod: req.PlaceholderPodName,
-			SpanMS: req.GroupRestoreSpanMS,
+			SpanMS: req.GroupRestoreSpanMS, SpanLearned: req.GroupRestoreSpanLearned,
 		}, log)
 	}
 

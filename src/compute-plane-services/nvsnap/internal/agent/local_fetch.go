@@ -14,6 +14,8 @@ package agent
 // stopped part way, with the agent, keeps its mark and is redone.
 
 import (
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -63,14 +65,34 @@ func beginLocalFetch(checkpointDir, id string) error {
 	return clearFiles(dir)
 }
 
+// errSourceSpanKept: a done fetch could not drop the source node's restore
+// span. The checkpoint is still marked done: fetching it again would cost
+// far more than budgeting this restore with that node's span.
+var errSourceSpanKept = errors.New("the fetched checkpoint keeps the source node's restore span")
+
 // endLocalFetch records the fetch's outcome: done, or emptied for the
-// next try.
+// next try. A done fetch first drops what the source node kept of its
+// own (nodeLocalCheckpointFile), whichever tier copied it: the rails and
+// the shared filesystem copy a whole directory, and an older peer still
+// lists its restore span. It is marked done either way; errSourceSpanKept
+// says the span stayed.
 func endLocalFetch(checkpointDir, id string, ok bool) error {
+	dir := filepath.Join(checkpointDir, id)
 	if !ok {
-		_ = clearFiles(filepath.Join(checkpointDir, id))
+		_ = clearFiles(dir)
 		return nil
 	}
-	return os.Remove(fetchMarker(checkpointDir, id))
+	spanErr := os.Remove(filepath.Join(dir, restoreSpanFile)) //nolint:gosec // id is one EnsureLocal validated
+	if os.IsNotExist(spanErr) {
+		spanErr = nil
+	}
+	if err := os.Remove(fetchMarker(checkpointDir, id)); err != nil {
+		return errors.Join(err, spanErr)
+	}
+	if spanErr != nil {
+		return fmt.Errorf("%w: %w", errSourceSpanKept, spanErr)
+	}
+	return nil
 }
 
 // clearFiles removes every non-directory under dir and keeps the

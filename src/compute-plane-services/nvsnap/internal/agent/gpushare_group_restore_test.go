@@ -355,3 +355,67 @@ func TestGroupRestore_OneClockSpanForTheRanks(t *testing.T) {
 		})
 	}
 }
+
+// A rank new to its node takes the cluster's learned span for the whole
+// group, from the largest rank's checkpoint, rather than the estimate, but
+// never less than another rank's own last span; the companions keep their
+// own budget.
+func TestGroupRestore_LearnedSpanForANewRank(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		c0Span  string
+		want    int64
+		learned bool
+	}{
+		// 10 s for 100 GB, scaled to rank c1's 200 GB, with the margin; the
+		// ranks bound it by their estimates.
+		{"learned above the known span", "20000\n", 24000, true},
+		// A rank's own span is the span, not bounded.
+		{"known span above the learned", "40000\n", 40000, false},
+	} {
+		t.Run(c.name, func(t *testing.T) { learnedSpanForANewRank(t, c.c0Span, c.want, c.learned) })
+	}
+}
+
+func learnedSpanForANewRank(t *testing.T, c0Span string, want int64, learned bool) {
+	gpu := &CatalogInfo{GPUType: "NVIDIA-GB300"}
+	ckpts := map[string]*CheckpointMetadata{
+		"c0": {SourcePodIP: "10.0.0.1", CheckpointSize: 100 << 30, CatalogInfo: gpu, GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 0, Size: 3}},
+		"c1": {SourcePodIP: "10.0.0.2", CheckpointSize: 200 << 30, CatalogInfo: gpu, GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 1, Size: 3}},
+		"e":  {SourcePodIP: "10.0.0.5", GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 2, Size: 3, Companion: true}},
+	}
+	h := newGroupRestoreHarness(t, ckpts)
+	h.spans = map[string]string{"c0": c0Span, "e": "900\n"}
+	kc := groupRestoreCluster(t, h, map[string]string{"new-0": "10.1.0.10", "new-1": "10.1.0.11", "etcd": "10.1.0.15"})
+	if _, err := kc.CoreV1().ConfigMaps(h.a.agentNamespace()).Create(context.Background(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: restoreSpansConfigMap, Namespace: h.a.agentNamespace()},
+		Data:       map[string]string{"NVIDIA-GB300.m3": addSpanSample("", spanSample{100 << 30, 10000})},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req := GroupRestoreRequest{Members: []GroupRestoreMember{
+		{CheckpointID: "c0", PlaceholderNamespace: "llm", PlaceholderPodName: "new-0"},
+		{CheckpointID: "c1", PlaceholderNamespace: "llm", PlaceholderPodName: "new-1"},
+		{CheckpointID: "e", PlaceholderNamespace: "llm", PlaceholderPodName: "etcd"},
+	}}
+	if _, err := h.a.groupRestore(ctx, req, quietFabricLog()); err != nil {
+		t.Fatalf("group restore: %v", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.requests) != 3 {
+		t.Fatalf("%d restores, want 3", len(h.requests))
+	}
+	for i := range h.requests {
+		r := &h.requests[i]
+		w, wl := want, learned
+		if r.CheckpointID == "e" {
+			w, wl = 0, false
+		}
+		if r.GroupRestoreSpanMS != w || r.GroupRestoreSpanLearned != wl {
+			t.Errorf("%s: span %d learned %v, want %d learned %v", r.CheckpointID, r.GroupRestoreSpanMS, r.GroupRestoreSpanLearned, w, wl)
+		}
+	}
+}

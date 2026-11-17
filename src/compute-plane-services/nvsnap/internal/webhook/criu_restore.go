@@ -129,6 +129,11 @@ func (m *Mutator) criuRestoreFor(ctx context.Context, pod *corev1.Pod, hash stri
 		log.WithField("checkpoint", id).Warn("CRIU restore: this checkpoint failed to restore before; cold start")
 		return "", man
 	}
+	if changed := ProcessConfigChanges(man.SourcePodMeta[ProcessConfigMeta], ProcessConfig(pod)); len(changed) > 0 {
+		log.WithFields(logrus.Fields{"checkpoint": id, "changed": strings.Join(changed, ", ")}).
+			Info("CRIU restore: the pod's process configuration differs from its checkpoint's, which the restored process would keep; cold start")
+		return "", man
+	}
 	return id, man
 }
 

@@ -49,7 +49,9 @@ v-2    f-1        t-1      failed     cachedir   1                              
 v-3    f-9        t-2      capturing             2                                   5m
 ```
 
-`kubectl get nvsnapfunctions -o wide` adds the reason; `-o yaml` has every
+`kubectl get nvsnapfunctions -o wide` adds the reason, at most 300 bytes: a group failure's count, its first
+member and that member's cause (a GPU tool's error reply when there is one); the record keeps every member's.
+`-o yaml` has every
 configuration of the version: its key, state, nodes, captures, the last
 restores, restore failures, GPU faults, stalls, and its cachedir capture.
 `-l nvsnap.io/function-id=<id>` lists one function's versions.

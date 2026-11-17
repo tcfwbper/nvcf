@@ -205,9 +205,28 @@ func (c *criuAutoRestorer) forgetFallback(uid types.UID) {
 // container once it has failed gpushareFailedStarts times, and the pod is
 // not Ready: "" otherwise.
 func failedStart(pod *corev1.Pod) string {
-	name := gpuContainer(pod)
-	if name == "" || rootfsonly.IsPodReady(pod) {
+	name, t, failures := lastFailure(pod)
+	if t == nil || failures < gpushareFailedStarts {
 		return ""
+	}
+	s := fmt.Sprintf("container %s failed %d times; last: %s, exit code %d, signal %d", name, failures, t.Reason, t.ExitCode, t.Signal)
+	if m := strings.TrimSpace(t.Message); m != "" {
+		s += ": " + truncateMiddle(m, terminationMessageMax)
+	}
+	return s
+}
+
+// terminationMessageMax bounds a container's termination message in a
+// failure.
+const terminationMessageMax = 512
+
+// lastFailure is the pod's GPU container, its last failed termination and
+// how many times it has failed; nil when it has not failed or the pod is
+// Ready.
+func lastFailure(pod *corev1.Pod) (name string, last *corev1.ContainerStateTerminated, failures int) {
+	name = gpuContainer(pod)
+	if name == "" || rootfsonly.IsPodReady(pod) {
+		return name, nil, 0
 	}
 	for i := range pod.Status.ContainerStatuses {
 		cs := &pod.Status.ContainerStatuses[i]
@@ -215,17 +234,98 @@ func failedStart(pod *corev1.Pod) string {
 			continue
 		}
 		t := cs.LastTerminationState.Terminated
-		failures := int(cs.RestartCount)
+		failures = int(cs.RestartCount)
 		if cur := cs.State.Terminated; cur != nil && (cur.ExitCode != 0 || cur.Signal != 0) {
 			t = cur
 			failures++
 		}
-		if t == nil || (t.ExitCode == 0 && t.Signal == 0) || failures < gpushareFailedStarts {
-			return ""
+		if t == nil || (t.ExitCode == 0 && t.Signal == 0) {
+			return name, nil, 0
 		}
-		return fmt.Sprintf("container %s failed %d times; last: %s, exit code %d, signal %d", name, failures, t.Reason, t.ExitCode, t.Signal)
+		return name, t, failures
 	}
-	return ""
+	return name, nil, 0
+}
+
+// killedFromOutside is whether a termination is a SIGKILL its process did
+// not choose and the kernel's OOM killer did not send: the kubelet's, as
+// a probe failed, or another's.
+func killedFromOutside(t *corev1.ContainerStateTerminated) bool {
+	return t != nil && (t.ExitCode == 137 || t.Signal == int32(syscall.SIGKILL)) && t.Reason != "OOMKilled"
+}
+
+// kubeletKillEventsTimeout bounds the read of a pod's events.
+const kubeletKillEventsTimeout = 5 * time.Second
+
+// killEventSlack is how long after a run's end its kill's event may be
+// stamped: the kubelet records it as it stops the container.
+const killEventSlack = 5 * time.Second
+
+// kubeletKill is why the kubelet killed container of pod in its failed
+// run t, from the pod's events: the "Killing" (e.g. "Container main failed
+// liveness probe, will be restarted") and the probe failure before it
+// ("Liveness probe failed: …") that happened during t, from its start to
+// its end (killEventSlack after it); "" when no event of t says so or the
+// events cannot be read. Exit code 137 alone does not tell a probe's kill
+// from any other SIGKILL, and an earlier run's kill is not t's.
+func (a *Agent) kubeletKill(ctx context.Context, pod *corev1.Pod, container string, t *corev1.ContainerStateTerminated) string {
+	if a.kubeClient == nil || t == nil || t.StartedAt.IsZero() || t.FinishedAt.IsZero() {
+		return ""
+	}
+	during := func(e *corev1.Event) bool {
+		// A repeated event keeps its first and its last time: it belongs to
+		// t when any of it falls in t's run.
+		first, last := e.FirstTimestamp.Time, eventTime(e)
+		if first.IsZero() {
+			first = last
+		}
+		return !last.Before(t.StartedAt.Time) && !first.After(t.FinishedAt.Add(killEventSlack))
+	}
+	ctx, cancel := context.WithTimeout(ctx, kubeletKillEventsTimeout)
+	defer cancel()
+	evs, err := a.kubeClient.CoreV1().Events(pod.Namespace).List(ctx, metav1.ListOptions{FieldSelector: "involvedObject.uid=" + string(pod.UID)})
+	if err != nil {
+		a.log.WithError(err).WithField("pod", pod.Namespace+"/"+pod.Name).Debug("cannot read the pod's events for why it was killed")
+		return ""
+	}
+	fieldPath := "spec.containers{" + container + "}"
+	var killing, unhealthy *corev1.Event
+	for i := range evs.Items {
+		e := &evs.Items[i]
+		if e.InvolvedObject.UID != pod.UID || e.InvolvedObject.FieldPath != fieldPath || !during(e) {
+			continue
+		}
+		switch e.Reason {
+		case "Killing":
+			if killing == nil || eventTime(e).After(eventTime(killing)) {
+				killing = e
+			}
+		case "Unhealthy":
+			if unhealthy == nil || eventTime(e).After(eventTime(unhealthy)) {
+				unhealthy = e
+			}
+		}
+	}
+	if killing == nil {
+		return ""
+	}
+	why := "the kubelet: " + killing.Message
+	if unhealthy != nil && !eventTime(unhealthy).After(eventTime(killing)) {
+		why += " (" + unhealthy.Message + ")"
+	}
+	return truncateMiddle(why, terminationMessageMax)
+}
+
+// eventTime is when an event last happened.
+func eventTime(e *corev1.Event) time.Time {
+	switch {
+	case !e.LastTimestamp.IsZero():
+		return e.LastTimestamp.Time
+	case !e.EventTime.IsZero():
+		return e.EventTime.Time
+	default:
+		return e.FirstTimestamp.Time
+	}
 }
 
 // considerGPUShareFailure marks the configuration of a pod that does not
@@ -251,6 +351,13 @@ func (c *criuAutoRestorer) considerGPUShareFailure(ctx context.Context, pod *cor
 	attempt := "gpushare-start/" + string(pod.UID)
 	if _, done := c.attempted.LoadOrStore(attempt, struct{}{}); done {
 		return
+	}
+	// Once per pod: the events say why a SIGKILL came, which its exit code
+	// does not.
+	if name, t, _ := lastFailure(pod); killedFromOutside(t) {
+		if why := c.a.kubeletKill(ctx, pod, name, t); why != "" {
+			failure += "; " + why
+		}
 	}
 	log := c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "failure": failure})
 	key, _, err := c.a.podFallbackKey(ctx, pod)
@@ -284,7 +391,8 @@ func (c *criuAutoRestorer) considerGPUShareFailure(ctx context.Context, pod *cor
 		}
 		return
 	}
-	marked, err := c.markGPUShareFailed(ctx, key, bundle, failure)
+	evidence := c.a.gpushareFailureEvidence(ctx, pod, log)
+	marked, err := c.markGPUShareFailed(ctx, key, bundle, failure, evidence)
 	if err != nil {
 		retryLater()
 		log.WithError(err).Warn("gpushare: cannot mark the configuration; the pod is left as it is")
@@ -303,6 +411,8 @@ func (c *criuAutoRestorer) considerGPUShareFailure(ctx context.Context, pod *cor
 		return
 	}
 	log.Warn("gpushare: the pod never started under the library; its configuration falls back to the cachedir without it, and the pod is replaced")
+	// Its logs go with it: the end of the failed run's, into the agent's.
+	c.a.logFailedRunTail(ctx, pod, gpuContainer(pod), log)
 	if err := c.a.deletePodRetrying(ctx, pod.Namespace, pod.Name, pod.UID); err != nil {
 		log.WithError(err).Warn("gpushare: cannot delete the pod; its replacement will be admitted without the library")
 	}
@@ -355,8 +465,9 @@ func clearGPUShare(d map[string]string, bundle, failure string) bool {
 }
 
 // markGPUShareFailed marks the group record of key (its instance's
-// through an alias), creating it when there is none.
-func (c *criuAutoRestorer) markGPUShareFailed(ctx context.Context, key, bundle, failure string) (bool, error) {
+// through an alias), creating it when there is none, and keeps the failed
+// pod's evidence (gpushare_evidence.go) with the mark.
+func (c *criuAutoRestorer) markGPUShareFailed(ctx context.Context, key, bundle, failure, evidence string) (bool, error) {
 	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
 	target := key
 	if cm, err := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{}); err == nil && cm.Data["state"] == criuGroupStateAlias {
@@ -364,6 +475,7 @@ func (c *criuAutoRestorer) markGPUShareFailed(ctx context.Context, key, bundle, 
 	} else if apierrors.IsNotFound(err) {
 		d := map[string]string{}
 		markGPUShare(d, bundle, failure, time.Now())
+		keepEvidence(d, evidence)
 		_, err := cms.Create(ctx, &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName(key), Labels: map[string]string{"app.kubernetes.io/managed-by": "nvsnap"}},
 			Data:       d,
@@ -380,6 +492,9 @@ func (c *criuAutoRestorer) markGPUShareFailed(ctx context.Context, key, bundle, 
 	marked := false
 	err := c.updateGroupRecord(ctx, target, func(d map[string]string) bool {
 		marked = markGPUShare(d, bundle, failure, time.Now())
+		if marked {
+			keepEvidence(d, evidence)
+		}
 		return marked
 	})
 	return marked, err

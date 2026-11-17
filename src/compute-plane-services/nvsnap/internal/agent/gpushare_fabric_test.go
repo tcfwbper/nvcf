@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,10 @@ type fakeFabricMember struct {
 	mu   sync.Mutex
 	st   fabricState
 	reg  bool
+	// failVerdicts fails that many verdict deliveries; stall makes State
+	// wait for its context.
+	failVerdicts int
+	stall        bool
 	// verdicts and ins record what the driver sent.
 	verdicts []string
 	ins      []string
@@ -35,14 +40,23 @@ type fakeFabricMember struct {
 }
 
 func (f *fakeFabricMember) Name() string { return f.name }
-func (f *fakeFabricMember) State(context.Context) (fabricState, bool, error) {
+func (f *fakeFabricMember) State(ctx context.Context) (fabricState, bool, error) {
 	f.mu.Lock()
+	if f.stall {
+		f.mu.Unlock()
+		<-ctx.Done()
+		return fabricState{}, false, ctx.Err()
+	}
 	defer f.mu.Unlock()
 	return f.st, f.reg, nil
 }
 func (f *fakeFabricMember) Verdict(_ context.Context, attempt int, verdict string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failVerdicts > 0 {
+		f.failVerdicts--
+		return errors.New("connection reset")
+	}
 	f.verdicts = append(f.verdicts, fmt.Sprintf("%d %s", attempt, verdict))
 	return nil
 }
@@ -780,4 +794,103 @@ func TestDriveFabric_RetriesLostDeliveries(t *testing.T) {
 			t.Errorf("outcome = %+v, want unlocked after the retry", out)
 		}
 	})
+}
+
+// A vote that keeps finding a node busy is aborted at the deadline, for
+// every member at its next vote, so all roll back at the same attempt
+// instead of retrying for as long as their tools would.
+func TestDriveFabric_VoteDeadlineAbortsEveryMember(t *testing.T) {
+	a, b := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "b"}
+	ds, res, cancel := startDriveOpts([]fabricMember{a, b}, fabricDriveOpts{Vote: true, VoteDeadline: 300 * time.Millisecond})
+	defer cancel()
+
+	a.vote(0, true)
+	b.vote(0, false)
+	eventually(t, "retry", func() bool { v, _ := b.sent(); return len(v) == 1 })
+	time.Sleep(400 * time.Millisecond)
+	a.vote(1, true)
+	b.vote(1, false)
+	eventually(t, "abort", func() bool {
+		va, _ := a.sent()
+		vb, _ := b.sent()
+		return len(va) == 2 && len(vb) == 2
+	})
+	for _, m := range []*fakeFabricMember{a, b} {
+		if v, _ := m.sent(); !reflect.DeepEqual(v, []string{"0 retry", "1 abort"}) {
+			t.Errorf("%s verdicts = %v, want [0 retry, 1 abort]", m.name, v)
+		}
+	}
+	ds.set(0)
+	ds.set(1)
+	if out := <-res; out.Went {
+		t.Errorf("outcome %+v: went after the deadline", out)
+	}
+}
+
+// Before the deadline a busy vote is retried as before.
+func TestDriveFabric_VoteDeadlineLeavesATimelyVote(t *testing.T) {
+	a, b := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "b"}
+	ds, res, cancel := startDriveOpts([]fabricMember{a, b}, fabricDriveOpts{Vote: true, VoteDeadline: time.Minute})
+	defer cancel()
+	a.vote(0, true)
+	b.vote(0, false)
+	eventually(t, "retry", func() bool { v, _ := b.sent(); return len(v) == 1 })
+	a.vote(1, true)
+	b.vote(1, true)
+	eventually(t, "go", func() bool { v, _ := b.sent(); return len(v) == 2 })
+	ds.set(0)
+	ds.set(1)
+	if out := <-res; !out.Went || out.Attempts != 2 {
+		t.Errorf("outcome %+v, want went at attempt 2", out)
+	}
+}
+
+// A go that reached one member is delivered to the others even when the
+// deadline passes before they have it: an abort to them while the first
+// suspends would split the capture.
+func TestDriveFabric_GoIsNeverReplacedByAbort(t *testing.T) {
+	a, b := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "b"}
+	b.failVerdicts = 3 // ~3 polls (600 ms), past the 300 ms deadline
+	ds, res, cancel := startDriveOpts([]fabricMember{a, b}, fabricDriveOpts{Vote: true, VoteDeadline: 300 * time.Millisecond})
+	defer cancel()
+	a.vote(0, true)
+	b.vote(0, true)
+	eventually(t, "go to b", func() bool { v, _ := b.sent(); return len(v) == 1 })
+	for _, m := range []*fakeFabricMember{a, b} {
+		if v, _ := m.sent(); !slices.Contains(v, "0 go") || slices.Contains(v, "0 abort") {
+			t.Errorf("%s verdicts = %v, want go and no abort", m.name, v)
+		}
+	}
+	ds.set(0)
+	ds.set(1)
+	if out := <-res; !out.Went {
+		t.Errorf("outcome %+v, want went", out)
+	}
+}
+
+// A member that never answers delays a poll by one request timeout, so the
+// deadline still aborts the others.
+func TestDriveFabric_StalledMemberDoesNotHoldTheAbort(t *testing.T) {
+	saved := fabricMemberTimeout
+	fabricMemberTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { fabricMemberTimeout = saved })
+	a, b, c := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "b"}, &fakeFabricMember{name: "c"}
+	ds, res, cancel := startDriveOpts([]fabricMember{a, b, c}, fabricDriveOpts{Vote: true, VoteDeadline: 300 * time.Millisecond})
+	defer cancel()
+	a.vote(0, true)
+	b.vote(0, true)
+	c.mu.Lock()
+	c.stall = true
+	c.mu.Unlock()
+	eventually(t, "abort to a and b", func() bool {
+		va, _ := a.sent()
+		vb, _ := b.sent()
+		return slices.Contains(va, "0 abort") && slices.Contains(vb, "0 abort")
+	})
+	ds.set(0)
+	ds.set(1)
+	ds.set(2)
+	if out := <-res; out.Went {
+		t.Errorf("outcome %+v: went with a stalled member", out)
+	}
 }

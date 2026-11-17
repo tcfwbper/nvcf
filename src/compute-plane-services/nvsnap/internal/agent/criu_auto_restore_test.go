@@ -13,7 +13,9 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
@@ -141,7 +143,8 @@ func TestRecordCRIUCapture_RecordsTheTenantScope(t *testing.T) {
 			t.Fatal(err)
 		}
 		cm := checkpointstore.NewConfigMapBackend(local, fake.NewSimpleClientset(), "nvsnap-system", logrus.New())
-		a := &Agent{captureBackend: cm, kubeClient: fake.NewSimpleClientset(labelled, plain), log: logrus.New(), config: Config{NodeName: "n1"}}
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: ns}}
+		a := &Agent{captureBackend: cm, kubeClient: fake.NewSimpleClientset(labelled, plain, pod), log: logrus.New(), config: Config{NodeName: "n1"}}
 		a.recordCRIUCapture(ctx, hash, "5c0b__1", CheckpointRequest{Namespace: ns, PodName: "p"}, "img", false, log)
 		got, err := cm.Stat(ctx, hash)
 		if err != nil {
@@ -208,5 +211,57 @@ func TestRecordCRIUCapture_RecordsGPUShareMountsTheProcessDidNotUse(t *testing.T
 		if (got.SourcePodMeta["gpushare"] == "true") != tc.want {
 			t.Errorf("%s: recorded gpushare=%q, want %v", tc.name, got.SourcePodMeta["gpushare"], tc.want)
 		}
+	}
+}
+
+// A single pod's capture record keeps the process configuration the
+// webhook stamped on the pod, which a restoring pod must match.
+func TestRecordCRIUCapture_KeepsTheProcessConfig(t *testing.T) {
+	const hash = "9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f9c0f"
+	ctx, log := context.Background(), logrus.NewEntry(logrus.New())
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "fn-ns"}}
+	for name, annotations := range map[string]map[string]string{
+		"stamped":     {webhook.ProcessConfigAnnotation: "v1 inference/args=0a"},
+		"not stamped": nil,
+	} {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "fn-ns", Annotations: annotations},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "inference"}}}}
+		local, err := checkpointstore.NewLocal(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		cm := checkpointstore.NewConfigMapBackend(local, fake.NewSimpleClientset(), "nvsnap-system", logrus.New())
+		a := &Agent{captureBackend: cm, kubeClient: fake.NewSimpleClientset(ns, pod), log: logrus.New(), config: Config{NodeName: "n1"}}
+		a.recordCRIUCapture(ctx, hash, "9c0f__1", CheckpointRequest{Namespace: "fn-ns", PodName: "p", ContainerName: "inference"}, "img", false, log)
+		got, err := cm.Stat(ctx, hash)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got.SourcePodMeta[webhook.ProcessConfigMeta] != annotations[webhook.ProcessConfigAnnotation] {
+			t.Errorf("%s: recorded %q, want %q", name, got.SourcePodMeta[webhook.ProcessConfigMeta], annotations[webhook.ProcessConfigAnnotation])
+		}
+	}
+}
+
+// A pod whose configuration cannot be read leaves no record: recorded
+// without its configuration, the capture would restore into any.
+func TestRecordCRIUCapture_UnreadablePodLeavesNoRecord(t *testing.T) {
+	const hash = "7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d7e3d"
+	ctx, log := context.Background(), logrus.NewEntry(logrus.New())
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "fn-ns"}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "fn-ns", Annotations: map[string]string{webhook.ProcessConfigAnnotation: "v1 inference/args=0a"}}}
+	kc := fake.NewSimpleClientset(ns, pod)
+	kc.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver unavailable")
+	})
+	local, err := checkpointstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := checkpointstore.NewConfigMapBackend(local, fake.NewSimpleClientset(), "nvsnap-system", logrus.New())
+	a := &Agent{captureBackend: cm, kubeClient: kc, log: logrus.New(), config: Config{NodeName: "n1"}}
+	a.recordCRIUCapture(ctx, hash, "7e3d__1", CheckpointRequest{Namespace: "fn-ns", PodName: "p", ContainerName: "inference"}, "img", false, log)
+	if _, err := cm.Stat(ctx, hash); !errors.Is(err, checkpointstore.ErrNotFound) {
+		t.Errorf("capture recorded although its pod could not be read: %v", err)
 	}
 }

@@ -451,6 +451,22 @@ func (a *Agent) recordCRIUCapture(ctx context.Context, hash, checkpointID string
 			m.SourcePodMeta[webhook.ColdEntrypointMeta] = string(b)
 		}
 	}
+	pc, err := a.podProcessConfig(ctx, req.Namespace, req.PodName)
+	if err != nil {
+		log.WithError(err).Warn("CRIU capture not recorded: cannot read the pod's process configuration; pods restoring from it will start fresh")
+		return
+	}
+	if pc != "" {
+		// A pod restores from it only with the same process configuration
+		// of the checkpointed container (of every container when the
+		// request names none).
+		if req.ContainerName != "" {
+			pc = webhook.ProcessConfigOf(pc, req.ContainerName)
+		}
+		if pc != "" {
+			m.SourcePodMeta[webhook.ProcessConfigMeta] = pc
+		}
+	}
 	if req.CaptureID != "" {
 		m.SourcePodMeta[checkpointstore.InstanceCaptureMetaKey] = "true"
 	}

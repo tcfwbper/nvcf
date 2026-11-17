@@ -343,3 +343,98 @@ func TestSelfAgentURL_DerivesPort(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckpointManifest_LeavesOutNodeLocalRecords: a node's restore span
+// (restoreSpanFile) is its own record, not part of the checkpoint, so its
+// manifest does not offer it to peers.
+func TestCheckpointManifest_LeavesOutNodeLocalRecords(t *testing.T) {
+	dir := t.TempDir()
+	id, wantTotal, wantCount := makeCheckpointDir(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, id, restoreSpanFile), []byte("33039\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestAgent(t, dir)
+	router := mux.NewRouter()
+	router.HandleFunc("/v1/checkpoints/{id}/manifest", a.checkpointManifestHandler).Methods("GET")
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	m, err := getPeerManifest(t.Context(), srv.URL, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range m.Files {
+		if f.Path == restoreSpanFile {
+			t.Fatalf("manifest lists the node's own %s", restoreSpanFile)
+		}
+	}
+	if m.FileCount != wantCount || m.TotalSize != wantTotal {
+		t.Errorf("manifest = %d files, %d bytes; want %d, %d (the checkpoint's files only)", m.FileCount, m.TotalSize, wantCount, wantTotal)
+	}
+}
+
+// TestEnsureLocal_PeerFetchSkipsNodeLocalRecords: a peer on an older
+// agent still lists its restore span; the fetching node does not copy it,
+// so it is still new to the checkpoint (hasRestoreSpan false): it budgets
+// with the learned span, not the peer's, and records a sample of its own.
+func TestEnsureLocal_PeerFetchSkipsNodeLocalRecords(t *testing.T) {
+	peerDir := t.TempDir()
+	id, _, _ := makeCheckpointDir(t, peerDir)
+	if err := os.WriteFile(filepath.Join(peerDir, id, restoreSpanFile), []byte("33039\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	peer := newTestAgent(t, peerDir)
+	router := mux.NewRouter()
+	// The manifest an older agent serves: every regular file, its own
+	// restore span included.
+	router.HandleFunc("/v1/checkpoints/{id}/manifest", func(w http.ResponseWriter, _ *http.Request) {
+		type file struct {
+			Path string `json:"path"`
+			Size int64  `json:"size"`
+		}
+		var files []file
+		root := filepath.Join(peerDir, id)
+		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			rel, _ := filepath.Rel(root, p)
+			files = append(files, file{Path: filepath.ToSlash(rel), Size: info.Size()})
+			return nil
+		})
+		_ = json.NewEncoder(w).Encode(map[string]any{"checkpoint_id": id, "file_count": len(files), "files": files})
+	}).Methods("GET")
+	router.HandleFunc("/v1/checkpoints/{id}/file", peer.readCheckpointFileHandler).Methods("GET")
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	catalogURL, _ := fakeCatalog(t, []map[string]string{{"node_name": "node-A", "agent_url": srv.URL}})
+	a, dir := receiverAgent(t, catalogURL)
+	if err := a.EnsureLocal(t.Context(), id); err != nil {
+		t.Fatalf("EnsureLocal: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, id, "inventory.img")); err != nil {
+		t.Fatalf("checkpoint not fetched: %v", err)
+	}
+	if hasRestoreSpan(filepath.Join(dir, id)) {
+		t.Errorf("the fetching node copied the peer's %s: it looks restored before its first restore", restoreSpanFile)
+	}
+}
+
+func TestNodeLocalCheckpointFile(t *testing.T) {
+	for rel, want := range map[string]bool{
+		restoreSpanFile:               true,
+		"./" + restoreSpanFile:        true,
+		"inventory.img":               false,
+		"gpushare/" + restoreSpanFile: false,
+		"rootfs-diff/etc/hostname":    false,
+	} {
+		if got := nodeLocalCheckpointFile(rel); got != want {
+			t.Errorf("nodeLocalCheckpointFile(%q) = %v, want %v", rel, got, want)
+		}
+	}
+}

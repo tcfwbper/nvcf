@@ -240,7 +240,22 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// the GPU resume: every task stays stopped until the clocks are there
 	// (restore_clock_gpu.go).
 	clockThroughGPU := gs != nil && clockThroughGPUSupported(a.agentCRIUHelp(), tools.gpuToolText())
-	if clockArgs, budget := restoreClockArgs(checkpointDir, criuSupportsTimensBudget(a.agentCRIUHelp()), clockThroughGPU, group.SpanMS); clockArgs != nil {
+	// firstOnNode: this node has no restore of this checkpoint on record. Its
+	// span is then a sample of the cluster's learned spans
+	// (restore_span_learned.go), which are for exactly such restores.
+	firstOnNode := !hasRestoreSpan(checkpointDir)
+	spanMS, spanLearned := group.SpanMS, group.SpanLearned
+	if clockThroughGPU && spanMS == 0 && firstOnNode {
+		// A restore of its own, the first of this checkpoint on this node:
+		// the cluster's learned span, bounded by the estimate.
+		if gpu, members, size := checkpointShape(metadata); gpu != "" {
+			if ms, ok := a.learnedRestoreSpan(ctx, gpu, members, size); ok {
+				spanMS, spanLearned = ms, true
+				log.WithField("learnedSpanMs", ms).Info("criu-v2: no restore of this checkpoint on this node yet; budgeting the clocks with the cluster's learned span")
+			}
+		}
+	}
+	if clockArgs, budget := restoreClockArgs(checkpointDir, criuSupportsTimensBudget(a.agentCRIUHelp()), clockThroughGPU, spanMS, spanLearned); clockArgs != nil {
 		args = append(args, clockArgs...)
 		msg := "criu-v2: the restored clocks continue from the dump once the restore has taken its budget"
 		if clockThroughGPU {
@@ -387,6 +402,15 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		if err := recordRestoreSpan(checkpointDir, spent); err != nil {
 			log.WithError(err).Warn("criu-v2: cannot record the restore's length; the next one estimates its clock budget")
 		}
+		if gpu, members, size := checkpointShape(metadata); gpu != "" && firstOnNode {
+			// In the background: the rank reports restored, and its group
+			// unlocks, without waiting on the API server.
+			go func(ctx context.Context) {
+				if err := a.recordLearnedSpan(ctx, gpu, members, size, spent); err != nil {
+					log.WithError(err).Warn("criu-v2: cannot add the restore's length to the cluster's learned spans")
+				}
+			}(context.WithoutCancel(ctx))
+		}
 		log.WithFields(logrus.Fields{"tasks": n, "restoreSpan": spent.Round(time.Millisecond).String()}).
 			Info("criu-v2: the restored tasks resumed with their clocks at the dumped values; recorded the restore's length for the next one's clock budget")
 		return nil
@@ -428,6 +452,9 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		// stopping, it would leave the tree stopped without its GPU memory.
 		waited, err := gpushareResumeWithGPUsOf(context.WithoutCancel(ctx), resumePID, hostPID, gs.PIDs, gpuMap, fabricDir, holdGate, clockAt, log)
 		clockWait = waited
+		if clockThroughGPU {
+			times.add("clock_wait", waited)
+		}
 		if err != nil {
 			gsSpan.RecordError(err)
 			gsSpan.SetStatus(codes.Error, "gpushare resume failed")
@@ -475,6 +502,8 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 				return nil, err
 			}
 		}
+		// After the network unlock: ModelExpress republishes over it.
+		goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
 	} else if gs != nil {
 		if err := resumeGPU(false); err != nil {
 			return nil, err
@@ -482,6 +511,7 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		if err := continueTasks(); err != nil {
 			return nil, err
 		}
+		goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
 	}
 
 	duration := time.Since(startTime).Seconds()

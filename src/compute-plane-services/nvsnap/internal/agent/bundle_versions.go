@@ -91,6 +91,21 @@ func (a *Agent) podBundle(ctx context.Context, ns, name string) string {
 	return webhook.PodBundleID(pod)
 }
 
+// podProcessConfig is the process configuration the webhook stamped on a
+// pod at admission, "" when it has none. A pod that cannot be read is an
+// error, not "none": a capture recorded without its configuration would
+// restore into any configuration.
+func (a *Agent) podProcessConfig(ctx context.Context, ns, name string) (string, error) {
+	if a.kubeClient == nil || ns == "" || name == "" {
+		return "", nil
+	}
+	pod, err := a.kubeClient.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	return pod.Annotations[webhook.ProcessConfigAnnotation], nil
+}
+
 // podGPUShareMounted reports whether the pod's container (any container
 // when container is empty) has the gpushare library or store mounted.
 // A pod that cannot be read reports false: the record then says what the

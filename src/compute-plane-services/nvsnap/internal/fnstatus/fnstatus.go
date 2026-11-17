@@ -9,10 +9,12 @@
 package fnstatus
 
 import (
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -171,8 +173,9 @@ type Status struct {
 	History
 }
 
-// reasonMax bounds a reason in the status.
-const reasonMax = 200
+// reasonMax bounds a reason in the status. The record keeps the whole
+// reason (up to 16 KiB); the status says what failed (reasonSummary).
+const reasonMax = 300
 
 // Project returns the status of every function version the records name,
 // by object name. records are the ConfigMaps of the records' namespace;
@@ -247,7 +250,7 @@ func configuration(key string, d, c map[string]string) Configuration {
 			cfg.Method = MethodCachedir
 		}
 	}
-	cfg.Reason = truncate(firstOf(d["reason"], d["lastRestoreFailure"], d["gpushareFailure"]))
+	cfg.Reason = reasonSummary(firstOf(d["reason"], d["lastRestoreFailure"], d["gpushareFailure"]))
 	return cfg
 }
 
@@ -349,9 +352,55 @@ func firstOf(vs ...string) string {
 	return ""
 }
 
+// groupFailure is a group operation's failure: "group checkpoint s1: 2 of
+// 2 members failed: ns/pod-0: <its error>; ns/pod-1: …" (the agent's
+// membersFailed and memberFailure).
+var groupFailure = regexp.MustCompile(`^(group \S+ \S+: \d+ of \d+ members failed): ([^:]+): (.*)$`)
+
+// nextMember starts the next member's part of a group failure.
+var nextMember = regexp.MustCompile(`; [a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9.-]*: `)
+
+// toolErrorReply is a process's error reply as nvsnap-gpu-suspend prints
+// it ("pid=1152 quiesce: err busy (GPU work did not drain)"), with the
+// count the agent adds; it ends at the next clause.
+var toolErrorReply = regexp.MustCompile(`pid=\d+ [^:|;]+: err .*?(?: \(\d+ times\))?(?: \(command:| \| |; |$)`)
+
+// reasonSummary is the record's reason as the status shows it, at most
+// reasonMax bytes. A long group failure keeps its count, its first
+// member's name and that member's cause: a process's error reply when the
+// GPU tool printed one, else the start of the member's error. The first
+// 200 bytes of such a reason used to hold the count, the pod's name and
+// "500 Internal Server Error: checkpoint fail" and nothing of why.
+func reasonSummary(s string) string {
+	if len(s) <= reasonMax {
+		return s
+	}
+	// A member's error can hold a tool's output lines; the patterns match
+	// within one line.
+	m := groupFailure.FindStringSubmatch(strings.ReplaceAll(s, "\n", " "))
+	if m == nil {
+		return truncate(s)
+	}
+	member := m[3]
+	if loc := nextMember.FindStringIndex(member); loc != nil {
+		member = member[:loc[0]]
+	}
+	// The member's agent answered its driver with an HTTP error.
+	cause := strings.TrimPrefix(member, "500 Internal Server Error: ")
+	if r := toolErrorReply.FindString(member); r != "" {
+		cause = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(r, " (command:"), " | "), "; "))
+	}
+	return truncate(m[1] + "; " + m[2] + ": " + cause)
+}
+
+// truncate bounds s to reasonMax bytes, cutting at a rune boundary.
 func truncate(s string) string {
 	if len(s) <= reasonMax {
 		return s
 	}
-	return s[:reasonMax]
+	i := reasonMax
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i]
 }

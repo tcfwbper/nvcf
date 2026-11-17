@@ -21,7 +21,11 @@ package agent
 //
 // A local captured address is unsafe when another pod uses it: guards skip
 // it when it is a new address of the restored instance or the address of a
-// pod in the cluster, and the restore continues as without the switch.
+// pod in the cluster, and the restore continues as without the switch. A pod
+// given the captured address after the restore (the VPC CNI hands a freed
+// address to the next pod quickly) still reaches the restored pod: the
+// connections it opens are answered through the pod's interface, not
+// delivered to the local alias (holderReturnSteps).
 
 import (
 	"context"
@@ -54,6 +58,16 @@ const (
 	capturedAddrMangleClaimed = capturedAddrChainPrefix + "-CLAIM"
 	capturedAddrNATIn         = capturedAddrChainPrefix + "-IN"
 	capturedAddrNATOut        = capturedAddrChainPrefix + "-OUT"
+	// capturedAddrHolderMark marks the connections that the pod holding the
+	// captured address opened to the restored pod, and their replies.
+	capturedAddrHolderMark  = "0x20000000/0x20000000"
+	capturedAddrMangleHold  = capturedAddrChainPrefix + "-HOLDER"
+	capturedAddrMangleReply = capturedAddrChainPrefix + "-REPLY"
+	// capturedAddrHolderPref is the rule that routes those replies by the
+	// main table; capturedAddrLocalPref is where the local table moves to,
+	// after it, from 0.
+	capturedAddrHolderPref = "100"
+	capturedAddrLocalPref  = "150"
 )
 
 // capturedAddressPlan is what a restore does with the captured address: apply
@@ -165,7 +179,71 @@ func capturedAddressRules(p capturedAddressPlan) (string, []iptablesStep) {
 	// captured.
 	chain("nat", capturedAddrNATOut, "POSTROUTING",
 		[]string{"-s", captured + host, "!", "-o", "lo", "-j", "SNAT", "--to-source", pod})
+	if p.captured.To4() != nil {
+		// A packet from the captured address that did not come over the
+		// loopback is from the pod that holds that address now: mark its
+		// connection, and the connection's replies, for holderReturnSteps.
+		chain("mangle", capturedAddrMangleHold, "PREROUTING",
+			[]string{"-s", captured + host, "!", "-i", "lo", "-j", "CONNMARK", "--set-xmark", capturedAddrHolderMark})
+		chain("mangle", capturedAddrMangleReply, "OUTPUT",
+			[]string{"-m", "connmark", "--mark", capturedAddrHolderMark, "-j", "MARK", "--set-xmark", capturedAddrHolderMark})
+	}
 	return tool, steps
+}
+
+// nsStep is one command run in the restored pod's network namespace; a
+// tolerant step may fail only because its rule is not there to delete
+// (errNoSuchRule's text).
+// Each deletes only the rule it names in full, never another rule at the
+// same preference.
+type nsStep struct {
+	argv     []string
+	tolerant bool
+}
+
+// holderReturnSteps let the pod that holds the captured address now reach
+// the restored pod (IPv4; nil for IPv6). Its packets arrive with a source
+// that is local here, and the replies would go to the local alias:
+//
+//   - accept_local takes a packet whose source is a local address, and loose
+//     reverse-path filtering (rp_filter 2; pods start strict, 1, and the
+//     kernel uses the larger of all and the interface) lets it in on the
+//     pod's interface;
+//   - the replies of the connections marked by capturedAddressRules are
+//     routed by the main table, ahead of the local table, which moves from
+//     preference 0 to after that rule.
+//
+// Connections the restored pod opens to the captured address stay local: it
+// cannot tell its own address from the holder's.
+func holderReturnSteps(p capturedAddressPlan) []nsStep {
+	if p.captured.To4() == nil {
+		return nil
+	}
+	return []nsStep{
+		{argv: []string{"sysctl", "-w", "net.ipv4.conf.all.accept_local=1"}},
+		{argv: []string{"sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"}},
+		{argv: []string{"ip", "rule", "del", "pref", capturedAddrHolderPref, "fwmark", capturedAddrHolderMark, "lookup", "main"}, tolerant: true},
+		{argv: []string{"ip", "rule", "add", "pref", capturedAddrHolderPref, "fwmark", capturedAddrHolderMark, "lookup", "main"}},
+		{argv: []string{"ip", "rule", "del", "pref", capturedAddrLocalPref, "lookup", "local"}, tolerant: true},
+		{argv: []string{"ip", "rule", "add", "pref", capturedAddrLocalPref, "lookup", "local"}},
+		{argv: []string{"ip", "rule", "del", "pref", "0", "lookup", "local"}, tolerant: true},
+	}
+}
+
+// errNoSuchRule is what ip prints when it deletes a rule that is not there.
+const errNoSuchRule = "No such file or directory"
+
+// applyHolderReturn runs holderReturnSteps in the network namespace of host
+// pid pid.
+func applyHolderReturn(pid int, p capturedAddressPlan, d capturedAddressDeps) error {
+	for _, s := range holderReturnSteps(p) {
+		err := d.ns(pid, s.argv...)
+		if err == nil || (s.tolerant && strings.Contains(err.Error(), errNoSuchRule)) {
+			continue
+		}
+		return fmt.Errorf("%s: %w", strings.Join(s.argv, " "), err)
+	}
+	return nil
 }
 
 // runIptablesSteps runs steps with tool through run.
@@ -185,11 +263,12 @@ func runIptablesSteps(tool string, steps []iptablesStep, run func(tool string, a
 type capturedAddressDeps struct {
 	alias func(pid int, ip string) error
 	run   func(pid int, tool string, args ...string) error
+	ns    func(pid int, argv ...string) error
 }
 
 // capturedAddressApply is what restoreCapturedAddress applies a plan with;
 // tests replace it.
-var capturedAddressApply = capturedAddressDeps{alias: addSourcePodIPToPlaceholderLo, run: nsenterIptables}
+var capturedAddressApply = capturedAddressDeps{alias: addSourcePodIPToPlaceholderLo, run: nsenterIptables, ns: nsenterRun}
 
 // applyCapturedAddress makes the plan's captured address local in the network
 // namespace of host pid pid and installs its edge translation.
@@ -215,6 +294,18 @@ func nsenterIptables(pid int, tool string, args ...string) error {
 	defer cancel()
 	netns := "--net=" + hostProcBase() + "/" + strconv.Itoa(pid) + "/ns/net"
 	out, err := exec.CommandContext(ctx, "nsenter", append([]string{netns, "--", tool, "-w"}, args...)...).CombinedOutput() //nolint:gosec // fixed tool; addresses parsed as IPs
+	if err != nil {
+		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// nsenterRun runs argv in the network namespace of host pid pid.
+func nsenterRun(pid int, argv ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), iptablesStepTimeout)
+	defer cancel()
+	netns := "--net=" + hostProcBase() + "/" + strconv.Itoa(pid) + "/ns/net"
+	out, err := exec.CommandContext(ctx, "nsenter", append([]string{netns, "--"}, argv...)...).CombinedOutput() //nolint:gosec // fixed commands; addresses parsed as IPs
 	if err != nil {
 		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(out)))
 	}
@@ -277,6 +368,9 @@ func (a *Agent) restoreCapturedAddress(ctx context.Context, pid int, placeholder
 			log.WithError(err).Warn("CRIU restore: cannot give the restored pod its captured address; sockets opened after the restore cannot use it")
 		} else {
 			log.Info("CRIU restore: the restored pod keeps its captured address, translated to its pod address at its edge")
+			if err := applyHolderReturn(pid, p, capturedAddressApply); err != nil {
+				log.WithError(err).Warn("CRIU restore: a pod given the captured address later cannot reach the restored pod by its pod address")
+			}
 		}
 	} else if p.result != capturedAddrUnchanged {
 		log.WithField("reason", p.reason).Warn("CRIU restore: the captured address stays off the restored pod; sockets opened after the restore cannot use it")

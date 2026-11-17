@@ -63,14 +63,14 @@ func TestRestoreClockArgs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, restoreClockFile), []byte("4000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if args, _ := restoreClockArgs(dir, false, true, 0); args != nil {
+	if args, _ := restoreClockArgs(dir, false, true, 0, false); args != nil {
 		t.Errorf("without --timens-budget: %v", args)
 	}
-	args, b := restoreClockArgs(dir, true, false, 0)
+	args, b := restoreClockArgs(dir, true, false, 0, false)
 	if b != 5*time.Second+restoreClockSlack || strings.Join(args, " ") != "--timens-budget "+strconv.FormatInt(b.Milliseconds(), 10) {
 		t.Errorf("CRIU only: %v %s", args, b)
 	}
-	args, b = restoreClockArgs(dir, true, true, 0)
+	args, b = restoreClockArgs(dir, true, true, 0, false)
 	want := "--timens-budget " + strconv.FormatInt(b.Milliseconds(), 10) + " --leave-stopped --timens-no-wait"
 	if b != 88*time.Second+restoreClockSlack || strings.Join(args, " ") != want {
 		t.Errorf("through the GPU reload: %v %s, want %q", args, b, want)
@@ -254,24 +254,35 @@ func TestGroupRestoreSpanBudget(t *testing.T) {
 	if err := recordRestoreSpan(dir, 40*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := groupSpanBudget(dir, 0), 44*time.Second+restoreClockSlack; got != want {
+	if got, want := groupSpanBudget(dir, 0, false), 44*time.Second+restoreClockSlack; got != want {
 		t.Errorf("not a group: %s, want this node's record %s", got, want)
 	}
-	if got, want := groupSpanBudget(dir, 100_000), 110*time.Second+restoreClockSlack; got != want {
+	if got, want := groupSpanBudget(dir, 100_000, false), 110*time.Second+restoreClockSlack; got != want {
 		t.Errorf("group span: %s, want %s", got, want)
 	}
-	if got := groupSpanBudget(dir, groupSpanUnknown); got != estimate {
+	if got := groupSpanBudget(dir, groupSpanUnknown, false); got != estimate {
 		t.Errorf("a rank without a record: %s, want every rank on the estimate %s", got, estimate)
 	}
-	if got := groupSpanBudget(dir, int64(10*time.Hour/time.Millisecond)); got != restoreClockMax {
+	if got := groupSpanBudget(dir, int64(10*time.Hour/time.Millisecond), false); got != restoreClockMax {
 		t.Errorf("group span past the bound: %s", got)
 	}
-	_, b := restoreClockArgs(dir, true, true, 100_000)
+	_, b := restoreClockArgs(dir, true, true, 100_000, false)
 	if b != 110*time.Second+restoreClockSlack {
 		t.Errorf("restoreClockArgs ignores the group span: %s", b)
 	}
-	if _, b := restoreClockArgs(dir, true, false, 100_000); b == 110*time.Second+restoreClockSlack {
+	if _, b := restoreClockArgs(dir, true, false, 100_000, false); b == 110*time.Second+restoreClockSlack {
 		t.Errorf("CRIU-only budget took the group's GPU span")
+	}
+	// A learned span, another checkpoint's, only shortens the wait: never
+	// past this checkpoint's estimate.
+	if got := groupSpanBudget(dir, 100_000, true); got != estimate {
+		t.Errorf("learned span past the estimate: %s, want the estimate %s", got, estimate)
+	}
+	if got, want := groupSpanBudget(dir, 10_000, true), 11*time.Second+restoreClockSlack; got != want {
+		t.Errorf("learned span under the estimate: %s, want %s", got, want)
+	}
+	if _, b := restoreClockArgs(dir, true, true, 100_000, true); b != estimate {
+		t.Errorf("restoreClockArgs does not bound a learned span: %s", b)
 	}
 }
 

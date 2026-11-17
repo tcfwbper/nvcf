@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -145,18 +146,132 @@ func TestRunIptablesStepsIsIdempotent(t *testing.T) {
 			t.Fatalf("run %d: %v", i, err)
 		}
 	}
-	for hook, jumps := range f.jumps {
-		if len(jumps) != 1 {
-			t.Errorf("%s: jumps %v, want one", hook, jumps)
+	jumps := 0
+	for hook, js := range f.jumps {
+		if len(slices.Compact(slices.Sorted(slices.Values(js)))) != len(js) {
+			t.Errorf("%s: jumps %v, a chain jumped to twice", hook, js)
 		}
+		jumps += len(js)
 	}
 	for chain, rules := range f.chains {
 		if len(rules) != 1 {
 			t.Errorf("%s: rules %v, want one", chain, rules)
 		}
 	}
-	if len(f.jumps) != 3 || len(f.chains) != 3 {
+	if jumps != 5 || len(f.chains) != 5 {
 		t.Errorf("jumps %v chains %v", f.jumps, f.chains)
+	}
+}
+
+// The connections the pod holding the captured address opens are marked
+// (their conntrack entry, not the packet: the packet's own route must stay
+// local) when they arrive off the loopback, and their replies carry the mark.
+// IPv6 gets neither.
+func TestCapturedAddressRulesMarkTheHolder(t *testing.T) {
+	f := &fakeIptables{chains: map[string][]string{}, jumps: map[string][]string{}}
+	tool, steps := capturedAddressRules(planCapturedAddress("10.1.0.5", "10.1.9.9", nil, nil))
+	if err := runIptablesSteps(tool, steps, f.run); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.chains["mangle/"+capturedAddrMangleHold], []string{"-s 10.1.0.5/32 ! -i lo -j CONNMARK --set-xmark " + capturedAddrHolderMark}; !slices.Equal(got, want) {
+		t.Errorf("holder chain %v, want %v", got, want)
+	}
+	if got, want := f.chains["mangle/"+capturedAddrMangleReply], []string{"-m connmark --mark " + capturedAddrHolderMark + " -j MARK --set-xmark " + capturedAddrHolderMark}; !slices.Equal(got, want) {
+		t.Errorf("reply chain %v, want %v", got, want)
+	}
+	if !slices.Equal(f.jumps["mangle/PREROUTING"], []string{capturedAddrMangleHold, capturedAddrMangleClaimed}) && !slices.Equal(f.jumps["mangle/PREROUTING"], []string{capturedAddrMangleClaimed, capturedAddrMangleHold}) {
+		t.Errorf("PREROUTING jumps %v", f.jumps["mangle/PREROUTING"])
+	}
+	if !slices.Equal(f.jumps["mangle/OUTPUT"], []string{capturedAddrMangleReply}) {
+		t.Errorf("OUTPUT jumps %v", f.jumps["mangle/OUTPUT"])
+	}
+	f6 := &fakeIptables{chains: map[string][]string{}, jumps: map[string][]string{}}
+	tool, steps = capturedAddressRules(planCapturedAddress("fd00::5", "fd00::9", nil, nil))
+	if err := runIptablesSteps(tool, steps, f6.run); err != nil {
+		t.Fatal(err)
+	}
+	if len(f6.chains) != 3 {
+		t.Errorf("IPv6 chains %v, want the three edge chains", f6.chains)
+	}
+}
+
+// fakeRules keeps a namespace's ip rules ("pref selector") and its sysctls.
+type fakeRules struct {
+	rules   []string
+	sysctls map[string]string
+	fail    string
+}
+
+func (f *fakeRules) ns(_ int, argv ...string) error {
+	cmd := strings.Join(argv, " ")
+	if f.fail != "" && strings.Contains(cmd, f.fail) {
+		return errors.New("RTNETLINK answers: Operation not permitted")
+	}
+	switch {
+	case argv[0] == "sysctl":
+		k, v, _ := strings.Cut(argv[2], "=")
+		f.sysctls[k] = v
+	case argv[1] == "rule" && argv[2] == "add":
+		f.rules = append(f.rules, argv[4]+" "+strings.Join(argv[5:], " "))
+	case argv[1] == "rule" && argv[2] == "del":
+		want := argv[4] + " " + strings.Join(argv[5:], " ")
+		i := slices.Index(f.rules, want)
+		if i < 0 {
+			return errors.New("RTNETLINK answers: " + errNoSuchRule)
+		}
+		f.rules = slices.Delete(f.rules, i, i+1)
+	}
+	return nil
+}
+
+// ordered returns the rules as the kernel reads them: by preference.
+func (f *fakeRules) ordered() []string {
+	out := slices.Clone(f.rules)
+	slices.SortStableFunc(out, func(a, b string) int {
+		pa, _ := strconv.Atoi(strings.Fields(a)[0])
+		pb, _ := strconv.Atoi(strings.Fields(b)[0])
+		return pa - pb
+	})
+	return out
+}
+
+// After the holder steps the marked replies are routed by the main table
+// before the local table, which no longer comes first; reverse-path
+// filtering is loose and a local source accepted. Running them again (a
+// retried restore) leaves the same rules, and a rule another component put
+// at the same preference stays.
+func TestApplyHolderReturn(t *testing.T) {
+	f := &fakeRules{rules: []string{"0 lookup local", "100 from 10.9.0.0/16 lookup 7", "32766 lookup main", "32767 lookup default"}, sysctls: map[string]string{}}
+	d := capturedAddressDeps{ns: f.ns}
+	p := planCapturedAddress("10.1.0.5", "10.1.9.9", nil, nil)
+	for i := 0; i < 2; i++ {
+		if err := applyHolderReturn(42, p, d); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	want := []string{
+		"100 from 10.9.0.0/16 lookup 7",
+		"100 fwmark " + capturedAddrHolderMark + " lookup main",
+		"150 lookup local",
+		"32766 lookup main",
+		"32767 lookup default",
+	}
+	if got := f.ordered(); !slices.Equal(got, want) {
+		t.Errorf("rules %v, want %v", got, want)
+	}
+	if f.sysctls["net.ipv4.conf.all.accept_local"] != "1" || f.sysctls["net.ipv4.conf.all.rp_filter"] != "2" {
+		t.Errorf("sysctls %v", f.sysctls)
+	}
+	// A failure other than a missing rule is reported, even on a tolerant
+	// delete.
+	f2 := &fakeRules{rules: []string{"0 lookup local"}, sysctls: map[string]string{}, fail: "del pref 0"}
+	if err := applyHolderReturn(42, p, capturedAddressDeps{ns: f2.ns}); err == nil {
+		t.Error("a failed move of the local table was not reported")
+	}
+	// IPv6: nothing runs.
+	f3 := &fakeRules{sysctls: map[string]string{}}
+	if err := applyHolderReturn(42, planCapturedAddress("fd00::5", "fd00::9", nil, nil), capturedAddressDeps{ns: f3.ns}); err != nil || len(f3.rules) != 0 || len(f3.sysctls) != 0 {
+		t.Errorf("IPv6: err %v rules %v sysctls %v", err, f3.rules, f3.sysctls)
 	}
 }
 
@@ -293,7 +408,7 @@ func TestRestoreCapturedAddress(t *testing.T) {
 	log.Logger.SetOutput(io.Discard)
 	saved := capturedAddressApply
 	t.Cleanup(func() { capturedAddressApply = saved })
-	applied := 0
+	applied, holder := 0, 0
 	capturedAddressApply = capturedAddressDeps{
 		alias: func(int, string) error { applied++; return nil },
 		run: func(_ int, _ string, args ...string) error {
@@ -302,11 +417,18 @@ func TestRestoreCapturedAddress(t *testing.T) {
 			}
 			return nil
 		},
+		ns: func(int, ...string) error { holder++; return nil },
 	}
 	a := &Agent{kubeClient: fake.NewSimpleClientset(pod("other", "web-0", "10.1.0.7", nil))}
-	if !a.restoreCapturedAddress(context.Background(), 1, "fn/p-0", "10.1.0.5", "10.1.9.9", "", log) || applied != 1 {
-		t.Fatalf("not applied (%d)", applied)
+	if !a.restoreCapturedAddress(context.Background(), 1, "fn/p-0", "10.1.0.5", "10.1.9.9", "", log) || applied != 1 || holder == 0 {
+		t.Fatalf("not applied (%d, holder steps %d)", applied, holder)
 	}
+	// The holder steps failing leaves the captured address applied.
+	capturedAddressApply.ns = func(int, ...string) error { return errors.New("EPERM") }
+	if !a.restoreCapturedAddress(context.Background(), 1, "fn/p-0", "10.1.0.5", "10.1.9.9", "", log) || applied != 2 {
+		t.Fatal("a failed holder step undid the captured address")
+	}
+	applied = 1
 	if a.restoreCapturedAddress(context.Background(), 1, "fn/p-0", "10.1.0.7", "10.1.9.9", "", log) || applied != 1 {
 		t.Fatal("applied an address another pod holds")
 	}
@@ -336,6 +458,7 @@ func TestRestoreSourceAddress(t *testing.T) {
 			}
 			return nil
 		},
+		ns: func(int, ...string) error { return nil },
 	}
 	kc := fake.NewSimpleClientset(
 		pod("fn", "p-0", "10.1.9.9", nil),      // the placeholder

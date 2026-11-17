@@ -215,7 +215,10 @@ func (a *Agent) EnsureLocal(ctx context.Context, checkpointID string) (retErr er
 		if stillWriting {
 			return
 		}
-		if err := endLocalFetch(a.config.CheckpointDir, checkpointID, fetched); err != nil {
+		switch err := endLocalFetch(a.config.CheckpointDir, checkpointID, fetched); {
+		case errors.Is(err, errSourceSpanKept):
+			a.log.WithError(err).WithField("checkpoint_id", checkpointID).Warn("EnsureLocal: fetched, but this node budgets its restore with the source node's span and records no learned span")
+		case err != nil:
 			a.log.WithError(err).WithField("checkpoint_id", checkpointID).Error("EnsureLocal: cannot mark the fetch done; the next restore fetches again")
 		}
 	}()
@@ -492,6 +495,10 @@ func (a *Agent) fetchFromPeer(ctx context.Context, peerURL string, alternateURLs
 	}
 	tasks := make(chan fetchTask, len(m.Files))
 	for _, f := range m.Files {
+		// An older peer still lists its own node's records.
+		if nodeLocalCheckpointFile(f.Path) {
+			continue
+		}
 		tasks <- fetchTask{path: f.Path, size: f.Size}
 	}
 	close(tasks)

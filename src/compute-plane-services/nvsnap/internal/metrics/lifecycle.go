@@ -108,8 +108,9 @@ var (
 	}, []string{"method", "outcome", "reason", "gpu", "ranks"})
 
 	// RestorePhaseSeconds is the time a restore spent in a phase: per rank
-	// "criu", "gpu" (GPU state reload and resume) and "rank" (the node's
-	// whole restore); per instance
+	// "criu", "gpu" (GPU state reload and resume), "clock_wait" (the part of
+	// "gpu" spent waiting for the restored clocks to reach the dump) and
+	// "rank" (the node's whole restore); per instance
 	// "group" (placeholders running to every rank restored) and "ready"
 	// (restored to the pod Ready).
 	RestorePhaseSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{

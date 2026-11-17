@@ -102,7 +102,10 @@ What is measured:
   webhook admitted count, and only those that became Ready while the agent
   watched (an agent restart does not count running pods again).
 - **Restore phases**: per rank, on its node: `criu`, `gpu` (GPU state reload
-  and resume), `rank` (the node's whole restore). Per instance: `group`
+  and resume), `clock_wait` (the part of `gpu` the rank waited for its
+  clocks to reach the dump: a budget larger than the restore,
+  [design](../design/RESTORE-CLOCK-GPU-RELOAD.md)), `rank` (the node's whole
+  restore). Per instance: `group`
   (placeholders running to every rank restored) and `ready` (restored to the
   pod Ready).
 - **Restore outcomes**: `restored`, `failed` (ran and failed), `not-run`
@@ -161,7 +164,8 @@ What is measured:
   nodes' drivers keep CRIU off, a pod of any configuration counted,
   [CRIU-CAPTURE-FALLBACK.md](../design/CRIU-CAPTURE-FALLBACK.md#28-gpu-drivers-criu-cannot-serve-on)) or `cold` (reason:
   `size-mismatch`, `not-restorable-as-group`, `checkpoint-blocked`,
-  `own-instance`, `prepare-failed`, `model-unavailable`). A pod of a
+  `own-instance`, `config-changed`: the pod's process configuration differs
+  from its checkpoint's, `prepare-failed`, `model-unavailable`). A pod of a
   configuration with no capture is not counted. The agents add `missed`:
   a rank of an instance the webhook never mutated (reason `not-admitted`:
   the API server admitted it unchanged, as its failure policy lets it when

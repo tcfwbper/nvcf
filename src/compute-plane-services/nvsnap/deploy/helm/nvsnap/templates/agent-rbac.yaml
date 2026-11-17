@@ -59,16 +59,25 @@ rules:
   - apiGroups: [""]
     resources: ["pods/status"]
     verbs: ["patch"]
+  # pods/log (get): the end of a GPU container's failed run's log, logged
+  # by the agent before it replaces a pod that did not start under the GPU
+  # library (internal/agent/gpushare_evidence.go); kept in the agent's log
+  # only.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   # configmaps (patch): the function identity labels on capture records
   # (internal/agent/record_identity.go).
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # events (create, patch): what a pod's restore or start did, on the pod
-  # (internal/agent/lifecycle_metrics.go).
+  # (internal/agent/lifecycle_metrics.go). (list): why the kubelet killed
+  # a GPU container that failed to start under the GPU library, recorded
+  # with its failure (internal/agent/criu_fallback.go kubeletKill).
   - apiGroups: [""]
     resources: ["events"]
-    verbs: ["create", "patch"]
+    verbs: ["create", "patch", "list"]
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]

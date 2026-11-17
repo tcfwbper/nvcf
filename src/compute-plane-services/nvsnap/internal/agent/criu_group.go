@@ -137,6 +137,44 @@ func verifyNamespace(d map[string]string) string {
 	return ""
 }
 
+// recordRank writes what GPU rank i's restore needs besides its checkpoint
+// into a group record: the container it was taken from, what the runtime
+// ran ahead of the pod's args, and the process configuration its pod was
+// admitted with, which a pod restoring the rank must match
+// (webhook/process_config.go). members is the size of the group.
+func recordRank(data map[string]string, i int, pod *corev1.Pod, entrypoint string, members int) {
+	ctr := gpuContainer(pod)
+	data[fmt.Sprintf("container.%d", i)] = ctr
+	if entrypoint != "" {
+		data[fmt.Sprintf("coldEntrypoint.%d", i)] = entrypoint
+	}
+	recordProcessConfig(data, i, pod, ctr, members)
+}
+
+// recordProcessConfig keeps member i's process configuration, its
+// checkpointed container's part of what the webhook stamped on its pod, in
+// a group record. Together the members' take at most
+// processConfigRecordBudget of the record; one that does not fit its share
+// is kept as one digest. A pod without a stamp (admitted before it was
+// stamped) records none, and its restores go on unchecked.
+func recordProcessConfig(data map[string]string, i int, pod *corev1.Pod, container string, members int) {
+	pc := webhook.ProcessConfigOf(pod.Annotations[webhook.ProcessConfigAnnotation], container)
+	if pc == "" {
+		return
+	}
+	if len(pc) > processConfigRecordBudget/max(members, 1) {
+		pc = webhook.CompactProcessConfig(pc)
+	}
+	data[fmt.Sprintf("processConfig.%d", i)] = pc
+}
+
+// processConfigRecordBudget bounds the room the members' process
+// configurations take in a group record, a ConfigMap of at most 1 MiB that
+// also holds the members' failures (groupReasonMax). A Dynamo worker's is
+// about 4 to 8 KiB: whole for up to 32 members or so, one digest each
+// beyond.
+const processConfigRecordBudget = 256 << 10
+
 // parseCRIUGroup reads a complete group record.
 func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool) {
 	if !recordUsable(data) {
@@ -150,7 +188,8 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 		return webhook.CRIUGroup{}, false
 	}
 	g := webhook.CRIUGroup{Key: key, GPUShare: data["gpushare"] == "true", VerifyNamespace: verifyNamespace(data),
-		Checkpoints: make([]string, size), Nodes: make([]string, size), Companion: make([]bool, size), Containers: make([]string, size), Bundles: make([]string, size), ColdEntrypoints: make([]string, size)}
+		Checkpoints: make([]string, size), Nodes: make([]string, size), Companion: make([]bool, size), Containers: make([]string, size), Bundles: make([]string, size), ColdEntrypoints: make([]string, size),
+		ProcessConfigs: make([]string, size)}
 	for i := range size {
 		g.Checkpoints[i] = data[fmt.Sprintf("checkpoint.%d", i)]
 		if g.Checkpoints[i] == "" {
@@ -161,6 +200,7 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 		g.Containers[i] = data[fmt.Sprintf("container.%d", i)]
 		g.Bundles[i] = data[fmt.Sprintf("bundle.%d", i)]
 		g.ColdEntrypoints[i] = data[fmt.Sprintf("coldEntrypoint.%d", i)]
+		g.ProcessConfigs[i] = data[fmt.Sprintf("processConfig.%d", i)]
 	}
 	return g, true
 }
@@ -700,11 +740,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 			if i >= len(ranks) {
 				data[fmt.Sprintf("companion.%d", i)] = "true"
 				data[fmt.Sprintf("container.%d", i)] = companionContainers[members[i].Name]
+				recordProcessConfig(data, i, members[i], companionContainers[members[i].Name], len(members))
 			} else {
-				data[fmt.Sprintf("container.%d", i)] = gpuContainer(members[i])
-				if entrypoints[i] != "" {
-					data[fmt.Sprintf("coldEntrypoint.%d", i)] = entrypoints[i]
-				}
+				recordRank(data, i, members[i], entrypoints[i], len(members))
 			}
 		}
 		if c.a.gpushareEnabledFor(ranks[0]) {

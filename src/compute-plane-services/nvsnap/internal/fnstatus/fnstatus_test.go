@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -152,5 +153,42 @@ func TestProject_ReasonBounded(t *testing.T) {
 	s := Project([]corev1.ConfigMap{record(GroupRecordPrefix+"a", v1, map[string]string{"state": StateFailed, "reason": strings.Repeat("x", 500)})})["v1"]
 	if len(s.Reason) != reasonMax {
 		t.Errorf("reason is %d bytes, want %d", len(s.Reason), reasonMax)
+	}
+}
+
+// TestReasonSummary_SaysWhatFailed: a long group failure keeps its count,
+// its first member and that member's cause, not just the start of the
+// member's HTTP error.
+func TestReasonSummary_SaysWhatFailed(t *testing.T) {
+	member := func(pod, cause string) string {
+		return "ns/" + pod + ": 500 Internal Server Error: checkpoint failed: CRIU dump failed (criu-v2): gpushare suspend: " + cause
+	}
+	busy := "nvsnap-gpu-suspend suspend: exit status 1: pid=1152 quiesce: err busy (GPU work did not drain) (480 times) (command: nvsnap-gpu-suspend --timeout-ms 120000 suspend 1 934 1150 1152; output: pid=1156 resume: ok resumed)"
+	cases := map[string]struct{ in, want string }{
+		"gpu tool reply": {
+			"group checkpoint s1: 2 of 2 members failed: " + member("rank-0", busy) + "; " + member("rank-1", busy),
+			"group checkpoint s1: 2 of 2 members failed; ns/rank-0: pid=1152 quiesce: err busy (GPU work did not drain) (480 times)",
+		},
+		"older record, reply between output lines": {
+			"group checkpoint s1: 2 of 2 members failed: " + member("rank-0", "nvsnap-gpu-suspend --timeout-ms 120000 suspend 1 934 11 … d (0 multicast) | pid=1150 quiesce: ok quiesced | pid=1152 quiesce: err busy (GPU work did not drain) | pid=1150 resume: ok resumed "+strings.Repeat("x", 300)) + "; " + member("rank-1", "x"),
+			"group checkpoint s1: 2 of 2 members failed; ns/rank-0: pid=1152 quiesce: err busy (GPU work did not drain)",
+		},
+		"no tool reply": {
+			"group restore s2: 6 of 6 members failed: ns/ldr-0: 500 Internal Server Error: restore failed: failed to find placeholder container: ListContainers: rpc error: code = Unavailable desc = connection error; ns/wkr-0: " + strings.Repeat("y", 300),
+			"group restore s2: 6 of 6 members failed; ns/ldr-0: restore failed: failed to find placeholder container: ListContainers: rpc error: code = Unavailable desc = connection error",
+		},
+		"short": {"preflight: MPTCP socket", "preflight: MPTCP socket"},
+		"member error with newlines": {
+			"group checkpoint s1: 2 of 2 members failed: " + member("rank-0", "nvsnap-gpu-suspend suspend: exit status 1: pid=7 load: err out of memory\n(command: x)\n"+strings.Repeat("z", 300)) + "; " + member("rank-1", "x"),
+			"group checkpoint s1: 2 of 2 members failed; ns/rank-0: pid=7 load: err out of memory",
+		},
+	}
+	for name, c := range cases {
+		if got := reasonSummary(c.in); got != c.want {
+			t.Errorf("%s:\n got %q\nwant %q", name, got, c.want)
+		}
+	}
+	if got := reasonSummary("group checkpoint s1: 1 of 1 members failed: ns/p: " + strings.Repeat("é", 400)); len(got) > reasonMax || !utf8.ValidString(got) {
+		t.Errorf("summary is %d bytes (valid UTF-8 %v), want at most %d and valid", len(got), utf8.ValidString(got), reasonMax)
 	}
 }

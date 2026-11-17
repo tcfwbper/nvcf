@@ -10,6 +10,7 @@ package agent
 // failureLogsKept of them.
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -25,6 +26,19 @@ const (
 	// failureLogMax bounds one kept log file.
 	failureLogMax = 64 << 20
 )
+
+// writeToolOutput writes the whole output of the nvsnap-gpu-suspend run
+// that failed the capture (a toolError in err) into dir, as
+// nvsnap-gpu-suspend-<command>.log, for keepFailureLogs to keep: the error
+// carries only what failed and the output's last lines.
+func writeToolOutput(dir string, err error) {
+	var te *toolError
+	if !errors.As(err, &te) || te.out == "" {
+		return
+	}
+	name := gpushareToolName + "-" + toolVerb(te.args) + ".log"
+	_ = os.WriteFile(filepath.Join(dir, filepath.Base(name)), []byte(te.out), 0o644) //nolint:gosec // dir is the capture's own directory
+}
 
 // keepFailureLogs copies the *.log files of the failed capture in dir into
 // root's failed-logs directory and drops the oldest beyond

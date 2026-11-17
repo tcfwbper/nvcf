@@ -102,9 +102,13 @@ The agent on each node watches its GPU pods that carry the library. When a pod's
 failure (non-zero exit or a signal) twice and the agent has not seen the pod Ready, it:
 
 1. records `state=gpushare-failed` on the configuration's group record, with the bundle version and the last
-   termination (reason, exit code), creating the record if needed. A usable record (a complete CRIU capture) is left
-   alone;
-2. deletes the pod (UID precondition), so its replacement is admitted again and gets 2.2. A pod no controller
+   termination (reason, exit code, the container's termination message, and for a SIGKILL that was not an OOM
+   kill the kubelet's account from the pod's events, such as a failed liveness probe), creating the record if needed. A usable record (a complete CRIU capture) is left
+   alone. The mark keeps `gpushareEvidence` too: the last termination with its times, the container's probes and
+   grace period, and the pod's last 20 events, within 16 KiB (`gpushare_evidence.go`);
+2. before it deletes the pod, logs the end of the failed run's log (200 lines, 16 KiB) in its own log, never on the
+   record: it is the workload's output;
+3. deletes the pod (UID precondition), so its replacement is admitted again and gets 2.2. A pod no controller
    recreates is left as it is; its configuration's next pods still get 2.2.
 
 - A workload that fails for its own reason is also marked. When a pod of a marked configuration, admitted without the

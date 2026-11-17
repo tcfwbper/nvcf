@@ -50,8 +50,9 @@ A local captured IP (the loopback alias) satisfies 1 to 3 but not 4:
 
 - If it is another member's new IP, the alias delivers that member's traffic locally.
 - If it is (or becomes) an unrelated pod's IP, packets that pod sends straight to the restored pod's IP arrive with a
-  local source and are dropped. Traffic through a Service is not affected: the node rewrites the backend's address to
-  the Service's on the way back.
+  local source and are dropped, and the restored pod's replies to it go to its own alias. Traffic through a Service is
+  not affected: the node rewrites the backend's address to the Service's on the way back. Section 5 answers the
+  connections that pod opens (IPv4).
 
 A socket can use the captured IP only if it is a local address, so this exposure cannot be removed without the
 workload's cooperation; it can only be detected and bounded (section 5).
@@ -92,8 +93,22 @@ Not guaranteed: when a guard skips (or applying fails) and the inet address map 
 the restore falls back to the switch-off behaviour and adds the old unguarded loopback alias, with section 3's
 exposure (`internal/agent/restore_address.go` `restoreSourceAddress`; `TestRestoreSourceAddress`).
 
-Not guaranteed: a pod given the captured IP after the restore cannot reach the restored pod by pod IP directly (its
-packets arrive with a local source). Service traffic is unaffected. Several instances restored from one capture each
+A pod given the captured IP after the restore (the AWS VPC CNI hands a freed address to the next pod within seconds;
+a ModelExpress peer pulling from a restored source hit it) reaches the restored pod by its pod IP, IPv4 only
+(`holderReturnSteps`):
+
+- `mangle PREROUTING -s <captured> ! -i lo -j CONNMARK --set-xmark <holder>`: a packet from the captured address that
+  did not come over the loopback is from the pod that holds it now. The connection is marked, not the packet, so the
+  packet itself is still delivered locally.
+- `mangle OUTPUT -m connmark --mark <holder> -j MARK --set-xmark <holder>`, and `ip rule pref 100 fwmark <holder>
+  lookup main`, with the local table moved from preference 0 to 150: the replies go out through the pod's interface,
+  not to the alias.
+- `net.ipv4.conf.all.accept_local=1` and `rp_filter=2` (loose; pods start strict, 1): the kernel takes a packet whose
+  source is a local address on the pod's interface. All three are needed (each tested alone on GB300 with the AWS VPC CNI).
+
+A failure of these steps is logged and leaves the captured address applied. Not guaranteed: a connection the restored
+pod opens to the captured address stays local (it cannot tell its own address from the holder's), and IPv6 gets none
+of this. Service traffic is unaffected. Several instances restored from one capture each
 hold the captured address privately, on their own loopback and never advertised, so they do not conflict with each
 other.
 
@@ -112,7 +127,7 @@ gets the same guards, except for the fallback above.
 
 - `agent.restoreCapturedAddress` turns on by default only after `sts8`, the full conformance suite, a guard test and
   the 4-worker scale test pass, on one cluster first.
-- Not built: detection of a later reuse conflict (packets dropped in a restored pod because their source is its
-  captured address, logged with the pod).
+- Not built: connections the restored pod opens to a later holder of its captured address (they stay local), and the
+  same for IPv6; detection of such a conflict (logged with the pod).
 - The cause is upstream: NCCL binds lazily created listeners to the address it read at startup. Binding them to the
   wildcard, or re-reading the address, would remove the need for the alias.

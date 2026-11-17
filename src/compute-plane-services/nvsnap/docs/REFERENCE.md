@@ -107,6 +107,7 @@ where the files column says.
 | `nvsnap.io/path` | `annPath` (internal/server/manifests.go) |  |
 | `nvsnap.io/per-capture` | inline: internal/checkpointstore/percapture_pvc.go, internal/checkpointstore/promoter_shared.go, internal/checkpointstore/promoter_snapshot.go |  |
 | `nvsnap.io/port` | `annPort` (internal/server/manifests.go) |  |
+| `nvsnap.io/process-config` | `ProcessConfigAnnotation` (internal/webhook/process_config.go) | Is a pod's process configuration as admission received it, before the webhook's own patches (which the restored process carries from its capture either way). |
 | `nvsnap.io/rails-fetching` | `railsAnnoFetching` (internal/agent/rails_serve.go) | Marks a serve pod running fetches of its own node: the node is ranked as a source after idle ones (railsSources). |
 | `nvsnap.io/rails-for` | `railsLabelFor` (internal/agent/rails_fetch.go) |  |
 | `nvsnap.io/rails-serves` | `railsLabelServes` (internal/agent/rails_serve.go) | Names, on a serve pod, the node it serves. |

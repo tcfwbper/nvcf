@@ -4,7 +4,9 @@
 package agent
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,10 +39,11 @@ func stsRank(name, ordinal, size string, owner types.UID, ready bool) corev1.Pod
 
 func TestParseCRIUGroup(t *testing.T) {
 	data := map[string]string{"state": "complete", "size": "2", "gpushare": "true",
-		"checkpoint.0": "a", "checkpoint.1": "b", "node.0": "n0", "node.1": "n1"}
+		"checkpoint.0": "a", "checkpoint.1": "b", "node.0": "n0", "node.1": "n1", "processConfig.1": "v1 engine/args=0a"}
 	g, ok := parseCRIUGroup("k1", data)
 	if !ok || !reflect.DeepEqual(g, webhook.CRIUGroup{Key: "k1", Checkpoints: []string{"a", "b"}, Nodes: []string{"n0", "n1"}, GPUShare: true,
-		Companion: []bool{false, false}, Containers: []string{"", ""}, Bundles: []string{"", ""}, ColdEntrypoints: []string{"", ""}}) {
+		Companion: []bool{false, false}, Containers: []string{"", ""}, Bundles: []string{"", ""}, ColdEntrypoints: []string{"", ""},
+		ProcessConfigs: []string{"", "v1 engine/args=0a"}}) {
 		t.Fatalf("got %+v %v", g, ok)
 	}
 	for name, mut := range map[string]func(map[string]string){
@@ -212,5 +215,71 @@ func TestCRIUGroupKey_ScopedByTenant(t *testing.T) {
 	}
 	if len(a) != 16 {
 		t.Errorf("key %q is not 16 hex characters", a)
+	}
+}
+
+// A capture keeps each rank's admitted process configuration, which the
+// webhook compares a restoring pod's with; a pod admitted before the
+// webhook stamped one records none, and its restores go on as before.
+func TestRecordRank_KeepsTheProcessConfig(t *testing.T) {
+	pod := stsRank("kimi-1", "1", "2", "o", true)
+	pod.Annotations[webhook.ProcessConfigAnnotation] = "v1 engine/args=0a"
+	data := map[string]string{}
+	recordRank(data, 1, &pod, `["/opt/start.sh"]`, 2)
+	want := map[string]string{"container.1": "engine", "coldEntrypoint.1": `["/opt/start.sh"]`, "processConfig.1": "v1 engine/args=0a"}
+	if !reflect.DeepEqual(data, want) {
+		t.Fatalf("record %v, want %v", data, want)
+	}
+	data["state"], data["size"], data["checkpoint.0"], data["checkpoint.1"] = "complete", "2", "a", "b"
+	if g, ok := parseCRIUGroup("k1", data); !ok || g.ProcessConfigs[1] != "v1 engine/args=0a" || g.ProcessConfigs[0] != "" {
+		t.Errorf("read back %+v %v", g.ProcessConfigs, ok)
+	}
+
+	old := stsRank("kimi-0", "0", "2", "o", true)
+	data = map[string]string{}
+	recordRank(data, 0, &old, "", 2)
+	if _, ok := data["processConfig.0"]; ok {
+		t.Errorf("recorded a configuration for a pod without one: %v", data)
+	}
+}
+
+// Many ranks share the record's room for configurations: a rank's that
+// does not fit its share is kept as one digest, which still refuses a
+// changed pod.
+func TestRecordRank_ManyRanksKeepOneDigest(t *testing.T) {
+	pod := stsRank("kimi-1", "1", "64", "o", true)
+	var items []string
+	for i := 0; i < 200; i++ {
+		items = append(items, fmt.Sprintf("engine/env/DYN_SOME_SETTING_%03d=0a1b2c3d4e5f", i))
+	}
+	long := "v1 " + strings.Join(items, " ")
+	pod.Annotations[webhook.ProcessConfigAnnotation] = long
+	data := map[string]string{}
+	recordRank(data, 1, &pod, "", 2)
+	if data["processConfig.1"] != long {
+		t.Errorf("2 ranks: kept %d bytes, want the whole %d", len(data["processConfig.1"]), len(long))
+	}
+	recordRank(data, 1, &pod, "", 64)
+	got := data["processConfig.1"]
+	if got != webhook.CompactProcessConfig(long) || len(got) > 64 {
+		t.Fatalf("64 ranks: kept %q", got)
+	}
+	if c := webhook.ProcessConfigChanges(got, long); c != nil {
+		t.Errorf("the same configuration differs from its digest: %v", c)
+	}
+	if c := webhook.ProcessConfigChanges(got, long+" engine/args=ffffffffffff"); len(c) != 1 {
+		t.Errorf("a changed configuration matches its digest: %v", c)
+	}
+}
+
+// Only the checkpointed container's part is recorded: a sidecar starts
+// fresh, and a change to it must not refuse the restore.
+func TestRecordRank_KeepsTheCheckpointedContainersPart(t *testing.T) {
+	pod := stsRank("kimi-0", "0", "2", "o", true)
+	pod.Annotations[webhook.ProcessConfigAnnotation] = "v1 engine/args=0a utils/args=0b"
+	data := map[string]string{}
+	recordRank(data, 0, &pod, "", 2)
+	if data["processConfig.0"] != "v1 engine/args=0a" {
+		t.Errorf("recorded %q", data["processConfig.0"])
 	}
 }

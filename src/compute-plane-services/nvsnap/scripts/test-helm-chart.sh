@@ -78,6 +78,10 @@ if port not in [p.get("name") for p in svc["spec"]["ports"]]:
 cr = [d for d in docs if d["kind"] == "ClusterRole" and d["metadata"]["name"] == "nvsnap-agent"]
 if not any("events" in r.get("resources", []) and "create" in r.get("verbs", []) for r in cr[0]["rules"]):
     sys.exit("the nvsnap-agent ClusterRole cannot create events")
+# list: why the kubelet killed a GPU container that failed under the GPU
+# library (internal/agent/criu_fallback.go kubeletKill).
+if not any("events" in r.get("resources", []) and "list" in r.get("verbs", []) for r in cr[0]["rules"]):
+    sys.exit("the nvsnap-agent ClusterRole cannot list events")
 ' "$OBS_STACK" || fail "agent ServiceMonitor or its events rule is wrong"
 # enabled: auto (the default) follows the cluster's API; true and false
 # override it.
