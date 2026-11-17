@@ -74,7 +74,7 @@ rmdir "${PROJECT_ROOT}/output"
 
 COMPONENTS_GO="${OUT_DIR}/components.go"
 if ! grep -Fq 'logchunkprocessor "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/byoo-otel-collector/otelcol/logchunkprocessor"' "${COMPONENTS_GO}"; then
-  perl -0pi -e 's/(\n\ttransformprocessor "github\.com\/open-telemetry\/opentelemetry-collector-contrib\/processor\/transformprocessor"\n)/$1\tlogchunkprocessor "github.com\/NVIDIA\/nvcf\/src\/compute-plane-services\/byoo-otel-collector\/otelcol\/logchunkprocessor"\n/' "${COMPONENTS_GO}"
+  perl -0pi -e 's/(\n\ttransformprocessor "github\.com\/open-telemetry\/opentelemetry-collector-contrib\/processor\/transformprocessor"\n)/$1\tlogchunkprocessor "github.com\/dsx-ai-factory\/nvcf\/src\/compute-plane-services\/byoo-otel-collector\/otelcol\/logchunkprocessor"\n/' "${COMPONENTS_GO}"
   grep -Fq 'logchunkprocessor "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/byoo-otel-collector/otelcol/logchunkprocessor"' "${COMPONENTS_GO}" || {
     echo "regenerate-otelcol: failed to insert logchunkprocessor import into ${COMPONENTS_GO}" >&2
     exit 1
@@ -84,7 +84,7 @@ if ! grep -Fq 'logchunkprocessor "github.com/dsx-ai-factory/nvcf/src/compute-pla
     echo "regenerate-otelcol: failed to insert logchunkprocessor factory into ${COMPONENTS_GO}" >&2
     exit 1
   }
-  perl -0pi -e 's/(\n\t\ttransformprocessor\.NewFactory\(\)\.Type\(\): "github\.com\/open-telemetry\/opentelemetry-collector-contrib\/processor\/transformprocessor v0\.[0-9]+\.[0-9]+",\n)/$1\t\tlogchunkprocessor.NewFactory().Type(): "github.com\/NVIDIA\/nvcf\/src\/compute-plane-services\/byoo-otel-collector\/otelcol\/logchunkprocessor v0.0.0",\n/' "${COMPONENTS_GO}"
+  perl -0pi -e 's/(\n\t\ttransformprocessor\.NewFactory\(\)\.Type\(\): "github\.com\/open-telemetry\/opentelemetry-collector-contrib\/processor\/transformprocessor v0\.[0-9]+\.[0-9]+",\n)/$1\t\tlogchunkprocessor.NewFactory().Type(): "github.com\/dsx-ai-factory\/nvcf\/src\/compute-plane-services\/byoo-otel-collector\/otelcol\/logchunkprocessor v0.0.0",\n/' "${COMPONENTS_GO}"
   grep -Fq 'logchunkprocessor.NewFactory().Type(): "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/byoo-otel-collector/otelcol/logchunkprocessor v0.0.0"' "${COMPONENTS_GO}" || {
     echo "regenerate-otelcol: failed to insert logchunkprocessor module metadata into ${COMPONENTS_GO}" >&2
     exit 1

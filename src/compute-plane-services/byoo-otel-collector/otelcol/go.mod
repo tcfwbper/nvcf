@@ -581,3 +581,5 @@ replace golang.org/x/crypto => golang.org/x/crypto v0.57.0
 replace golang.org/x/net => golang.org/x/net v0.60.0
 
 replace google.golang.org/grpc => google.golang.org/grpc v1.83.2
+
+replace github.com/klauspost/compress => github.com/klauspost/compress v1.20.4

@@ -171,6 +171,22 @@ Set the endpoint for your collector when enabling tracing. See
    imageTag: 0.143.2
 ```
 
+<Note>
+NVCA Operator chart 3.7.7 defaults the OTel Collector sidecar image to
+`0.160.0-nv-0.4.9`, which is not in the public catalog. If you enable the sidecar
+on that chart, set the image tag to a published collector release,
+`0.160.0-nv-0.4.10` or later:
+
+```yaml
+otelCollector:
+  enabled: true
+  imageTag: 0.160.0-nv-0.4.10
+```
+
+On helm-managed clusters, set `helmManaged.otelCollector.imageTag` to the same tag
+when you enable the sidecar there.
+</Note>
+
 ## Helm-Managed Parameters
 
 Only used when `ngcConfig.clusterSource: "helm-managed"`.
