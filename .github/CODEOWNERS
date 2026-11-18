@@ -31,7 +31,7 @@
 # ledger, deployment stages, NVCT API, vanity gateway, autoscaler, Helm ReVal,
 # LLM gateway, LLM request router, SIS, and Stargate.
 /src/control-plane-services/ @dsx-ai-factory/nvcf-control-plane-dev
-/src/uis/ @dsx-ai-factory/nvcf-control-plane-dev
+/src/uis/ @dsx-ai-factory/nvcf-ui-dev
 /src/invocation-plane-services/ @dsx-ai-factory/nvcf-control-plane-dev
 /src/libraries/rust/stargate/ @dsx-ai-factory/nvcf-control-plane-dev
 /deploy/helm/admin-token-issuer-proxy/ @dsx-ai-factory/nvcf-control-plane-dev
