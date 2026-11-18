@@ -372,7 +372,7 @@ fn watch_snapshot(routers: &[&str], watch_urls: &[&str]) -> WatchEndpointSnapsho
     }
 }
 
-fn test_registration_config() -> InferenceServerRegistrationConfig {
+pub(super) fn test_registration_config() -> InferenceServerRegistrationConfig {
     InferenceServerRegistrationConfig {
         seeds: vec!["router-a".to_string()],
         inference_server_id: "inst-a".to_string(),

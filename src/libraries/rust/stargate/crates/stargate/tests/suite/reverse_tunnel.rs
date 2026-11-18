@@ -950,14 +950,18 @@ async fn reverse_backend_shutdown_drains_in_flight_request_until_drain_timeout()
             .expect("backend should receive the request");
         let shutdown = tokio::spawn(async move {
             let started = tokio::time::Instant::now();
-            reg.shutdown().await;
-            started.elapsed()
+            let summary = reg.shutdown().await;
+            (started.elapsed(), summary)
         });
         tokio::time::sleep(case.release_after).await;
         backend.release.notify_one();
 
         let (status, body) = request.await.unwrap();
-        let shutdown_took = shutdown.await.unwrap();
+        let (shutdown_took, summary) = shutdown.await.unwrap();
+        let summary = summary.expect("a reverse tunnel shutdown returns a drain summary");
+        assert_eq!(summary.in_flight_at_start, 1, "{name}: {summary:?}");
+        assert_eq!(summary.accepted, 0, "{name}: {summary:?}");
+        assert_eq!(summary.drain_timeout, case.drain_timeout, "{name}");
         if case.waits_for_request {
             assert!(
                 shutdown_took >= case.release_after,
@@ -968,12 +972,24 @@ async fn reverse_backend_shutdown_drains_in_flight_request_until_drain_timeout()
             assert_sse_done(
                 &parse_sse_events(&body).expect("in-flight response should be valid SSE"),
             );
+            assert_eq!(summary.outcome(), "completed", "{name}: {summary:?}");
+            assert_eq!(
+                (summary.completed, summary.cut_off),
+                (1, 0),
+                "{name}: {summary:?}"
+            );
         } else {
             // The process exit that follows shutdown cuts the request; this
             // harness keeps running, so only the shutdown time is checked.
             assert!(
                 shutdown_took < case.drain_timeout + Duration::from_secs(1),
                 "{name}: shutdown took {shutdown_took:?}"
+            );
+            assert_eq!(summary.outcome(), "timed_out", "{name}: {summary:?}");
+            assert_eq!(
+                (summary.completed, summary.cut_off),
+                (0, 1),
+                "{name}: {summary:?}"
             );
         }
         Arc::into_inner(stargate).unwrap().shutdown().await;

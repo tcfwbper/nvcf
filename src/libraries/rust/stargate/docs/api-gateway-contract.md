@@ -284,7 +284,10 @@ counted from the signal. Pylon then needs up to 5 s more to stop, so set the
 timeout at least 5 s below the pod's termination grace period. With the
 default, the grace period must be at least 95 s, which is longer than the
 Kubernetes default of 30 s. For LLM container functions, NVCA sets the
-timeout from its inference stop pause.
+timeout from its inference stop pause. To check the timeout, read the
+`pylon drain finished` line that Pylon logs when the drain ends. An `outcome`
+of `timed_out` with `requests_cut_off` above 0 means requests were still
+running when the timeout expired, so the timeout is too short.
 
 Gateway rules:
 

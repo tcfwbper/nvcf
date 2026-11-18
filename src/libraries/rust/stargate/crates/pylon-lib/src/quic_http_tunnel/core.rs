@@ -717,6 +717,8 @@ pub(super) async fn forward_tunnel_request(
         headers: mut request_headers,
     } = request;
     let health_request = is_health_request_path(&path_and_query);
+    // Counted for the drain summary. A health probe is not a request.
+    let _drain_request = (!health_request).then(|| app.runtime_state.begin_drain_request());
     let observation_endpoint = request_observation_endpoint(&method, &path_and_query);
     let path_and_query = if health_request {
         health_probe_path_and_query(&app.upstream_health_paths, &path_and_query)
@@ -1832,6 +1834,71 @@ mod tests {
                 .await
                 .expect_err("blocked request task should be cancelled")
                 .is_cancelled()
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_counters_count_forwarded_requests_but_not_health_probes() {
+        use crate::drain::DrainSummary;
+
+        let (app, _observations) = observed_app("http://127.0.0.1:0");
+        let counters = app.runtime_state.drain_counters();
+        let before = counters.snapshot();
+        let since_before = |counters: &crate::drain::DrainCounters| {
+            DrainSummary::between(before, counters.snapshot(), Duration::ZERO, Duration::ZERO)
+        };
+
+        let health = TunnelRequestParts {
+            method: Method::GET,
+            path_and_query: "/health".to_string(),
+            headers: HeaderMap::new(),
+        };
+        let _ = forward_tunnel_request(&app, health, &mut TestTransport::default()).await;
+        let after_health = since_before(&counters);
+        assert_eq!(
+            (after_health.accepted, after_health.completed),
+            (0, 0),
+            "a health probe is not counted"
+        );
+
+        let gate = TestGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let read_entered = gate.entered.clone();
+        let release = gate.release.clone();
+        let request_app = app.clone();
+        let request_task = tokio::spawn(async move {
+            let mut transport = TestTransport {
+                request_body: br#"{"messages":[],"stream":true}"#.to_vec(),
+                request_body_gate: Some(gate),
+                ..TestTransport::default()
+            };
+            forward_tunnel_request(
+                &request_app,
+                observed_request("/v1/chat/completions"),
+                &mut transport,
+            )
+            .await
+        });
+
+        read_entered.notified().await;
+        assert_eq!(
+            counters.snapshot().in_flight(),
+            1,
+            "a request counts while it runs"
+        );
+
+        release.notify_one();
+        let _ = request_task.await.expect("request task should finish");
+        let after_request = since_before(&counters);
+        assert_eq!(
+            (
+                after_request.accepted,
+                after_request.completed,
+                after_request.cut_off
+            ),
+            (1, 1, 0)
         );
     }
 

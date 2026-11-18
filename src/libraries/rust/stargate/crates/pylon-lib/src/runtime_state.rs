@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 use stargate_proto::pb::{InferenceServerModelRegistration, InferenceServerStatus, ModelStats};
 use tokio::sync::watch;
 
+use crate::drain::{DrainCounters, DrainRequestGuard};
 use crate::queue_admission::{
     LiveRequestState, PylonQueueMismatchRetryConfig, QueueAdmissionDecision, QueueModelSnapshot,
     QueueTrackedRequestGuard,
@@ -93,6 +94,7 @@ pub struct PylonRuntimeState {
     output_token_calibration_enabled: bool,
     metrics: Option<Arc<PylonMetrics>>,
     observation_tx: Option<flume::Sender<RequestObservationEvent>>,
+    drain: Arc<DrainCounters>,
 }
 
 /// Version counter for advertised registration content.
@@ -224,6 +226,7 @@ impl PylonRuntimeState {
             output_token_calibration_enabled: false,
             metrics: None,
             observation_tx: None,
+            drain: Arc::default(),
         }
     }
 
@@ -247,6 +250,15 @@ impl PylonRuntimeState {
         state.metrics = metrics;
         state.observation_tx = Some(observation_tx);
         (state, observation_rx)
+    }
+
+    /// Counts a forwarded request for the drain summary until the guard drops.
+    pub(crate) fn begin_drain_request(&self) -> DrainRequestGuard<'_> {
+        self.drain.begin_request()
+    }
+
+    pub(crate) fn drain_counters(&self) -> Arc<DrainCounters> {
+        Arc::clone(&self.drain)
     }
 
     pub fn set_status(&self, status: InferenceServerStatus) {

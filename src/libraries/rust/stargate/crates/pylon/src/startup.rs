@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use pylon_lib::{
-    AuthTokenProvider, BringupConfig, CalibrationConfig, EngineStatsStreamConfig,
+    AuthTokenProvider, BringupConfig, CalibrationConfig, DrainSummary, EngineStatsStreamConfig,
     EngineStatsStreamHandle, EngineStatsStreamMode, InferenceServerRegistrationClient,
     InferenceServerRegistrationConfig, MetricsServerHandle, ModelDiscoveryConfig,
     ModelInitialization, ModelLifecycleConfig, ModelLifecycleHandle, ModelSource, PylonMetrics,
@@ -342,6 +342,7 @@ fn model_source_from_args(args: &Args) -> Result<ModelSource> {
 }
 
 struct RunningPylon {
+    inference_server_id: String,
     registration_client: InferenceServerRegistrationClient,
     engine_stats_stream: Option<RunningEngineStatsStream>,
     stats_collector: StatsCollectorHandle,
@@ -370,7 +371,7 @@ impl RunningPylon {
                     if let Ok(signal) = &result {
                         info!(signal, "received shutdown signal");
                     }
-                    self.shutdown().await;
+                    self.shutdown(ShutdownCause::Signal).await;
                     return result.map(|_| ());
                 }
                 result = self.registration_client.wait_for_exit() => critical_task_exit_error("registration session", result),
@@ -405,13 +406,14 @@ impl RunningPylon {
                 }
             };
             error!(error = %error, "critical pylon task exited");
-            self.shutdown().await;
+            self.shutdown(ShutdownCause::CriticalTaskExit).await;
             return Err(error);
         }
     }
 
-    async fn shutdown(self) {
+    async fn shutdown(self, cause: ShutdownCause) {
         let Self {
+            inference_server_id,
             mut registration_client,
             engine_stats_stream,
             stats_collector,
@@ -422,7 +424,9 @@ impl RunningPylon {
         } = self;
         // Requests that arrive during the registration drain need admitted
         // model generations, so the model lifecycle stops only after it.
-        registration_client.shutdown().await;
+        if let Some(summary) = registration_client.shutdown().await {
+            log_drain_summary(&inference_server_id, cause, &summary);
+        }
         tokio::join!(
             async move {
                 if let Some(stream) = engine_stats_stream {
@@ -437,6 +441,56 @@ impl RunningPylon {
                     tunnel.shutdown().await;
                 }
             },
+        );
+    }
+}
+
+/// What started Pylon's shutdown, for the drain summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownCause {
+    Signal,
+    CriticalTaskExit,
+}
+
+impl ShutdownCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Signal => "signal",
+            Self::CriticalTaskExit => "critical_task_exit",
+        }
+    }
+}
+
+/// Logs one line per drain: `info` when every request finished, `warn` when
+/// the drain timeout cut some off.
+fn log_drain_summary(inference_server_id: &str, cause: ShutdownCause, summary: &DrainSummary) {
+    let duration_ms = u64::try_from(summary.duration.as_millis()).unwrap_or(u64::MAX);
+    let drain_timeout_ms = u64::try_from(summary.drain_timeout.as_millis()).unwrap_or(u64::MAX);
+    if summary.cut_off == 0 {
+        info!(
+            inference_server_id,
+            cause = cause.as_str(),
+            outcome = summary.outcome(),
+            requests_in_flight_at_start = summary.in_flight_at_start,
+            requests_accepted = summary.accepted,
+            requests_completed = summary.completed,
+            requests_cut_off = summary.cut_off,
+            duration_ms,
+            drain_timeout_ms,
+            "pylon drain finished"
+        );
+    } else {
+        warn!(
+            inference_server_id,
+            cause = cause.as_str(),
+            outcome = summary.outcome(),
+            requests_in_flight_at_start = summary.in_flight_at_start,
+            requests_accepted = summary.accepted,
+            requests_completed = summary.completed,
+            requests_cut_off = summary.cut_off,
+            duration_ms,
+            drain_timeout_ms,
+            "pylon drain finished"
         );
     }
 }
@@ -579,6 +633,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
     registration_client.start(registration_config)?;
 
     Ok(RunningPylon {
+        inference_server_id: args.inference_server_id.clone(),
         registration_client,
         engine_stats_stream,
         stats_collector,
@@ -1320,6 +1375,7 @@ mod tests {
         .await
         .expect("test model lifecycle should start");
         RunningPylon {
+            inference_server_id: "test-pylon".to_string(),
             registration_client: InferenceServerRegistrationClient::default(),
             engine_stats_stream: None,
             stats_collector,
@@ -2025,9 +2081,12 @@ mod tests {
     async fn running_pylon_shutdown_stops_owned_metrics_server() {
         let runtime = test_running_pylon(active_test_stats_collector()).await;
 
-        tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
-            .await
-            .expect("owned metrics server should stop during shutdown");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.shutdown(ShutdownCause::Signal),
+        )
+        .await
+        .expect("owned metrics server should stop during shutdown");
     }
 
     #[tokio::test]
@@ -2125,7 +2184,7 @@ mod tests {
             .await
             .expect("pylon startup task should not panic")
             .expect("pylon startup should succeed")
-            .shutdown()
+            .shutdown(ShutdownCause::Signal)
             .await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
@@ -2169,7 +2228,7 @@ mod tests {
         assert_eq!(registration.models.len(), 1);
         assert!(registration.models.contains_key("model-a"));
 
-        runtime.shutdown().await;
+        runtime.shutdown(ShutdownCause::Signal).await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
@@ -2235,7 +2294,7 @@ mod tests {
             .await
             .expect("pylon startup task should not panic")
             .expect("pylon startup should succeed")
-            .shutdown()
+            .shutdown(ShutdownCause::Signal)
             .await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
@@ -2271,7 +2330,7 @@ mod tests {
             );
         }
 
-        runtime.shutdown().await;
+        runtime.shutdown(ShutdownCause::Signal).await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
@@ -2304,7 +2363,7 @@ mod tests {
         upstream.calibration_release.add_permits(1);
         let error = match startup.await.expect("pylon startup task should not panic") {
             Ok(runtime) => {
-                runtime.shutdown().await;
+                runtime.shutdown(ShutdownCause::Signal).await;
                 panic!("calibration request error must fail startup");
             }
             Err(error) => error,
@@ -2379,7 +2438,7 @@ mod tests {
 
         let error = match start_pylon_runtime(&args, &plan).await {
             Ok(runtime) => {
-                runtime.shutdown().await;
+                runtime.shutdown(ShutdownCause::Signal).await;
                 panic!("initial discovery failure must fail startup");
             }
             Err(error) => error,
@@ -2413,7 +2472,7 @@ mod tests {
         let registration = control_plane.first_registration().await;
 
         assert!(registration.models.is_empty());
-        runtime.shutdown().await;
+        runtime.shutdown(ShutdownCause::Signal).await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
@@ -2448,7 +2507,7 @@ mod tests {
             );
         }
 
-        runtime.shutdown().await;
+        runtime.shutdown(ShutdownCause::Signal).await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
@@ -2483,7 +2542,7 @@ mod tests {
                     "{model_id} should advertise the fallback in {mode} mode"
                 );
             }
-            runtime.shutdown().await;
+            runtime.shutdown(ShutdownCause::Signal).await;
             control_plane.shutdown().await;
         }
         assert_eq!(upstream.calibration_requests.load(Ordering::SeqCst), 0);

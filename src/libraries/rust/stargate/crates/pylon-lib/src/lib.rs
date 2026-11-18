@@ -18,6 +18,7 @@ pub use stargate_protocol::TunnelTransportProtocol;
 pub use stargate_tls::ServerTlsIdentity;
 
 mod bringup;
+mod drain;
 mod generated_request_id;
 mod model_discovery;
 mod model_lifecycle;
@@ -36,6 +37,7 @@ mod upstream_health;
 mod upstream_url;
 
 pub use bringup::{BringupConfig, BringupError, CalibrationConfig};
+pub use drain::DrainSummary;
 pub use model_discovery::{
     ModelDiscoveryConfig, ModelDiscoveryError, ModelDiscoveryProvider,
     ParseModelDiscoveryProviderError,
