@@ -49,6 +49,10 @@ pub struct CalibrationConfig {
     pub calibration_prompt_units: usize,
     pub calibration_max_concurrency: usize,
     pub calibration_timeout: Duration,
+    /// Makes calibration best effort: a 429, 503, or 529 ends the ramp, input
+    /// counts come from response usage, and a model whose calibration fails
+    /// starts at this rate.
+    pub fallback_input_tps: Option<f64>,
 }
 
 impl Default for BringupConfig {
@@ -70,6 +74,7 @@ impl Default for CalibrationConfig {
             calibration_prompt_units: DEFAULT_CALIBRATION_PROMPT_UNITS,
             calibration_max_concurrency: DEFAULT_CALIBRATION_MAX_CONCURRENCY,
             calibration_timeout: DEFAULT_CALIBRATION_TIMEOUT,
+            fallback_input_tps: None,
         }
     }
 }
@@ -87,7 +92,7 @@ mod tests {
     use super::*;
     use super::{calibration::*, lifecycle::*, upstream::*};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
     use axum::Json;
     use axum::Router;
@@ -165,6 +170,7 @@ mod tests {
             crate::generated_request_id::GeneratedRequestKind::Calibration,
             &test_generation(),
             Some(&runtime_state),
+            false,
         )
         .await;
         let states = observations
@@ -562,6 +568,7 @@ mod tests {
                 concurrency: 2,
             },
             &test_runtime_state(),
+            None,
         )
         .await
         .expect("calibration batch should succeed");
@@ -770,6 +777,7 @@ mod tests {
                 concurrency: 3,
             },
             &test_runtime_state(),
+            None,
         )
         .await
         .expect("calibration batch should succeed");
@@ -812,6 +820,7 @@ mod tests {
                 concurrency: 1,
             },
             &runtime_state,
+            None,
         )
         .await
         .expect("calibration batch should succeed");
@@ -896,6 +905,219 @@ mod tests {
             .expect("a completed observed interval should retain the calibration frontier");
         tokio::time::resume();
         stats.shutdown().await;
+    }
+
+    /// Completes `completions` calibration requests, then answers `status`.
+    async fn spawn_overloading_server(completions: usize, status: u16) -> TestHttpServer {
+        let remaining = Arc::new(AtomicUsize::new(completions));
+        TestHttpServer::spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let remaining = remaining.clone();
+                async move {
+                    if remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                            value.checked_sub(1)
+                        })
+                        .is_ok()
+                    {
+                        return Json(serde_json::json!({"usage": {"completion_tokens": 1}}))
+                            .into_response();
+                    }
+                    (
+                        StatusCode::from_u16(status).expect("test status is valid"),
+                        Json(serde_json::json!({
+                            "message": "Service temporarily overloaded",
+                            "type": "Overloaded",
+                            "code": status
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        ))
+        .await
+    }
+
+    /// Returns the calibration result and the input TPS it left in the stats.
+    async fn run_test_calibration(
+        base_url: &str,
+        fallback_input_tps: Option<f64>,
+    ) -> (Result<(), BringupError>, f64) {
+        let (runtime_state, stats) = test_stats_collector();
+        let generation = test_generation();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_calibration(
+                &reqwest::Client::new(),
+                base_url,
+                &generation,
+                &CalibrationConfig {
+                    calibration_requests: 1,
+                    calibration_max_concurrency: 1,
+                    fallback_input_tps,
+                    ..CalibrationConfig::default()
+                },
+                &stats.control(),
+                &runtime_state,
+            ),
+        )
+        .await
+        .expect("a busy reply should end the calibration");
+        let input_tps = stats
+            .control()
+            .flush_and_snapshot(&generation)
+            .await
+            .expect("stats collector should respond")
+            .expect("generation should remain live")
+            .last_mean_input_tps;
+        stats.shutdown().await;
+        (result, input_tps)
+    }
+
+    #[tokio::test]
+    async fn overload_ends_a_fallback_calibration() {
+        for (label, completions, status, is_measured) in [
+            ("529 after completed requests", 3, 529, true),
+            ("503 after completed requests", 3, 503, true),
+            ("429 after completed requests", 3, 429, true),
+            ("529 before any completed request", 0, 529, false),
+        ] {
+            let server = spawn_overloading_server(completions, status).await;
+
+            let (result, input_tps) = run_test_calibration(server.as_str(), Some(100.0)).await;
+
+            if is_measured {
+                result.unwrap_or_else(|error| panic!("{label}: {error}"));
+                assert!(input_tps > 0.0, "{label}");
+            } else {
+                assert!(
+                    matches!(result, Err(BringupError::InsufficientCalibrationData)),
+                    "{label}: {result:?}"
+                );
+            }
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn overload_still_fails_a_calibration_without_a_fallback() {
+        let server = spawn_overloading_server(3, 529).await;
+
+        let (result, _) = run_test_calibration(server.as_str(), None).await;
+
+        assert!(matches!(result, Err(error) if error.is_overloaded()));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn calibration_input_tokens_come_from_usage_only_with_a_fallback() {
+        let server = TestHttpServer::spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({"usage": {"prompt_tokens": 7, "completion_tokens": 1}}))
+            }),
+        ))
+        .await;
+
+        for (input_tokens_from_usage, expected_input_tokens) in [
+            (false, CALIBRATION_PROMPT_UNITS_FLOOR as u64), // prompt characters
+            (true, 7),
+        ] {
+            let (runtime_state, observations) = PylonRuntimeState::observed(
+                InferenceServerStatus::Active,
+                &["test-model".to_string()],
+                32,
+                None,
+            );
+            send_calibration_batch(
+                &reqwest::Client::new(),
+                server.as_str(),
+                &test_generation(),
+                Duration::from_secs(1),
+                CalibrationBatch {
+                    prompt_units: CALIBRATION_PROMPT_UNITS_FLOOR,
+                    request_count: 1,
+                    concurrency: 1,
+                },
+                &runtime_state,
+                input_tokens_from_usage.then_some(&AtomicBool::new(false)),
+            )
+            .await
+            .expect("calibration batch should succeed");
+
+            let completed = observations
+                .try_iter()
+                .last()
+                .expect("calibration request should be observed")
+                .into_observation();
+            assert_eq!(
+                completed.state,
+                crate::RequestObservationState::Complete,
+                "input_tokens_from_usage={input_tokens_from_usage}"
+            );
+            assert_eq!(
+                completed.input_tokens, expected_input_tokens,
+                "input_tokens_from_usage={input_tokens_from_usage}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn calibration_without_usage_prompt_tokens_logs_and_counts_characters() {
+        let server = TestHttpServer::spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { Json(serde_json::json!({"usage": {"completion_tokens": 1}})) }),
+        ))
+        .await;
+        let (runtime_state, observations) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &["test-model".to_string()],
+            32,
+            None,
+        );
+        let subscriber = crate::test_support::RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(subscriber.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+        // Two steps of one ramp share the flag, so the line is logged once.
+        let prompt_tokens_missing = AtomicBool::new(false);
+        for _ in 0..2 {
+            send_calibration_batch(
+                &reqwest::Client::new(),
+                server.as_str(),
+                &test_generation(),
+                Duration::from_secs(1),
+                CalibrationBatch {
+                    prompt_units: CALIBRATION_PROMPT_UNITS_FLOOR,
+                    request_count: 2,
+                    concurrency: 1,
+                },
+                &runtime_state,
+                Some(&prompt_tokens_missing),
+            )
+            .await
+            .expect("calibration batch should succeed");
+        }
+        drop(default_guard);
+
+        let completed = observations
+            .try_iter()
+            .last()
+            .expect("calibration request should be observed")
+            .into_observation();
+        assert_eq!(
+            completed.input_tokens,
+            CALIBRATION_PROMPT_UNITS_FLOOR as u64
+        );
+        let message = "calibration responses have no usage.prompt_tokens; counting prompt characters as input tokens";
+        assert_eq!(subscriber.event_count(message), 1);
+        assert_eq!(
+            crate::test_support::tracing_event_by_message(&subscriber.events(), message).level,
+            tracing::Level::WARN
+        );
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1903,6 +2125,7 @@ mod tests {
                     concurrency: 1,
                 },
                 &test_runtime_state(),
+                None,
             )
             .await
             .unwrap_or_else(|error| {

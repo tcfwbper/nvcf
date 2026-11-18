@@ -43,6 +43,8 @@ use super::{Args, OutputTokenCalibrationMode};
 type TaskExit = std::result::Result<(), JoinError>;
 
 const DEFAULT_STARTUP_HEALTH_WAIT: Duration = Duration::from_secs(60);
+const DEFAULT_CALIBRATION_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_FALLBACK_CALIBRATION_TIMEOUT_MS: u64 = 5_000;
 const INFERENCE_READY_TIMEOUT_ENV: &str = "INFERENCE_READY_TIMEOUT";
 
 pub(super) async fn run(args: Args) -> Result<()> {
@@ -535,10 +537,14 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
         server_identity_reloader,
     )
     .await?;
-    if matches!(
-        &plan.model_initialization,
-        ModelInitialization::Calibration(_)
-    ) {
+    // Without --cluster-id the cluster is this Pylon's own inference server ID,
+    // so it is the cluster's only Pylon.
+    if args.cluster_id.is_some()
+        && matches!(
+            &plan.model_initialization,
+            ModelInitialization::Calibration(_)
+        )
+    {
         warn!(
             cluster_id = %plan.cluster_id,
             "running local calibration; --do-calibration is valid only for a cluster with one pylon"
@@ -793,10 +799,6 @@ pub(crate) fn pylon_queue_mismatch_retry_config_from_args(
 
 fn model_initialization_from_args(args: &Args) -> Result<ModelInitialization> {
     ensure!(
-        !(args.do_calibration && args.initial_input_tps.is_some()),
-        "--do-calibration and --initial-input-tps cannot be used together"
-    );
-    ensure!(
         args.initial_input_tps
             .is_none_or(|input_tps| input_tps.is_finite() && input_tps > 0.0),
         "initial input TPS must be finite and positive"
@@ -806,12 +808,22 @@ fn model_initialization_from_args(args: &Args) -> Result<ModelInitialization> {
             args.calibration_requests > 0,
             "--do-calibration requires --calibration-requests greater than zero"
         );
+        // Without a seed, a ramp that measures nothing stops Pylon, so a slow
+        // first step gets the longer limit.
+        let calibration_timeout_ms =
+            args.bringup_calibration_timeout_ms
+                .unwrap_or(if args.initial_input_tps.is_some() {
+                    DEFAULT_FALLBACK_CALIBRATION_TIMEOUT_MS
+                } else {
+                    DEFAULT_CALIBRATION_TIMEOUT_MS
+                });
         return Ok(ModelInitialization::Calibration(CalibrationConfig {
             health_timeout: Duration::from_millis(args.bringup_canary_timeout_ms),
             calibration_requests: args.calibration_requests,
             calibration_prompt_units: args.calibration_prompt_units,
             calibration_max_concurrency: args.calibration_max_concurrency,
-            calibration_timeout: Duration::from_millis(args.bringup_calibration_timeout_ms),
+            calibration_timeout: Duration::from_millis(calibration_timeout_ms),
+            fallback_input_tps: args.initial_input_tps,
         }));
     }
 
@@ -902,6 +914,49 @@ mod tests {
         let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
             .expect("startup plan should build");
         (args, plan)
+    }
+
+    #[test]
+    fn calibration_step_limit_defaults_to_five_seconds_only_with_a_seed() {
+        for (label, extra, expected) in [
+            ("seed", &["--initial-input-tps", "100"][..], 5_000),
+            ("no seed", &[][..], 30_000),
+            (
+                "seed, explicit",
+                &[
+                    "--initial-input-tps",
+                    "100",
+                    "--bringup-calibration-timeout-ms",
+                    "1000",
+                ][..],
+                1_000,
+            ),
+            (
+                "no seed, explicit",
+                &["--bringup-calibration-timeout-ms", "1000"][..],
+                1_000,
+            ),
+        ] {
+            let mut argv = vec![
+                "pylon",
+                "--upstream-http-base-url",
+                "http://127.0.0.1:8090/",
+                "--do-calibration",
+            ];
+            argv.extend_from_slice(extra);
+            let args = <Args as Parser>::try_parse_from(argv).expect(label);
+
+            let Ok(ModelInitialization::Calibration(config)) =
+                model_initialization_from_args(&args)
+            else {
+                panic!("{label}: expected a calibration plan");
+            };
+            assert_eq!(
+                config.calibration_timeout,
+                Duration::from_millis(expected),
+                "{label}"
+            );
+        }
     }
 
     fn runtime_args(
@@ -2120,19 +2175,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflicting_bootstrap_sources_make_zero_stargate_calls() {
-        let upstream = TestUpstream::spawn(false).await;
-        let control_plane = TestControlPlane::spawn().await;
-
+    async fn calibration_with_initial_input_tps_seeds_the_first_heartbeat_with_each_measured_rate()
+    {
+        let mut upstream = TestUpstream::spawn(false).await;
+        let mut control_plane = TestControlPlane::spawn().await;
         let args = runtime_args(
             &upstream.base_url,
             control_plane.addr,
-            &["model-a"],
-            &["--do-calibration", "--initial-input-tps", "100"],
+            &["model-a", "model-b"],
+            &[
+                "--do-calibration",
+                "--initial-input-tps",
+                "100",
+                "--calibration-requests",
+                "1",
+                "--calibration-prompt-units",
+                "256",
+                "--calibration-max-concurrency",
+                "1",
+                "--bringup-calibration-timeout-ms",
+                "1000",
+            ],
         );
-        assert!(PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None).is_err());
-        control_plane.assert_no_calls();
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
+        let startup = tokio::spawn(async move { start_pylon_runtime(&args, &plan).await });
 
+        assert_eq!(
+            upstream.calibration_started.recv().await.as_deref(),
+            Some("model-a")
+        );
+        control_plane.assert_no_calls();
+        upstream.calibration_release.add_permits(5);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), upstream.calibration_started.recv())
+                .await
+                .expect("model-b should calibrate before registration")
+                .as_deref(),
+            Some("model-b")
+        );
+        control_plane.assert_no_calls();
+        upstream.calibration_release.add_permits(5);
+
+        let registration = control_plane.first_registration().await;
+        assert_eq!(upstream.calibration_plans.load(Ordering::SeqCst), 2);
+        for model_id in ["model-a", "model-b"] {
+            let input_tps = registration.models[model_id]
+                .stats
+                .as_ref()
+                .expect("first heartbeat should contain stats")
+                .last_mean_input_tps;
+            assert!(
+                input_tps.is_finite() && input_tps > 0.0 && input_tps != 100.0,
+                "{model_id}: {input_tps}"
+            );
+        }
+
+        startup
+            .await
+            .expect("pylon startup task should not panic")
+            .expect("pylon startup should succeed")
+            .shutdown()
+            .await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }

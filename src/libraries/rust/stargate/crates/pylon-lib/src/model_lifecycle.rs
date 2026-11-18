@@ -175,8 +175,17 @@ pub async fn start_model_lifecycle(
             }
             InitializationAttemptOutcome::Retired => {}
             InitializationAttemptOutcome::Failed(error) => {
-                supervisor.shutdown().await;
-                return Err(error);
+                let Some(input_tps) = supervisor.fallback_input_tps(&error) else {
+                    supervisor.shutdown().await;
+                    return Err(error);
+                };
+                if let Err(error) = supervisor
+                    .admit_at_input_tps(&generation, &error, input_tps)
+                    .await
+                {
+                    supervisor.shutdown().await;
+                    return Err(error);
+                }
             }
             InitializationAttemptOutcome::Cancelled => {
                 unreachable!("startup initialization has no cancellation token")
@@ -248,6 +257,13 @@ impl ModelLifecycleSupervisor {
                 self.start_canary(&generation, stop)?;
             }
             InitializationAttemptOutcome::Failed(error) => {
+                if let Some(input_tps) = self.fallback_input_tps(&error) {
+                    let generation = self
+                        .admit_at_input_tps(&generation, &error, input_tps)
+                        .await?;
+                    self.start_canary(&generation, stop)?;
+                    return Ok(());
+                }
                 tracing::warn!(
                     model_id = generation.model_id(),
                     error = %error,
@@ -334,48 +350,93 @@ impl ModelLifecycleSupervisor {
             .filter(|model_id| !self.live.contains_key(*model_id))
             .cloned()
             .collect::<Vec<_>>();
+        let initialization = match &self.config.initialization {
+            ModelInitialization::Calibration(_) | ModelInitialization::Uncalibrated => {
+                ModelStatsInitialization::Empty
+            }
+            ModelInitialization::ConfiguredInputTps { input_tps } => {
+                ModelStatsInitialization::ConfiguredInputTps {
+                    input_tps: *input_tps,
+                }
+            }
+        };
         for model_id in added {
-            let sequence = self.next_generation;
-            self.next_generation = self
-                .next_generation
-                .checked_add(1)
-                .ok_or(ModelLifecycleError::GenerationCounterExhausted)?;
-            let generation = ModelGeneration::new(model_id.clone(), sequence);
-            if !self.runtime_state.begin_generation(generation.clone()) {
-                return Err(ModelLifecycleError::StaleGeneration);
-            }
-            let initialization = match &self.config.initialization {
-                ModelInitialization::Calibration(_) | ModelInitialization::Uncalibrated => {
-                    ModelStatsInitialization::Empty
-                }
-                ModelInitialization::ConfiguredInputTps { input_tps } => {
-                    ModelStatsInitialization::ConfiguredInputTps {
-                        input_tps: *input_tps,
-                    }
-                }
-            };
-            if !self
-                .stats
-                .begin_generation(generation.clone(), initialization)
-                .await
-                .map_err(|_| ModelLifecycleError::StatsCollectorStopped)?
-            {
-                let _ = self.runtime_state.retire_generation(&generation);
-                return Err(ModelLifecycleError::StaleGeneration);
-            }
-            self.live.insert(
-                model_id.clone(),
-                LiveModelGeneration {
-                    generation: generation.clone(),
-                    canary: None,
-                },
-            );
+            let generation = self.begin_generation(model_id, initialization).await?;
             self.pending.push(PendingInitialization {
                 generation,
                 retry_at: Instant::now(),
             });
         }
         Ok(())
+    }
+
+    async fn begin_generation(
+        &mut self,
+        model_id: String,
+        initialization: ModelStatsInitialization,
+    ) -> Result<ModelGeneration, ModelLifecycleError> {
+        let sequence = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or(ModelLifecycleError::GenerationCounterExhausted)?;
+        let generation = ModelGeneration::new(model_id.clone(), sequence);
+        if !self.runtime_state.begin_generation(generation.clone()) {
+            return Err(ModelLifecycleError::StaleGeneration);
+        }
+        if !self
+            .stats
+            .begin_generation(generation.clone(), initialization)
+            .await
+            .map_err(|_| ModelLifecycleError::StatsCollectorStopped)?
+        {
+            let _ = self.runtime_state.retire_generation(&generation);
+            return Err(ModelLifecycleError::StaleGeneration);
+        }
+        self.live.insert(
+            model_id,
+            LiveModelGeneration {
+                generation: generation.clone(),
+                canary: None,
+            },
+        );
+        Ok(generation)
+    }
+
+    /// Returns the fallback input TPS for a failed calibration. An unhealthy
+    /// upstream keeps its usual handling.
+    fn fallback_input_tps(&self, error: &ModelLifecycleError) -> Option<f64> {
+        match (&self.config.initialization, error) {
+            (_, ModelLifecycleError::Bringup(BringupError::UnhealthyUpstream)) => None,
+            (ModelInitialization::Calibration(calibration), _) => calibration.fallback_input_tps,
+            _ => None,
+        }
+    }
+
+    /// Replaces a generation whose calibration failed with one that starts at
+    /// `input_tps`, as `--initial-input-tps` does, and admits it. A new generation
+    /// also drops late observations from the failed ramp.
+    async fn admit_at_input_tps(
+        &mut self,
+        failed: &ModelGeneration,
+        error: &ModelLifecycleError,
+        input_tps: f64,
+    ) -> Result<ModelGeneration, ModelLifecycleError> {
+        tracing::warn!(
+            model_id = failed.model_id(),
+            error = %error,
+            fallback_input_tps = input_tps,
+            "model calibration failed; starting the model at the fallback input TPS"
+        );
+        self.retire(failed).await;
+        let generation = self
+            .begin_generation(
+                failed.model_id().to_string(),
+                ModelStatsInitialization::ConfiguredInputTps { input_tps },
+            )
+            .await?;
+        self.admit(&generation).await?;
+        Ok(generation)
     }
 
     async fn drive_initialization(
@@ -710,7 +771,7 @@ fn earliest_pending_index(pending: &[PendingInitialization]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -734,7 +795,10 @@ mod tests {
     };
     use crate::generated_request_id::generated_request_generation;
     use crate::runtime_state::ModelGeneration;
-    use crate::test_support::TestHttpServer;
+    use crate::test_support::{
+        RecordedTracingEvent, RecordingTracingSubscriber, TestHttpServer,
+        assert_tracing_event_field,
+    };
     use crate::upstream_health::UpstreamHealthPaths;
     use crate::{
         BringupConfig, BringupError, CalibrationConfig, ModelDiscoveryConfig,
@@ -1035,6 +1099,7 @@ mod tests {
                 calibration_prompt_units: 256,
                 calibration_max_concurrency: 1,
                 calibration_timeout,
+                fallback_input_tps: None,
             }),
             ..discovery_config(base_url)
         }
@@ -1393,6 +1458,7 @@ mod tests {
                         calibration_prompt_units: 1024,
                         calibration_max_concurrency: 1,
                         calibration_timeout: Duration::from_secs(30),
+                        fallback_input_tps: None,
                     }),
                     bringup: BringupConfig {
                         enabled: false,
@@ -1480,6 +1546,244 @@ mod tests {
 
         stats.shutdown().await;
         upstream.shutdown().await;
+    }
+
+    const FALLBACK_INPUT_TPS: f64 = 100.0;
+
+    fn fallback_calibration_config(
+        base_url: &str,
+        model_ids: &[&str],
+        calibration_timeout: Duration,
+    ) -> ModelLifecycleConfig {
+        ModelLifecycleConfig {
+            source: ModelSource::Static(
+                model_ids
+                    .iter()
+                    .map(|model_id| (*model_id).to_string())
+                    .collect(),
+            ),
+            initialization: ModelInitialization::Calibration(CalibrationConfig {
+                health_timeout: Duration::from_secs(1),
+                calibration_requests: 1,
+                calibration_prompt_units: 256,
+                calibration_max_concurrency: 1,
+                calibration_timeout,
+                fallback_input_tps: Some(FALLBACK_INPUT_TPS),
+            }),
+            ..discovery_config(base_url)
+        }
+    }
+
+    fn start_test_stats() -> (PylonRuntimeState, crate::StatsCollectorHandle) {
+        let stats_config = StatsCollectorConfig::default();
+        let (runtime_state, observations) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &[],
+            stats_config.observation_channel_capacity,
+            None,
+        );
+        let stats = start_stats_collector(stats_config, observations, runtime_state.clone());
+        (runtime_state, stats)
+    }
+
+    fn published_input_tps(runtime_state: &PylonRuntimeState) -> BTreeMap<String, f64> {
+        runtime_state
+            .advertised_models()
+            .into_iter()
+            .map(|(model_id, model)| {
+                let stats = model.stats.expect("advertised model should carry stats");
+                (model_id, stats.last_mean_input_tps)
+            })
+            .collect()
+    }
+
+    const FALLBACK_WARNING: &str =
+        "model calibration failed; starting the model at the fallback input TPS";
+
+    /// Asserts each seeded model publishes the fallback rate with one warning and
+    /// every other model publishes a measured rate.
+    fn assert_seeded_models(
+        label: &str,
+        runtime_state: &PylonRuntimeState,
+        events: &[RecordedTracingEvent],
+        seeded: &[&str],
+    ) {
+        for (model_id, input_tps) in published_input_tps(runtime_state) {
+            if seeded.contains(&model_id.as_str()) {
+                assert_eq!(input_tps, FALLBACK_INPUT_TPS, "{label}: {model_id}");
+            } else {
+                assert!(
+                    input_tps > 0.0 && input_tps != FALLBACK_INPUT_TPS,
+                    "{label}: {model_id} should publish a measured rate, got {input_tps}"
+                );
+            }
+        }
+        let warnings = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str) == Some(FALLBACK_WARNING)
+            })
+            .collect::<Vec<_>>();
+        let mut warned_models = Vec::new();
+        for warning in warnings {
+            assert_eq!(warning.level, tracing::Level::WARN, "{label}");
+            assert_tracing_event_field(warning, "fallback_input_tps", "100.0");
+            assert!(warning.fields.contains_key("error"), "{label}: {warning:?}");
+            warned_models.push(warning.fields["model_id"].clone());
+        }
+        assert_eq!(warned_models, seeded, "{label}");
+    }
+
+    #[tokio::test]
+    async fn fallback_calibration_measures_each_model_and_seeds_a_failed_one() {
+        for (label, completion_behavior, model_ids, seeded) in [
+            (
+                "calibration request error",
+                CompletionBehavior::FailModel {
+                    model_id: "model-b",
+                    failing: Arc::new(AtomicBool::new(true)),
+                    completed_requests_per_generation: 4,
+                },
+                &["model-a", "model-b", "model-c"][..],
+                &["model-b"][..],
+            ),
+            (
+                "no completed request",
+                CompletionBehavior::Pending,
+                &["model-a", "model-b"][..],
+                &["model-a", "model-b"][..],
+            ),
+        ] {
+            let mut upstream = TestUpstream::spawn(&[], completion_behavior).await;
+            let (runtime_state, stats) = start_test_stats();
+            let subscriber = RecordingTracingSubscriber::default();
+            let dispatch = tracing::Dispatch::new(subscriber.clone());
+            let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+            let lifecycle = start_model_lifecycle(
+                fallback_calibration_config(
+                    &upstream.base_url,
+                    model_ids,
+                    Duration::from_millis(100),
+                ),
+                runtime_state.clone(),
+                &stats,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label}: startup should fall back: {error}"));
+            drop(default_guard);
+
+            let mut calibrated_models = BTreeSet::new();
+            while let Ok(generation) = upstream.calibrations.try_recv() {
+                calibrated_models.insert(generation.model_id().to_string());
+            }
+            assert_eq!(
+                calibrated_models,
+                model_ids
+                    .iter()
+                    .map(|model_id| (*model_id).to_string())
+                    .collect(),
+                "{label}: every model should calibrate"
+            );
+            assert_eq!(runtime_state.advertised_model_ids(), model_ids, "{label}");
+            assert_seeded_models(label, &runtime_state, &subscriber.events(), seeded);
+
+            lifecycle.shutdown().await;
+            stats.shutdown().await;
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_calibration_seeds_a_discovered_model_whose_calibration_fails() {
+        let upstream = TestUpstream::spawn(
+            &["model-a"],
+            CompletionBehavior::FailModel {
+                model_id: "model-b",
+                failing: Arc::new(AtomicBool::new(true)),
+                completed_requests_per_generation: 4,
+            },
+        )
+        .await;
+        let (runtime_state, stats) = start_test_stats();
+        let subscriber = RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(subscriber.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+        let lifecycle = start_model_lifecycle(
+            ModelLifecycleConfig {
+                source: discovery_config(&upstream.base_url).source,
+                ..fallback_calibration_config(&upstream.base_url, &[], Duration::from_millis(100))
+            },
+            runtime_state.clone(),
+            &stats,
+            None,
+        )
+        .await
+        .expect("calibrated startup should succeed");
+
+        upstream.set_models(&["model-a", "model-b"]).await;
+        wait_for_model_ids(&runtime_state, &["model-a", "model-b"]).await;
+        drop(default_guard);
+        assert_seeded_models(
+            "discovered model",
+            &runtime_state,
+            &subscriber.events(),
+            &["model-b"],
+        );
+
+        lifecycle.shutdown().await;
+        stats.shutdown().await;
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fallback_calibration_keeps_an_unhealthy_upstream_fatal() {
+        let health_probes = Arc::new(AtomicUsize::new(0));
+        let server_health_probes = health_probes.clone();
+        // The startup health wait passes; the probe before calibration fails.
+        let server = TestHttpServer::spawn(Router::new().route(
+            "/health",
+            get(move || {
+                let probes = server_health_probes.clone();
+                async move {
+                    if probes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        ))
+        .await;
+        let (runtime_state, stats) = start_test_stats();
+
+        let result = start_model_lifecycle(
+            fallback_calibration_config(
+                server.as_str(),
+                &["model-a", "model-b"],
+                Duration::from_secs(30),
+            ),
+            runtime_state.clone(),
+            &stats,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ModelLifecycleError::Bringup(
+                BringupError::UnhealthyUpstream
+            ))
+        ));
+        assert!(health_probes.load(Ordering::SeqCst) >= 2);
+        assert!(runtime_state.advertised_model_ids().is_empty());
+        assert!(runtime_state.current_generation("model-a").is_none());
+        assert!(runtime_state.current_generation("model-b").is_none());
+
+        stats.shutdown().await;
+        server.shutdown().await;
     }
 
     #[tokio::test]

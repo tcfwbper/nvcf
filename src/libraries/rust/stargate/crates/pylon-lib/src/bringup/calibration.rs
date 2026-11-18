@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -47,18 +48,32 @@ pub(crate) async fn run_calibration(
     let mut last_completed = None;
     let mut completed_prompt_units = Vec::new();
 
+    let prompt_tokens_missing = AtomicBool::new(false);
     let mut ramp = calibration_ramp(config);
     while let Some(step) = ramp.next() {
-        match send_calibration_batch(
+        let result = send_calibration_batch(
             http_client,
             upstream_http_base_url,
             generation,
             config.calibration_timeout,
             step,
             runtime_state,
+            config
+                .fallback_input_tps
+                .is_some()
+                .then_some(&prompt_tokens_missing),
         )
-        .await
-        {
+        .await;
+        // With a fallback rate, a busy reply ends the ramp like a step timeout and
+        // keeps the window measured so far.
+        let upstream_overloaded = config.fallback_input_tps.is_some()
+            && result.as_ref().is_err_and(BringupError::is_busy);
+        let outcome = if upstream_overloaded {
+            Ok(CalibrationStepOutcome::Saturated)
+        } else {
+            result
+        };
+        match outcome {
             Ok(CalibrationStepOutcome::Completed) => {
                 if completed_prompt_units.last() != Some(&step.prompt_units) {
                     completed_prompt_units.push(step.prompt_units);
@@ -82,6 +97,7 @@ pub(crate) async fn run_calibration(
                     timed_out_prompt_units = step.prompt_units,
                     timed_out_request_count = step.request_count,
                     timed_out_concurrency = step.concurrency,
+                    upstream_overloaded,
                     duration_ms = started_at.elapsed().as_secs_f64() * 1_000.0,
                     current_input_tps = stats.last_mean_input_tps,
                     current_output_tps = stats.output_tps,
@@ -186,12 +202,16 @@ pub(super) async fn send_calibration_batch(
     timeout: Duration,
     batch: CalibrationBatch,
     runtime_state: &PylonRuntimeState,
+    // `Some` counts input tokens from `usage.prompt_tokens`. The flag spans the
+    // whole ramp, so a backend without that field is logged once per model.
+    prompt_tokens_missing: Option<&AtomicBool>,
 ) -> Result<CalibrationStepOutcome, BringupError> {
     let CalibrationBatch {
         prompt_units,
         request_count,
         concurrency,
     } = batch;
+    let input_tokens_from_usage = prompt_tokens_missing.is_some();
     let step = stream::iter((0..request_count).map(|_| {
         let request = serde_json::json!({
             "model": generation.model_id(),
@@ -209,12 +229,24 @@ pub(super) async fn send_calibration_batch(
                 GeneratedRequestKind::Calibration,
                 generation,
                 Some(runtime_state),
+                input_tokens_from_usage,
             )
             .await
         }
     }))
     .buffer_unordered(concurrency.min(request_count))
-    .try_for_each(|_| async { Ok(()) });
+    .try_for_each(|completion| {
+        if let Some(missing) = prompt_tokens_missing
+            && !completion.has_prompt_tokens()
+            && !missing.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                model_id = generation.model_id(),
+                "calibration responses have no usage.prompt_tokens; counting prompt characters as input tokens"
+            );
+        }
+        async { Ok(()) }
+    });
     match tokio::time::timeout(timeout, step).await {
         Ok(outcome) => outcome.map(|()| CalibrationStepOutcome::Completed),
         Err(_) => Ok(CalibrationStepOutcome::Saturated),

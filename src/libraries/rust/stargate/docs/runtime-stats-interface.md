@@ -267,14 +267,28 @@ engine cluster reports a valid maximum. Historical per-observer peaks are not
 additive. Pulsar uses maximum capacity by default; queue estimates still use
 mean capacity.
 
-Before registration, Pylon initializes each model generation from exactly one
-source. `--initial-input-tps` installs the configured value. Local calibration
+Before registration, Pylon initializes each model generation from one source.
+`--initial-input-tps` installs the configured value. Local calibration
 installs nothing: it runs an increasing request ramp until a load-step timeout,
 and those requests' exact-generation observer events build the same distribution
 used at runtime. Each calibration request starts with a unique prompt prefix, so
 it cannot hit the prefix cache. Duplicate engine events for calibration IDs are
 ignored. Pylon logs the current stats at timeout without reinjecting them.
 Later valid runtime samples continue updating either unpinned distribution.
+
+With both `--do-calibration` and `--initial-input-tps`, Pylon calibrates each
+model, one at a time, including models discovered later. A 429, 503, or 529
+response ends a model's ramp like a load-step timeout, and ramp requests count
+input tokens from the response `usage.prompt_tokens`. The load-step timeout
+(`--bringup-calibration-timeout-ms`) defaults to 5 seconds in this mode and to
+30 seconds with calibration alone, where a ramp that measures nothing stops
+Pylon. If those responses have no `usage.prompt_tokens`, Pylon
+logs a warning and counts prompt characters instead, as calibration alone does.
+If a model's calibration fails or measures no input rate,
+Pylon logs a warning and starts that model at the `--initial-input-tps` value.
+An unhealthy upstream still fails startup. `PYLON_DO_CALIBRATION` and
+`PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` set the two calibration flags from the
+environment; a command-line flag takes precedence.
 
 Labels:
 
