@@ -62,6 +62,68 @@ bao_admin bao secrets list -detailed
 bao_admin bao plugin info secret vault-plugin-secrets-jwt
 ```
 
+### JWT canary
+
+The preflight needs a successful signed JWT and its public verification key.
+This check signs a token on one JWT mount and verifies it against the mount's
+public keys. It needs `bao_admin` from the previous block and the Python
+`cryptography` package. Keep its output as the baseline before the bridge and
+repeat it after each state transition.
+
+List the JWT mounts and pick one with a role:
+
+```bash
+bao_admin bao secrets list -detailed -format=json | jq -r 'to_entries[] | select(.value.type == "vault-plugin-secrets-jwt") | .key'
+bao_admin bao list services/<name>/jwt/roles
+```
+
+Define the check and run it for a mount and role:
+
+```bash
+jwt_canary() {
+  local mount=$1 role=$2 token jwks
+  token=$(bao_admin sh -c "echo '{\"claims\":{}}' | bao write -format=json $mount/sign/$role -" |
+    jq -er .data.token) || return 1
+  jwks=$(bao_admin bao read -format=json "$mount/jwks" | jq -c .data) || return 1
+  TOKEN="$token" JWKS="$jwks" python3 - <<'PY'
+import base64, json, os
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
+
+def decode(part):
+    return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+header_b64, payload_b64, signature_b64 = os.environ["TOKEN"].split(".")
+header = json.loads(decode(header_b64))
+keys = {key["kid"]: key for key in json.loads(os.environ["JWKS"])["keys"]}
+key = keys[header["kid"]]
+message = (header_b64 + "." + payload_b64).encode()
+signature = decode(signature_b64)
+if key["kty"] == "RSA":
+    public = rsa.RSAPublicNumbers(int.from_bytes(decode(key["e"]), "big"),
+                                  int.from_bytes(decode(key["n"]), "big")).public_key()
+    public.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+elif key["kty"] == "EC":
+    curve, digest, size = {"P-256": (ec.SECP256R1(), hashes.SHA256(), 32),
+                           "P-384": (ec.SECP384R1(), hashes.SHA384(), 48),
+                           "P-521": (ec.SECP521R1(), hashes.SHA512(), 66)}[key["crv"]]
+    public = ec.EllipticCurvePublicNumbers(int.from_bytes(decode(key["x"]), "big"),
+                                           int.from_bytes(decode(key["y"]), "big"),
+                                           curve).public_key()
+    r, s = int.from_bytes(signature[:size], "big"), int.from_bytes(signature[size:], "big")
+    public.verify(utils.encode_dss_signature(r, s), message, ec.ECDSA(digest))
+else:
+    raise SystemExit("unsupported key type " + key["kty"])
+print("JWT canary OK alg=%s kid=%s" % (header["alg"], header["kid"]))
+PY
+}
+jwt_canary services/<name>/jwt <role>
+```
+
+The command passes the claims as JSON on standard input, because `bao write`
+cannot take a map on its command line. A failed signature, a missing key or a
+token that does not verify makes the function return an error.
+
 Confirm the unversioned catalog SHA equals the bridge's original binary SHA
 for every server architecture. Compare before replacing any pod; otherwise
 an incompatible bridge can make existing mounts unusable on restart.

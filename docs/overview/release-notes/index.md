@@ -7,8 +7,10 @@ lists the stack releases selected for this docs edition.
 ## Current
 
 - [1.0.1 Release Notes](./1.0.1.md)
+- [Upgrade from NVCF 1.0.4 to NVCF 1.1.1](./1.0.4-to-1.1.1-upgrade.md)
+- [Upgrade from NVCF 1.1.0 to NVCF 1.1.1](./1.1.0-to-1.1.1-upgrade.md)
 - [Upgrade from NVCF 1.0.1 to NVCF 1.1.0](./1.0.1-to-1.1.0-upgrade.md)
-- [Upgrade from docs 1.0.2 or 1.0.3 to NVCF 1.0.4](./1.0.2-to-1.0.4-upgrade.md)
+- [Upgrade from docs 1.0.1, 1.0.2 or 1.0.3 to NVCF 1.0.4](./1.0.2-to-1.0.4-upgrade.md)
 - [Upgrade from 0.6.2 to 1.0.1](./0.6.1-to-1.0.1-upgrade.md)
 
 ## Legacy
