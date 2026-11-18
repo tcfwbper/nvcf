@@ -275,6 +275,10 @@ spec:
           - --nvca-worker-degradation-period
           - {{ .Values.agent.workerDegradationPeriod | quote }}
           {{- end }}
+          {{- if ((.Values.agent).workerContainerRestartCountToFailInstance) }}
+          - --nvca-worker-container-restart-count-to-fail-instance
+          - {{ .Values.agent.workerContainerRestartCountToFailInstance | int | quote }}
+          {{- end }}
           {{- if and ((.Values.agent).secretMirrorLabelSelector) ((.Values.agent).secretMirrorNamespace) }}
           - --nvca-secret-mirror-source-namespace
           - "{{ .Values.agent.secretMirrorNamespace }}"

@@ -64,6 +64,30 @@ func IsUtilsPod(pod *corev1.Pod) bool {
 	return false
 }
 
+// isWorkerContainer reports whether the named container is the NVCA worker: the "utils" container of the static
+// "utils" Pod for Helm functions, or the worker container that carries the instance ID for container functions.
+// Sidecars such as ESS in the Helm "utils" Pod are not the worker.
+func isWorkerContainer(pod *corev1.Pod, containerName string) bool {
+	if pod.Name == common.UtilsPodName && IsMiniServiceNamespaceName(pod.Namespace) {
+		return containerName == common.UtilsContainerName
+	}
+	if containerName != common.UtilsContainerName && containerName != function.LLMWorkerContainerName {
+		return false
+	}
+	for _, c := range pod.Spec.Containers {
+		if c.Name != containerName {
+			continue
+		}
+		for _, env := range c.Env {
+			if env.Name == InstanceIDEnvKey {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // IsPodReadyConditionTrue returns true if a pod is ready; false otherwise.
 func isPodReadyConditionTrue(status corev1.PodStatus) bool {
 	condition := getPodReadyCondition(status)
@@ -273,13 +297,17 @@ type ContainerStuckInitializing struct {
 	Message string
 }
 
-// IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times
-// in a Pod launched more than PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during
-// the Pod's lifetime, so a container whose latest run exited with code 0 after the Pod became Ready is not
-// counted: the app ended on purpose (for example a streaming app that quits when its session ends) and the
-// kubelet restarted it in place.
+// IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times, or
+// WorkerContainerRestartCountToFailInstance times for the NVCA worker container, in a Pod launched more than
+// PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during the Pod's lifetime, so a
+// container whose latest run exited with code 0 after the Pod became Ready is not counted: the app ended on purpose
+// (for example a streaming app that quits when its session ends) and the kubelet restarted it in place.
 func IsContainerInRestartLoop(pod *corev1.Pod, cs corev1.ContainerStatus, k8sTimeConfig *TimeConfig) bool {
-	if cs.RestartCount < RestartCountToFailInstance ||
+	threshold := RestartCountToFailInstance
+	if isWorkerContainer(pod, cs.Name) {
+		threshold = k8sTimeConfig.workerRestartCountToFailInstance()
+	}
+	if cs.RestartCount < threshold ||
 		!IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
 		return false
 	}

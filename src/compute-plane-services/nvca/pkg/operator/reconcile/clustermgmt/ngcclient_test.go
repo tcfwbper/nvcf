@@ -915,6 +915,49 @@ func TestWithAgentConfigMapper(t *testing.T) {
 		assert.Contains(t, err.Error(), "failed to parse worker degradation period minutes")
 	})
 
+	t.Run("maps container restart count to fail instance", func(t *testing.T) {
+		src := &clusterDTO{
+			ClusterConfigurations: CaseInsensitiveClusterConfigMap{
+				NVCAWorkerContainerRestartCountToFailInstanceConfig: "5",
+			},
+		}
+		dest := &Cluster{NVCFBackend: &nvidiaiov1.NVCFBackend{}}
+
+		err := withAgentConfigMapper()(ctx, nvidiaiov1.EnvTypeProd, src, dest)
+		require.NoError(t, err)
+		assert.Equal(t, int32(5), dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance)
+	})
+
+	t.Run("maps negative container restart count to fail instance to the default", func(t *testing.T) {
+		src := &clusterDTO{
+			ClusterConfigurations: CaseInsensitiveClusterConfigMap{
+				NVCAWorkerContainerRestartCountToFailInstanceConfig: "-1",
+			},
+		}
+		dest := &Cluster{NVCFBackend: &nvidiaiov1.NVCFBackend{}}
+
+		err := withAgentConfigMapper()(ctx, nvidiaiov1.EnvTypeProd, src, dest)
+		require.NoError(t, err)
+		assert.Equal(t, int32(0), dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance)
+	})
+
+	t.Run("ignores invalid container restart count to fail instance and maps other settings", func(t *testing.T) {
+		for _, value := range []string{"five", "99999999999"} {
+			src := &clusterDTO{
+				ClusterConfigurations: CaseInsensitiveClusterConfigMap{
+					NVCAWorkerContainerRestartCountToFailInstanceConfig: value,
+					AgentPriorityClassNameConfig:                        "high-priority",
+				},
+			}
+			dest := &Cluster{NVCFBackend: &nvidiaiov1.NVCFBackend{}}
+
+			err := withAgentConfigMapper()(ctx, nvidiaiov1.EnvTypeProd, src, dest)
+			require.NoError(t, err, value)
+			assert.Equal(t, int32(0), dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance, value)
+			assert.Equal(t, "high-priority", dest.NVCFBackend.Spec.AgentConfig.DeploymentConfig.PriorityClassName, value)
+		}
+	})
+
 	t.Run("handles nil cluster configurations", func(t *testing.T) {
 		src := &clusterDTO{
 			ClusterConfigurations: nil,
@@ -1022,6 +1065,27 @@ func TestCaseInsensitiveClusterConfigMap(t *testing.T) {
 				expected: CaseInsensitiveClusterConfigMap{
 					AgentNodeSelectorLabelKeyConfig:   "node-pool",
 					AgentNodeSelectorLabelValueConfig: "gpu-pool",
+				},
+			},
+			{
+				name: "exact canonical case wins over case variants",
+				jsonData: `{
+					"nvcaworkercontainerrestartcounttofailinstance": "8",
+					"NVCAWorkerContainerRestartCountToFailInstance": "5",
+					"NVCAWORKERCONTAINERRESTARTCOUNTTOFAILINSTANCE": "9"
+				}`,
+				expected: CaseInsensitiveClusterConfigMap{
+					NVCAWorkerContainerRestartCountToFailInstanceConfig: "5",
+				},
+			},
+			{
+				name: "case variants without the canonical spelling resolve in sorted key order",
+				jsonData: `{
+					"nvcaworkercontainerrestartcounttofailinstance": "8",
+					"NVCAWORKERCONTAINERRESTARTCOUNTTOFAILINSTANCE": "9"
+				}`,
+				expected: CaseInsensitiveClusterConfigMap{
+					NVCAWorkerContainerRestartCountToFailInstanceConfig: "8",
 				},
 			},
 		}

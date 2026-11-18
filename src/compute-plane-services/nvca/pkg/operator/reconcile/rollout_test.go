@@ -1319,6 +1319,24 @@ func TestHasAgentWorkerConfigChanged_DynamicConfigNoRepeatedRollout(t *testing.T
 			expectedRollout: true,
 			description:     "NGC worker config changed, should trigger rollout",
 		},
+		{
+			name:           "rollout when NGC container restart threshold changes",
+			version:        "v2.44.0",
+			bcWorkerConfig: nvidiaiov1.NVCFWorkerConfig{},
+			nbSpecWorkerConfig: nvidiaiov1.NVCFWorkerConfig{
+				CacheMountOptionsEnabled:                  true,
+				CacheMountOptions:                         "local",
+				WorkerDegradationPeriod:                   300000000000,
+				WorkerContainerRestartCountToFailInstance: 5,
+			},
+			nbStatusWorkerConfig: nvidiaiov1.NVCFWorkerConfig{
+				CacheMountOptionsEnabled: true,
+				CacheMountOptions:        "local",
+				WorkerDegradationPeriod:  300000000000,
+			},
+			expectedRollout: true,
+			description:     "Container restart threshold changed, should trigger rollout",
+		},
 	}
 
 	for _, tt := range tests {

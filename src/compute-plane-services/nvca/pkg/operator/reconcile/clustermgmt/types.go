@@ -19,6 +19,7 @@ package clustermgmt
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -65,6 +66,9 @@ const (
 	// NVCFWorkerDegradationPeriodMinutesConfig specifies the time period in minutes before a worker is considered degraded
 	NVCFWorkerDegradationPeriodMinutesConfig ClusterConfigurationKeyType = "NVCFWorkerDegradationPeriodMinutes"
 
+	// NVCAWorkerContainerRestartCountToFailInstanceConfig specifies the container restart count at which NVCA marks a function instance failed
+	NVCAWorkerContainerRestartCountToFailInstanceConfig ClusterConfigurationKeyType = "NVCAWorkerContainerRestartCountToFailInstance"
+
 	// NVCASecretMirrorSourceNamespaceConfig specifies the source namespace from which secrets should be mirrored to function namespaces
 	NVCASecretMirrorSourceNamespaceConfig ClusterConfigurationKeyType = "NVCASecretMirrorSourceNamespace"
 
@@ -88,22 +92,35 @@ func (m *CaseInsensitiveClusterConfigMap) UnmarshalJSON(data []byte) error {
 
 	// Build a lookup map of lowercase known keys to their canonical forms
 	knownKeys := map[string]ClusterConfigurationKeyType{
-		strings.ToLower(string(AgentNodeSelectorLabelKeyConfig)):          AgentNodeSelectorLabelKeyConfig,
-		strings.ToLower(string(AgentNodeSelectorLabelValueConfig)):        AgentNodeSelectorLabelValueConfig,
-		strings.ToLower(string(AgentPriorityClassNameConfig)):             AgentPriorityClassNameConfig,
-		strings.ToLower(string(ModelCacheVolumeMountOptionEnabledConfig)): ModelCacheVolumeMountOptionEnabledConfig,
-		strings.ToLower(string(ModelCacheVolumeMountOptionsConfig)):       ModelCacheVolumeMountOptionsConfig,
-		strings.ToLower(string(ClusterNetworkCIDRAllowedRangeConfig)):     ClusterNetworkCIDRAllowedRangeConfig,
-		strings.ToLower(string(NVCFWorkerDegradationPeriodMinutesConfig)): NVCFWorkerDegradationPeriodMinutesConfig,
-		strings.ToLower(string(NVCASecretMirrorSourceNamespaceConfig)):    NVCASecretMirrorSourceNamespaceConfig,
-		strings.ToLower(string(NVCASecretMirrorLabelSelectorConfig)):      NVCASecretMirrorLabelSelectorConfig,
+		strings.ToLower(string(AgentNodeSelectorLabelKeyConfig)):                     AgentNodeSelectorLabelKeyConfig,
+		strings.ToLower(string(AgentNodeSelectorLabelValueConfig)):                   AgentNodeSelectorLabelValueConfig,
+		strings.ToLower(string(AgentPriorityClassNameConfig)):                        AgentPriorityClassNameConfig,
+		strings.ToLower(string(ModelCacheVolumeMountOptionEnabledConfig)):            ModelCacheVolumeMountOptionEnabledConfig,
+		strings.ToLower(string(ModelCacheVolumeMountOptionsConfig)):                  ModelCacheVolumeMountOptionsConfig,
+		strings.ToLower(string(ClusterNetworkCIDRAllowedRangeConfig)):                ClusterNetworkCIDRAllowedRangeConfig,
+		strings.ToLower(string(NVCFWorkerDegradationPeriodMinutesConfig)):            NVCFWorkerDegradationPeriodMinutesConfig,
+		strings.ToLower(string(NVCASecretMirrorSourceNamespaceConfig)):               NVCASecretMirrorSourceNamespaceConfig,
+		strings.ToLower(string(NVCASecretMirrorLabelSelectorConfig)):                 NVCASecretMirrorLabelSelectorConfig,
+		strings.ToLower(string(NVCAWorkerContainerRestartCountToFailInstanceConfig)): NVCAWorkerContainerRestartCountToFailInstanceConfig,
 	}
 
-	// Normalize keys by matching them case-insensitively to known keys
-	for key, value := range temp {
+	// Normalize keys by matching them case-insensitively to known keys. Keys are visited in sorted order and the
+	// exact canonical spelling wins, so case variants of the same key resolve the same way on every call.
+	keys := make([]string, 0, len(temp))
+	for key := range temp {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	exact := make(map[ClusterConfigurationKeyType]bool)
+	for _, key := range keys {
+		value := temp[key]
 		lowerKey := strings.ToLower(key)
 		if canonicalKey, found := knownKeys[lowerKey]; found {
+			if exact[canonicalKey] {
+				continue
+			}
 			normalized[canonicalKey] = value
+			exact[canonicalKey] = key == string(canonicalKey)
 		} else {
 			// If key is not recognized, store it as-is (for forward compatibility)
 			normalized[ClusterConfigurationKeyType(key)] = value

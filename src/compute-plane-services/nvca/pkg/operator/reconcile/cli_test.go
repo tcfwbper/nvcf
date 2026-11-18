@@ -362,6 +362,7 @@ func TestOperatorCommand_NVCAFlags(t *testing.T) {
 	assert.True(t, flagNames["nvca-cache-mount-options-enabled"], "nvca-cache-mount-options-enabled flag should exist")
 	assert.True(t, flagNames["nvca-cache-mount-options"], "nvca-cache-mount-options flag should exist")
 	assert.True(t, flagNames["nvca-worker-degradation-period"], "nvca-worker-degradation-period flag should exist")
+	assert.True(t, flagNames["nvca-worker-container-restart-count-to-fail-instance"], "nvca-worker-container-restart-count-to-fail-instance flag should exist")
 	assert.True(t, flagNames["additional-image-pull-secrets-b64"], "additional-image-pull-secrets-b64 flag should exist")
 	assert.True(t, flagNames["agent-override-env-vars-json-b64"], "agent-override-env-vars-json-b64 flag should exist")
 

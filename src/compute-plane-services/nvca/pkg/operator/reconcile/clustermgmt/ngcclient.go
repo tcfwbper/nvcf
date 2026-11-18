@@ -33,6 +33,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
 	cmnhttp "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/http"
 	cmnsecret "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/secret"
+	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -497,7 +498,7 @@ func withOTelCollectorMapper() clusterMapper {
 }
 
 func withAgentConfigMapper() clusterMapper {
-	return func(_ context.Context, _ nvidiaiov1.EnvType, src *clusterDTO, dest *Cluster) error {
+	return func(ctx context.Context, _ nvidiaiov1.EnvType, src *clusterDTO, dest *Cluster) error {
 		if src.ClusterConfigurations == nil {
 			src.ClusterConfigurations = make(CaseInsensitiveClusterConfigMap)
 		}
@@ -556,11 +557,32 @@ func withAgentConfigMapper() clusterMapper {
 			workerDegradationPeriod = time.Duration(minutes) * time.Minute
 		}
 
+		var workerContainerRestartCountToFailInstance int32
+		if countStr := src.ClusterConfigurations[NVCAWorkerContainerRestartCountToFailInstanceConfig]; countStr != "" {
+			// An invalid value is ignored rather than returned as an error, so it does not block the other cluster
+			// settings from being reconciled.
+			log := core.GetLogger(ctx).WithFields(logrus.Fields{
+				"cluster_id": src.ID,
+				"config_key": NVCAWorkerContainerRestartCountToFailInstanceConfig,
+				"value":      countStr,
+			})
+			count, err := strconv.ParseInt(countStr, 10, 32)
+			switch {
+			case err != nil:
+				log.WithError(err).Warn("ignoring invalid cluster configuration override for the worker restart threshold")
+			case count < 0:
+				log.Warn("ignoring negative cluster configuration override for the worker restart threshold")
+			default:
+				workerContainerRestartCountToFailInstance = int32(count)
+			}
+		}
+
 		// Map NVCFWorkerConfig
 		dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig = nvidiaiov1.NVCFWorkerConfig{
-			CacheMountOptionsEnabled: cacheMountOptionsEnabled,
-			CacheMountOptions:        cacheMountOptions,
-			WorkerDegradationPeriod:  workerDegradationPeriod,
+			CacheMountOptionsEnabled:                  cacheMountOptionsEnabled,
+			CacheMountOptions:                         cacheMountOptions,
+			WorkerDegradationPeriod:                   workerDegradationPeriod,
+			WorkerContainerRestartCountToFailInstance: workerContainerRestartCountToFailInstance,
 		}
 
 		return nil

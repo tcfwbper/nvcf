@@ -249,6 +249,7 @@ func newCobraCommand(
 					NamespaceStuckTimeout:                     cfg.Workload.NamespaceStuckTimeout,
 					FailingObjectsBackoffTimeout:              cfg.Workload.FailingObjectsBackoffTimeout,
 					FailingObjectsBackoffRequeueInterval:      cfg.Workload.FailingObjectsBackoffRequeueInterval,
+					WorkerContainerRestartCountToFailInstance: cfg.Workload.WorkerContainerRestartCountToFailInstance,
 				},
 				FunctionEnvOverrides: cfg.Workload.EffectiveFunctionEnvOverrides(),
 				TaskEnvOverrides:     cfg.Workload.EffectiveTaskEnvOverrides(),

@@ -1015,9 +1015,10 @@ func TestSetupNVCADeployment_SelfHosted(t *testing.T) {
 		ngcServiceKeyFetcher: &mockTokenFetcher{token: "randomkey"},
 		envType:              nvidiaiov1.EnvTypeStage,
 		nvcfWorkerConfig: nvidiaiov1.NVCFWorkerConfig{
-			CacheMountOptionsEnabled: true,
-			CacheMountOptions:        "ro",
-			WorkerDegradationPeriod:  5 * time.Hour,
+			CacheMountOptionsEnabled:                  true,
+			CacheMountOptions:                         "ro",
+			WorkerDegradationPeriod:                   5 * time.Hour,
+			WorkerContainerRestartCountToFailInstance: 5,
 		},
 		workloadTolerations: []corev1.Toleration{{
 			Key:      "nvidia.com/test-workload",
@@ -1133,7 +1134,8 @@ func TestSetupNVCADeployment_SelfHosted(t *testing.T) {
 		},
 		Workload: nvcaconfig.WorkloadConfig{
 			WorkloadTimeConfig: nvcaconfig.WorkloadTimeConfig{
-				WorkerDegradationTimeout: 5 * time.Hour,
+				WorkerDegradationTimeout:                  5 * time.Hour,
+				WorkerContainerRestartCountToFailInstance: 5,
 			},
 			Tolerations: []corev1.Toleration{{
 				Key:      "nvidia.com/test-workload",
@@ -2843,17 +2845,20 @@ func TestBackendK8sCacheBuilder_WithNVCAConfig(t *testing.T) {
 	builder := NewBackendK8sCacheBuilder()
 
 	config := nvidiaiov1.NVCFWorkerConfig{
-		CacheMountOptionsEnabled: true,
-		CacheMountOptions:        "ro,noatime,nouuid",
-		WorkerDegradationPeriod:  2 * time.Hour,
+		CacheMountOptionsEnabled:                  true,
+		CacheMountOptions:                         "ro,noatime,nouuid",
+		WorkerDegradationPeriod:                   2 * time.Hour,
+		WorkerContainerRestartCountToFailInstance: 5,
 	}
 
-	newBuilder := builder.WithNVCFWorkerConfig(config.CacheMountOptionsEnabled, config.CacheMountOptions, config.WorkerDegradationPeriod)
+	newBuilder := builder.WithNVCFWorkerConfig(config.CacheMountOptionsEnabled, config.CacheMountOptions, config.WorkerDegradationPeriod,
+		config.WorkerContainerRestartCountToFailInstance)
 
 	// Verify the builder was updated correctly
 	assert.Equal(t, config.CacheMountOptionsEnabled, newBuilder.nvcfWorkerConfig.CacheMountOptionsEnabled)
 	assert.Equal(t, config.CacheMountOptions, newBuilder.nvcfWorkerConfig.CacheMountOptions)
 	assert.Equal(t, config.WorkerDegradationPeriod, newBuilder.nvcfWorkerConfig.WorkerDegradationPeriod)
+	assert.Equal(t, config.WorkerContainerRestartCountToFailInstance, newBuilder.nvcfWorkerConfig.WorkerContainerRestartCountToFailInstance)
 
 	// Verify original builder was updated
 	assert.Equal(t, newBuilder.nvcfWorkerConfig, builder.nvcfWorkerConfig)
@@ -3290,6 +3295,40 @@ func TestNewAgentConfig_CRTolerationsTakePrecedence(t *testing.T) {
 	cfg, err := bc.newAgentConfig(ctx, nb)
 	require.NoError(t, err)
 	assert.Equal(t, crTolerations, cfg.Agent.Tolerations)
+}
+
+func TestMergeAgentConfigs_WorkerContainerRestartThreshold(t *testing.T) {
+	tests := []struct {
+		name          string
+		clusterSource nvcaoptypes.ClusterSource
+		specValue     int32
+		helmValue     int32
+		want          int32
+	}{
+		{name: "ngc-managed falls back to the helm value", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, helmValue: 8, want: 8},
+		{name: "ngc-managed explicit value wins", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, specValue: 5, helmValue: 8, want: 5},
+		{name: "ngc-managed with neither set stays unset", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, want: 0},
+		{name: "helm-managed uses the helm value", clusterSource: nvcaoptypes.ClusterSourceHelmManaged, specValue: 5, helmValue: 8, want: 8},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bc := &BackendK8sCache{
+				nvcfWorkerConfig: nvidiaiov1.NVCFWorkerConfig{WorkerContainerRestartCountToFailInstance: tt.helmValue},
+			}
+			nb := &nvidiaiov1.NVCFBackend{
+				Spec: nvidiaiov1.NVCFBackendSpec{
+					NVCFBackendSpecT: nvidiaiov1.NVCFBackendSpecT{
+						ClusterSource: tt.clusterSource,
+						AgentConfig: nvidiaiov1.AgentConfig{
+							NVCFWorkerConfig: nvidiaiov1.NVCFWorkerConfig{WorkerContainerRestartCountToFailInstance: tt.specValue},
+						},
+					},
+				},
+			}
+			got := bc.mergeAgentConfigs(nb).NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestSetupNVCADeployment_AppliesAgentTolerations(t *testing.T) {

@@ -308,12 +308,14 @@ func (b *BackendK8sCacheBuilder) WithNVCFWorkerConfig(
 	cacheMountOptionsEnabled bool,
 	cacheMountOptions string,
 	workerDegradationPeriod time.Duration,
+	workerContainerRestartCountToFailInstance int32,
 ) *BackendK8sCacheBuilder {
 	next := *b
 	next.nvcfWorkerConfig = nvidiaiov1.NVCFWorkerConfig{
-		CacheMountOptionsEnabled: cacheMountOptionsEnabled,
-		CacheMountOptions:        cacheMountOptions,
-		WorkerDegradationPeriod:  workerDegradationPeriod,
+		CacheMountOptionsEnabled:                  cacheMountOptionsEnabled,
+		CacheMountOptions:                         cacheMountOptions,
+		WorkerDegradationPeriod:                   workerDegradationPeriod,
+		WorkerContainerRestartCountToFailInstance: workerContainerRestartCountToFailInstance,
 	}
 	return &next
 }

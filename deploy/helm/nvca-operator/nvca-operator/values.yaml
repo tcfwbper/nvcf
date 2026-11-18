@@ -273,6 +273,7 @@ resources:
 ## @param agent.cacheMountOptionsEnabled Enable or disable CSI volume mount options for NVCA caches
 ## @param agent.cacheMountOptions Comma-separated string of CSI volume mount options (e.g., "ro,noatime,nouuid") used when cacheMountOptionsEnabled is true
 ## @param agent.workerDegradationPeriod Duration for determining if a worker is degraded (e.g., "90m", "1h30m")
+## @param agent.workerContainerRestartCountToFailInstance NVCA worker (utils) container restart count at which NVCA marks a function instance failed and replaces it. Other containers always use 3. 0 uses the NVCA default of 3
 ## @param agent.secretMirrorNamespace Default namespace to mirror custom secrets for nvcf workloads
 ## @param agent.secretMirrorLabelSelector Label selector on the secrets in the sourceNamespace
 ## @param agent.customAnnotations Map of custom annotations to add to the agent pod
@@ -290,6 +291,7 @@ agent:
   cacheMountOptionsEnabled: true
   cacheMountOptions: "ro,norecovery,nouuid"
   workerDegradationPeriod: ""
+  workerContainerRestartCountToFailInstance: 0
   secretMirrorNamespace: nvca-operator
   secretMirrorLabelSelector: ""
   customAnnotations: {}

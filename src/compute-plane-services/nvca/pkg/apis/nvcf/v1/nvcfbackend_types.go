@@ -560,6 +560,9 @@ type NVCFWorkerConfig struct {
 	CacheMountOptionsEnabled bool          `json:"cacheMountOptionsEnabled"`
 	CacheMountOptions        string        `json:"cacheMountOptions,omitempty"`
 	WorkerDegradationPeriod  time.Duration `json:"workerDegradationPeriod,omitempty"`
+	// WorkerContainerRestartCountToFailInstance overrides the NVCA worker (utils) container restart count at
+	// which NVCA marks an instance failed. Other containers always use 3. Zero uses the NVCA default.
+	WorkerContainerRestartCountToFailInstance int32 `json:"workerContainerRestartCountToFailInstance,omitempty"`
 }
 
 type AgentConfig struct {

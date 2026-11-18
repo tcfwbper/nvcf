@@ -30,6 +30,7 @@ The operator supports cluster-level configuration options set via the NGC API du
 | `ModelCacheVolumeMountOptions` | Mount options (e.g., `vers=3.0,dir_mode=0777`) for model cache volumes |
 | `ClusterNetworkCIDRAllowedRange` | Allowed CIDR ranges for cluster network access |
 | `NVCFWorkerDegradationPeriodMinutes` | Time before a worker is considered degraded |
+| `NVCAWorkerContainerRestartCountToFailInstance` | NVCA worker (utils) container restart count at which a function instance is marked failed and replaced (default `3`; other containers always use `3`) |
 | `NVCASecretMirrorSourceNamespace` | Source namespace for secret mirroring to function namespaces |
 | `NVCASecretMirrorLabelSelector` | Label selector for secrets to mirror to function namespaces |
 
