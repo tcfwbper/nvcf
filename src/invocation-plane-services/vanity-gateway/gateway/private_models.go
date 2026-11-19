@@ -31,6 +31,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -48,13 +49,23 @@ import (
 const PrivateModelsHeader = "NVCF-Private-Models"
 
 const (
-	// The NVCF API applies the same account and API key resource checks here
-	// as it does to invocation, and lists each function version it allows.
-	privateModelLookupPath       = "/v2/nvcf/functions"
+	// The NVCF API applies the same account and API key resource checks to
+	// both listings as it does to invocation, version by version, and both
+	// need the list_functions scope. List Invocable Functions returns only id
+	// pairs. An NVCF API that answers 404 for it predates it, and the gateway
+	// uses the full function listing instead.
+	privateModelInvocablePath    = "/v2/nvcf/invocable/functions/versions/ids"
+	privateModelFunctionsPath    = "/v2/nvcf/functions"
 	privateModelLookupVisibility = "authorized,private"
+	// privateModelFallbackRecheck is how long the gateway uses the function
+	// listing after a 404 for List Invocable Functions.
+	privateModelFallbackRecheck = 10 * time.Minute
 
-	privateModelLookupTimeout     = 5 * time.Second
-	privateModelLookupCacheTTL    = time.Minute
+	privateModelLookupTimeout = 5 * time.Second
+	// Only authorized results are kept this long. A 401 or 403 is kept for
+	// privateModelLookupRetryAfter only, so a key that gains the list scope is
+	// not held back by an old rejection.
+	privateModelLookupCacheTTL    = 5 * time.Minute
 	privateModelLookupStaleTTL    = 15 * time.Minute
 	privateModelLookupRetryAfter  = 10 * time.Second
 	privateModelLookupCacheSize   = 4096
@@ -112,6 +123,11 @@ var nativeModelPaths = map[string]struct{}{"/v1/messages": {}, decisionsPath: {}
 // own limits. It is not an NVCF API failure.
 var errPrivateModelLookupLimited = errors.New("private model lookup skipped by the gateway's limits")
 
+// errNVCFNotFound is a 404 from the NVCF API. For List Invocable Functions, it
+// means that the NVCF API does not serve that listing yet, or that it found no
+// account for the caller.
+var errNVCFNotFound = errors.New("NVCF API returned status 404")
+
 // authorizedVersions maps each accessible function behind a private alias to
 // its accessible pinned versions.
 type authorizedVersions map[string]map[string]struct{}
@@ -146,12 +162,16 @@ type privateModelAccessEntry struct {
 // caller's API key may access. Results are cached per key. Each entry keeps
 // only functions that back private aliases, which bounds its size.
 type privateModelAccess struct {
-	lookupURL string
-	client    *http.Client
-	slots     *semaphore.Weighted
-	newKeys   *tokenBucket
-	lookups   singleflight.Group
-	now       func() time.Time
+	invocableURL string
+	functionsURL string
+	// fallbackUntil is when, in Unix nanoseconds, to try List Invocable
+	// Functions again after the NVCF API answered 404 for it.
+	fallbackUntil atomic.Int64
+	client        *http.Client
+	slots         *semaphore.Weighted
+	newKeys       *tokenBucket
+	lookups       singleflight.Group
+	now           func() time.Time
 
 	mu    sync.Mutex
 	cache map[string]privateModelAccessEntry
@@ -184,10 +204,14 @@ func newPrivateModelAccess(endpoint string, transport http.RoundTripper) (*priva
 	if base.Scheme == "" || base.Host == "" {
 		return nil, errors.New("invalid NVCF control plane endpoint: scheme and host are required")
 	}
-	lookupURL := base.JoinPath(privateModelLookupPath)
-	lookupURL.RawQuery = url.Values{"visibility": {privateModelLookupVisibility}}.Encode()
+	query := url.Values{"visibility": {privateModelLookupVisibility}}.Encode()
+	invocableURL := base.JoinPath(privateModelInvocablePath)
+	invocableURL.RawQuery = query
+	functionsURL := base.JoinPath(privateModelFunctionsPath)
+	functionsURL.RawQuery = query
 	return &privateModelAccess{
-		lookupURL: lookupURL.String(),
+		invocableURL: invocableURL.String(),
+		functionsURL: functionsURL.String(),
 		client: &http.Client{
 			Transport: transport,
 			// The request carries the caller's API key, so a redirect is a
@@ -258,8 +282,8 @@ func (a *privateModelAccess) authorizedVersions(request *http.Request, credentia
 // lookup runs detached from the caller's cancellation, because concurrent
 // requests with the same key share its result, and from the request's
 // processing record, because it is not the request's upstream dispatch. 401
-// and 403 are results, not errors: the key is invalid or cannot list
-// functions. A key that has never been authorized needs a token from the
+// and 403 are results, not errors: the key is invalid or lacks the scope the
+// listing needs. A key that has never been authorized needs a token from the
 // new-key budget, and no lookup waits for a slot.
 func (a *privateModelAccess) lookup(request *http.Request, authorization string, index privateModelIndex, known bool) (privateModelAccessEntry, error) {
 	unavailable := privateModelAccessEntry{result: privateModelsUnavailable}
@@ -274,7 +298,34 @@ func (a *privateModelAccess) lookup(request *http.Request, authorization string,
 	ctx, cancel := context.WithTimeout(middleware.WithoutRequestProcessing(context.WithoutCancel(request.Context())), privateModelLookupTimeout)
 	defer cancel()
 	ctx = middleware.ContextWithCallKind(ctx, middleware.CallKindModelAccess)
-	upstream, err := http.NewRequestWithContext(ctx, http.MethodGet, a.lookupURL, nil)
+
+	if a.now().UnixNano() >= a.fallbackUntil.Load() {
+		entry, err := a.readListing(ctx, request, authorization, a.invocableURL, index)
+		if !errors.Is(err, errNVCFNotFound) {
+			return entry, err
+		}
+		// A 404 can be about the caller rather than the route: the NVCF API
+		// answers 404 for a JWT whose client has no account, on both
+		// listings. This lookup falls back on its own. The pod switches to the
+		// function listing only when that listing answers for the same
+		// credential, which shows that the route is missing.
+		entry, err = a.readListing(ctx, request, authorization, a.functionsURL, index)
+		if err == nil {
+			a.fallbackUntil.Store(a.now().Add(privateModelFallbackRecheck).UnixNano())
+			zap.L().Info("NVCF API does not serve List Invocable Functions, using the function listing",
+				zap.String("request_id", request.Header.Get(middleware.RequestIDHeader)),
+				zap.Duration("recheck_after", privateModelFallbackRecheck))
+		}
+		return entry, err
+	}
+	return a.readListing(ctx, request, authorization, a.functionsURL, index)
+}
+
+// readListing requests a function version listing with the caller's key and
+// keeps the accessible versions behind private aliases.
+func (a *privateModelAccess) readListing(ctx context.Context, request *http.Request, authorization, listingURL string, index privateModelIndex) (privateModelAccessEntry, error) {
+	unavailable := privateModelAccessEntry{result: privateModelsUnavailable}
+	upstream, err := http.NewRequestWithContext(ctx, http.MethodGet, listingURL, nil)
 	if err != nil {
 		return unavailable, fmt.Errorf("build request: %w", err)
 	}
@@ -292,29 +343,39 @@ func (a *privateModelAccess) lookup(request *http.Request, authorization string,
 		_ = resp.Body.Close()
 	}()
 
-	now := a.now()
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusUnauthorized:
-		return privateModelAccessEntry{result: privateModelsUnauthenticated, fetched: now}, nil
+		return a.entry(privateModelsUnauthenticated, nil, index), nil
 	case http.StatusForbidden:
-		return privateModelAccessEntry{result: privateModelsForbidden, fetched: now}, nil
+		return a.entry(privateModelsForbidden, nil, index), nil
+	case http.StatusNotFound:
+		return unavailable, errNVCFNotFound
 	default:
 		return unavailable, fmt.Errorf("NVCF API returned status %d", resp.StatusCode)
 	}
-
-	versions, err := decodeAuthorizedVersions(io.LimitReader(resp.Body, privateModelLookupMaxBody), index)
+	versions, err := decodeListing(io.LimitReader(resp.Body, privateModelLookupMaxBody), index)
 	if err != nil {
 		return unavailable, fmt.Errorf("decode NVCF API response: %w", err)
 	}
-	return privateModelAccessEntry{versions: versions, result: privateModelsAuthorized, fetched: now, fingerprint: index.fingerprint}, nil
+	return a.entry(privateModelsAuthorized, versions, index), nil
 }
 
-// decodeAuthorizedVersions reads the function list one entry at a time. It
-// keeps each function in the index and only the versions that aliases pin. An
-// account can own many functions with many versions, so the response is never
-// held in memory whole.
-func decodeAuthorizedVersions(body io.Reader, index privateModelIndex) (authorizedVersions, error) {
+// entry is the cache entry for a completed lookup.
+func (a *privateModelAccess) entry(result string, versions authorizedVersions, index privateModelIndex) privateModelAccessEntry {
+	entry := privateModelAccessEntry{result: result, fetched: a.now()}
+	if result == privateModelsAuthorized {
+		entry.versions = versions
+		entry.fingerprint = index.fingerprint
+	}
+	return entry
+}
+
+// decodeListing reads a function version listing one entry at a time. It
+// keeps each function in the index, with only the versions that aliases pin.
+// An account can own many functions with many versions, so the listing is
+// never held in memory whole.
+func decodeListing(body io.Reader, index privateModelIndex) (authorizedVersions, error) {
 	decoder := stdjson.NewDecoder(body)
 	if err := expectJSONDelim(decoder, '{'); err != nil {
 		return nil, err
@@ -332,34 +393,55 @@ func decodeAuthorizedVersions(body io.Reader, index privateModelIndex) (authoriz
 			}
 			continue
 		}
-		if err := expectJSONDelim(decoder, '['); err != nil {
-			return nil, err
-		}
-		for decoder.More() {
-			var function struct {
-				ID        string `json:"id"`
-				VersionID string `json:"versionId"`
-			}
-			if err := decoder.Decode(&function); err != nil {
-				return nil, err
-			}
-			id := strings.ToLower(function.ID)
-			if _, ok := index.routes[id]; !ok {
-				continue
-			}
-			if versions[id] == nil {
-				versions[id] = make(map[string]struct{})
-			}
-			version := strings.ToLower(function.VersionID)
-			if _, ok := index.pinned[id][version]; ok {
-				versions[id][version] = struct{}{}
-			}
-		}
-		if err := expectJSONDelim(decoder, ']'); err != nil {
+		if err := decodeLookupFunctions(decoder, index, versions); err != nil {
 			return nil, err
 		}
 	}
 	return versions, expectJSONDelim(decoder, '}')
+}
+
+func decodeLookupFunctions(decoder *stdjson.Decoder, index privateModelIndex, versions authorizedVersions) error {
+	if err := expectJSONDelim(decoder, '['); err != nil {
+		return err
+	}
+	for decoder.More() {
+		var function struct {
+			ID        string `json:"id"`
+			VersionID string `json:"versionId"`
+			Status    string `json:"status"`
+		}
+		if err := decoder.Decode(&function); err != nil {
+			return err
+		}
+		if !invocableStatus(function.Status) {
+			continue
+		}
+		id := strings.ToLower(function.ID)
+		if _, ok := index.routes[id]; !ok {
+			continue
+		}
+		if versions[id] == nil {
+			versions[id] = make(map[string]struct{})
+		}
+		version := strings.ToLower(function.VersionID)
+		if _, ok := index.pinned[id][version]; ok {
+			versions[id][version] = struct{}{}
+		}
+	}
+	return expectJSONDelim(decoder, ']')
+}
+
+// invocableStatus reports whether a listed function version accepts
+// invocations. List Invocable Functions returns only those versions, without a
+// status. The function listing returns every version with its status, and
+// invocation accepts only ACTIVE and DEGRADING versions.
+func invocableStatus(status string) bool {
+	switch strings.ToUpper(status) {
+	case "", "ACTIVE", "DEGRADING":
+		return true
+	default:
+		return false
+	}
 }
 
 func expectJSONDelim(decoder *stdjson.Decoder, want stdjson.Delim) error {
@@ -373,11 +455,18 @@ func expectJSONDelim(decoder *stdjson.Decoder, want stdjson.Delim) error {
 	return nil
 }
 
-// fresh returns the key's entry if it is within the cache TTL and, for an
-// authorized result, was computed for the same private function set.
+// fresh returns the key's entry while it is fresh. An authorized result is
+// fresh for the cache TTL if it was computed for the same private function
+// set. A 401 or 403 is fresh for privateModelLookupRetryAfter only, so a key
+// that gains the list scope sees its private models within seconds.
 func (a *privateModelAccess) fresh(key string, index privateModelIndex) (privateModelAccessEntry, bool) {
 	entry, ok := a.cached(key, privateModelLookupCacheTTL)
-	if !ok || (entry.result == privateModelsAuthorized && entry.fingerprint != index.fingerprint) {
+	switch {
+	case !ok:
+		return privateModelAccessEntry{}, false
+	case entry.result == privateModelsAuthorized && entry.fingerprint != index.fingerprint:
+		return privateModelAccessEntry{}, false
+	case entry.result != privateModelsAuthorized && !a.now().Before(entry.fetched.Add(privateModelLookupRetryAfter)):
 		return privateModelAccessEntry{}, false
 	}
 	return entry, true
@@ -394,10 +483,12 @@ func (a *privateModelAccess) cached(key string, maxAge time.Duration) (privateMo
 	return entry, true
 }
 
-// lastGood returns the key's last successful result while it is within the
-// stale window, or an unavailable result.
+// lastGood returns the key's last authorized result while it is within the
+// stale window, or an unavailable result. A 401 or 403 is not served stale: it
+// is fresh for privateModelLookupRetryAfter only, and after that a failed or
+// skipped refresh must not report a rejection the NVCF API did not repeat.
 func (a *privateModelAccess) lastGood(key string) privateModelAccessEntry {
-	if entry, ok := a.cached(key, privateModelLookupStaleTTL); ok {
+	if entry, ok := a.cached(key, privateModelLookupStaleTTL); ok && entry.result == privateModelsAuthorized {
 		return entry
 	}
 	return privateModelAccessEntry{result: privateModelsUnavailable}
