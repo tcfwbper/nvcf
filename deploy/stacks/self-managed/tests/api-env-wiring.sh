@@ -79,7 +79,7 @@ assert_render_failure() {
 }
 
 remote_pylon_expression='.api.remoteConfig.configData.nvcf.sidecars."llm-router-client-image"'
-remote_worker_address_expression='.api.remoteConfig.configData.nvcf."llm-request-router"."worker-address"'
+remote_worker_address_expression='.api.remoteConfig.configData.nvcf.llm."request-router"."worker-address"'
 manifest_pylon_expression='select(.kind == "ConfigMap" and .data."nvcf-api.yaml" != null) | .data."nvcf-api.yaml" | from_yaml | .nvcf.sidecars."llm-router-client-image"'
 
 # The public chart-native path overrides the computed default. Arbitrary remote
@@ -101,8 +101,9 @@ api:
         sidecars:
           llm-router-client-image: mirror.example.test/team/pylon:9.9.9
           retained-setting: keep-inside-sidecars
-        llm-request-router:
-          worker-address: wrong-owner.example.test:1
+        llm:
+          request-router:
+            worker-address: wrong-owner.example.test:1
   env:
     CUSTOM_API_ENV: configured
     LITERAL_TEMPLATE_VALUE: '{{ requiredEnv "DO_NOT_EVALUATE_API_ENV" }}'

@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.nvidia.nvcf.configuration.JacksonConfiguration;
 import com.nvidia.nvcf.rest.function.management.dto.LlmInvocationConfigDto;
 import com.nvidia.nvcf.rest.function.management.dto.PriorityDto;
+import java.time.Duration;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
@@ -47,6 +48,21 @@ class FunctionMapperServiceLlmInvocationConfigTest {
         var original = new LlmInvocationConfigDto(new PriorityDto(7L, null));
         assertThat(mapper.toLlmInvocationConfigDto(mapper.toLlmInvocationConfigJson(original)))
                 .isEqualTo(original);
+    }
+
+    @Test
+    void gracePeriodIsStoredOnlyWhenSupplied() {
+        assertThat(mapper.toLlmInvocationConfigJson(null)).isNull();
+        var withoutGracePeriod = mapper.toLlmInvocationConfigJson(new LlmInvocationConfigDto(null));
+        assertThat(mapper.toLlmInvocationConfigDto(withoutGracePeriod)
+                .terminationGracePeriodDuration()).isNull();
+        assertThat(withoutGracePeriod).doesNotContain("terminationGracePeriodDuration");
+        var withCustom = mapper.toLlmInvocationConfigJson(
+                new LlmInvocationConfigDto(new PriorityDto(7L, null), Duration.ofMinutes(5)));
+        assertThat(mapper.toLlmInvocationConfigDto(withCustom))
+                .isEqualTo(new LlmInvocationConfigDto(new PriorityDto(7L, null), Duration.ofMinutes(5)));
+        assertThat(mapper.toLlmInvocationConfigDto("{\"version\":1}")
+                .terminationGracePeriodDuration()).isNull();
     }
 
     @Test

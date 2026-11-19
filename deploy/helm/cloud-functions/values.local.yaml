@@ -52,7 +52,8 @@ api:
   remoteConfig:
     configData:
       nvcf:
-        llm-request-router:
-          # Local worker-facing LLM request router endpoint. Split control/compute-plane
-          # environments should override this with a routable external host:port.
-          worker-address: "llm-request-router.nvcf.svc.cluster.local:50071"
+        llm:
+          request-router:
+            # Local worker-facing LLM request router endpoint. Split control/compute-plane
+            # environments should override this with a routable external host:port.
+            worker-address: "llm-request-router.nvcf.svc.cluster.local:50071"

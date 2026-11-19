@@ -1061,7 +1061,7 @@ natsAuthCalloutService:
 {{- $_ := set $stackNvcfRemoteConfig "sidecars" (dict $pylonRemoteConfigKey $effectivePylonImage) }}
 {{- end }}
 {{- if $llmEnabled }}
-{{- $_ := set $stackNvcfRemoteConfig "llm-request-router" (dict "worker-address" $llmRequestRouterWorkerAddress) }}
+{{- $_ := set $stackNvcfRemoteConfig "llm" (dict "request-router" (dict "worker-address" $llmRequestRouterWorkerAddress)) }}
 {{- end }}
 {{- if $stackNvcfRemoteConfig }}
 {{- $_ := set $stackApiRemoteConfigData "nvcf" $stackNvcfRemoteConfig }}

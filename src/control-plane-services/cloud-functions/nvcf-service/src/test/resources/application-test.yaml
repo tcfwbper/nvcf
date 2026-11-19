@@ -82,8 +82,9 @@ nvcf:
   request:
     timeout: 1s # only whole seconds
   fqdn: http://localhost:${server.port}
-  llm-request-router:
-    worker-address: llm-request-router.example.com:50071
+  llm:
+    request-router:
+      worker-address: llm-request-router.example.com:50071
   sidecars:
     inference-container: stg.nvcr.io/nvidia/tritonserver:23.04-py3
     init-container: stg.nvcr.io/nv-cf/nvcf-core/nvcf_worker_init:0.7.0

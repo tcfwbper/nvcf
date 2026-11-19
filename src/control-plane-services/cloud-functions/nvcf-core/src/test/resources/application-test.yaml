@@ -184,8 +184,9 @@ nvcf:
     timeout: 1s # only whole seconds
   fqdn: http://localhost:${server.port}
   global-fqdn-grpc: http://localhost:${spring.grpc.server.port}
-  llm-request-router:
-    worker-address: llm-request-router.example.com:50071
+  llm:
+    request-router:
+      worker-address: llm-request-router.example.com:50071
   sidecars:
     tracing-key: ${kv.worker-tracing}
     hostname: stg.nvcr.io

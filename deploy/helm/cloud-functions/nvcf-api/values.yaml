@@ -277,8 +277,9 @@ api:
         notary:
           turn:
             enabled: true
-        llm-request-router:
-          # Worker-facing endpoint advertised to LLM worker containers as
-          # LLM_REQUEST_ROUTER_ADDRESS. Deployment overlays must provide a
-          # routable address for their topology.
-          worker-address: ""
+        llm:
+          request-router:
+            # Worker-facing endpoint advertised to LLM worker containers as
+            # LLM_REQUEST_ROUTER_ADDRESS. Deployment overlays must provide a
+            # routable address for their topology.
+            worker-address: ""

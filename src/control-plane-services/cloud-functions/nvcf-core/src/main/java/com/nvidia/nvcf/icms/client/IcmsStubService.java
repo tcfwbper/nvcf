@@ -97,6 +97,8 @@ public interface IcmsStubService {
             @RequestParam(value = "LaunchSpecification.Attributes",
                           required = false) Set<String> attributes,
             @RequestParam("FunctionDetails.FunctionType") FunctionType functionType,
+            @RequestParam(value = "FunctionDetails.TerminationGracePeriodDuration",
+                          required = false) String terminationGracePeriodDuration,
             @RequestParam(value = "LaunchSpecification.Telemetries",
                           required = false) String telemetries,
             @RequestParam(value = "LaunchSpecification.HelmValidationPolicy",

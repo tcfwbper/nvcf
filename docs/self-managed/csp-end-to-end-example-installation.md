@@ -335,7 +335,7 @@ into launched worker pods. Both layers are required for multi-cluster function
 execution.
 
 The stack maps the effective `llmRequestRouterAddress` to the NVCF API
-remote-config key `nvcf.llm-request-router.worker-address` only when the LLM
+remote-config key `nvcf.llm.request-router.worker-address` only when the LLM
 addon is enabled. Do not place this value under `api.env`.
 
 Workers must also reach the control-plane pod that holds their request. For

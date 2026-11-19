@@ -70,6 +70,7 @@ import com.nvidia.nvcf.rest.account.TestAccountService;
 import com.nvidia.nvcf.rest.function.deployment.TestDeploymentService;
 import com.nvidia.nvcf.rest.function.deployment.dto.HelmValidationPolicyDto;
 import com.nvidia.nvcf.rest.function.management.dto.FunctionModelDto;
+import com.nvidia.nvcf.rest.function.management.dto.LlmInvocationConfigDto;
 import com.nvidia.nvcf.rest.queue.TestQueueService;
 import com.nvidia.nvcf.rest.registry.dto.DockerConfigJsonAuthDto;
 import com.nvidia.nvcf.rest.registry.dto.DockerConfigJsonDto;
@@ -82,6 +83,7 @@ import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
@@ -111,7 +113,8 @@ import tools.jackson.databind.json.JsonMapper;
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
                 "spring.profiles.active=test",
-                "nvcf.global-fqdn-grpc=http://localhost:9090"
+                "nvcf.global-fqdn-grpc=http://localhost:9090",
+                "nvcf.llm.worker.termination-grace-period.min=PT2M"
         })
 @ContextConfiguration(initializers = IntegrationTestConfiguration.Initializer.class)
 class IcmsClientTest {
@@ -537,6 +540,64 @@ class IcmsClientTest {
                                      List.of("stg.nvcr.io", "canary.nvcr.io"));
         validateFunctionName(formUrlEncodedBody, TEST_FUNCTION_NAME);
         validateHelmPolicy(formUrlEncodedBody, policyDto);
+    }
+
+    @Test
+    void llmLaunchSendsStoredGracePeriodInBothFields() {
+        var function = testService.createTestFunctionEntity(TEST_FUNCTION_ID, TEST_VERSION_ID_1,
+                                                            TEST_NCA_ID, TEST_FUNCTION_NAME);
+        function.setFunctionType(FunctionType.LLM);
+        function.setLlmConfig(functionMapperService.toLlmInvocationConfigJson(
+                new LlmInvocationConfigDto(null, Duration.ofMinutes(3))));
+        var deployment = testService.createDeploymentEntity(
+                TEST_FUNCTION_ID, TEST_VERSION_ID_1, TEST_DEPLOYMENT_ID, TEST_NCA_ID);
+        var gpuSpec = GpuSpecificationEntity.builder()
+                .key(GpuSpecificationKey.builder().ncaId(TEST_NCA_ID)
+                        .deploymentId(TEST_DEPLOYMENT_ID).gpuSpecificationId(TEST_GPU_SPEC_ID)
+                        .build())
+                .gpu(T10).instanceType(T10_INSTANCE_TYPE).maxInstances(40).minInstances(1)
+                .maxRequestConcurrency(9).build();
+
+        icmsAllocatorService.scheduleNewInstance(function, deployment.getDeploymentId(), gpuSpec, 1);
+
+        var body = MockIcmsServer.getMockIcmsServer().getAllServeEvents()
+                .getFirst().getRequest().getBodyAsString();
+        var params = parseRequestParams(body);
+        assertThat(URLDecoder.decode(params.get("FunctionDetails.TerminationGracePeriodDuration"),
+                                      StandardCharsets.UTF_8)).isEqualTo("PT3M");
+        var env = new String(Base64.getDecoder().decode(URLDecoder.decode(
+                params.get("LaunchSpecification.Environment"), StandardCharsets.UTF_8)),
+                StandardCharsets.UTF_8);
+        assertThat(Arrays.asList(env.split("\n")))
+                .contains("TERMINATION_GRACE_PERIOD=PT3M");
+    }
+
+    @Test
+    void llmLaunchUsesDefaultWhenStoredConfigIsAbsent() {
+        var function = testService.createTestFunctionEntity(TEST_FUNCTION_ID, TEST_VERSION_ID_1,
+                                                            TEST_NCA_ID, TEST_FUNCTION_NAME);
+        function.setFunctionType(FunctionType.LLM);
+        function.setLlmConfig(null);
+        var deployment = testService.createDeploymentEntity(
+                TEST_FUNCTION_ID, TEST_VERSION_ID_1, TEST_DEPLOYMENT_ID, TEST_NCA_ID);
+        var gpuSpec = GpuSpecificationEntity.builder()
+                .key(GpuSpecificationKey.builder().ncaId(TEST_NCA_ID)
+                        .deploymentId(TEST_DEPLOYMENT_ID).gpuSpecificationId(TEST_GPU_SPEC_ID)
+                        .build())
+                .gpu(T10).instanceType(T10_INSTANCE_TYPE).maxInstances(40).minInstances(1)
+                .maxRequestConcurrency(9).build();
+
+        icmsAllocatorService.scheduleNewInstance(function, deployment.getDeploymentId(), gpuSpec, 1);
+
+        var params = parseRequestParams(MockIcmsServer.getMockIcmsServer().getAllServeEvents()
+                .getFirst().getRequest().getBodyAsString());
+        assertThat(URLDecoder.decode(params.get("FunctionDetails.TerminationGracePeriodDuration"),
+                                      StandardCharsets.UTF_8)).isEqualTo("PT2M");
+        var env = new String(Base64.getDecoder().decode(URLDecoder.decode(
+                params.get("LaunchSpecification.Environment"), StandardCharsets.UTF_8)),
+                StandardCharsets.UTF_8);
+        assertThat(Arrays.asList(env.split("\n")))
+                .contains("TERMINATION_GRACE_PERIOD=PT2M");
     }
 
     @Test

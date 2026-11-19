@@ -306,7 +306,7 @@ For a split control-plane and compute-plane deployment, override this value
 with a host and port that worker pods can reach.
 
 The stack maps the configured or default address to
-`api.remoteConfig.configData.nvcf.llm-request-router.worker-address`. The NVCF
+`api.remoteConfig.configData.nvcf.llm.request-router.worker-address`. The NVCF
 API then includes the address in LLM worker configuration. Do not configure
 the worker address under `api.env`. When the LLM addon is disabled, the stack
 does not pass a staged endpoint to the API chart.

@@ -19,10 +19,22 @@ package com.nvidia.nvcf.rest.function.management.dto;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.annotation.Nullable;
 import jakarta.validation.Valid;
+import java.time.Duration;
 
 @Schema(types = {"object"}, description = "Function-level LLM invocation configuration.")
 public record LlmInvocationConfigDto(
         @Nullable
         @Valid
         @Schema(description = "Function-level request priority configuration.")
-        PriorityDto priority) {}
+        PriorityDto priority,
+
+        @Nullable
+        @Schema(description = "ISO 8601 duration allowed for an LLM function to terminate. "
+                + "When absent, NVCF sends the configured minimum (PT1M by default) to ICMS at launch.",
+                example = "PT3M")
+        Duration terminationGracePeriodDuration) {
+
+    public LlmInvocationConfigDto(PriorityDto priority) {
+        this(priority, null);
+    }
+}

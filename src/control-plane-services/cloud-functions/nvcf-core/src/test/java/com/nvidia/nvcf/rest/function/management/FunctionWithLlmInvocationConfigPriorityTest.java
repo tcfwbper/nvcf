@@ -1,4 +1,5 @@
 /*
+/*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -52,6 +53,7 @@ import com.nvidia.nvcf.util.MockEssServer;
 import com.nvidia.nvcf.util.MockIcmsServer;
 import com.nvidia.nvcf.util.MockRevalServer;
 import java.net.URI;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -173,6 +175,8 @@ class FunctionWithLlmInvocationConfigPriorityTest {
         assertThat(created.llmInvocationConfig().priority().perAccountPriority())
                 .containsEntry(OVERRIDE_NCA_ID, 3L);
         assertThat(storedPriority(created.versionId())).isEqualTo(priority);
+        assertThat(functionLookupService.lookupUsingVersionIdOrThrow(created.versionId())
+                .getLlmConfig()).doesNotContain("terminationGracePeriodDuration");
     }
 
     @Test
@@ -186,8 +190,10 @@ class FunctionWithLlmInvocationConfigPriorityTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
         // A present llmInvocationConfig replaces the target and propagates to every sibling version.
-        assertThat(storedPriority(first.versionId())).isEqualTo(priorityConfig(2L, null));
-        assertThat(storedPriority(secondVersionId)).isEqualTo(priorityConfig(2L, null));
+        assertThat(storedPriority(first.versionId()).priority())
+                .isEqualTo(priorityConfig(2L, null).priority());
+        assertThat(storedPriority(secondVersionId).priority())
+                .isEqualTo(priorityConfig(2L, null).priority());
     }
 
     @Test
@@ -205,6 +211,7 @@ class FunctionWithLlmInvocationConfigPriorityTest {
         var stored = storedPriority(created.versionId());
         assertThat(stored).isNotNull();
         assertThat(stored.priority()).isNull();
+        assertThat(stored.terminationGracePeriodDuration()).isNull();
     }
 
     @Test
@@ -215,8 +222,8 @@ class FunctionWithLlmInvocationConfigPriorityTest {
         var newVersion = addLlmVersion(first.id(), name, null);
 
         // An omitted llmInvocationConfig on version-create inherits the function's existing value.
-        assertThat(storedPriority(newVersion.versionId()))
-                .isEqualTo(priorityConfig(7L, Map.of(OVERRIDE_NCA_ID, 3L)));
+        assertThat(storedPriority(newVersion.versionId()).priority())
+                .isEqualTo(priorityConfig(7L, Map.of(OVERRIDE_NCA_ID, 3L)).priority());
     }
 
     @Test
@@ -296,10 +303,10 @@ class FunctionWithLlmInvocationConfigPriorityTest {
 
         // A supplied llmInvocationConfig on version-create replaces and propagates to every sibling version.
         assertThat(newVersion.llmInvocationConfig().priority().defaultPriority()).isEqualTo(9L);
-        assertThat(storedPriority(first.versionId()))
-                .isEqualTo(priorityConfig(9L, Map.of(OVERRIDE_NCA_ID, 2L)));
-        assertThat(storedPriority(newVersion.versionId()))
-                .isEqualTo(priorityConfig(9L, Map.of(OVERRIDE_NCA_ID, 2L)));
+        assertThat(storedPriority(first.versionId()).priority())
+                .isEqualTo(priorityConfig(9L, Map.of(OVERRIDE_NCA_ID, 2L)).priority());
+        assertThat(storedPriority(newVersion.versionId()).priority())
+                .isEqualTo(priorityConfig(9L, Map.of(OVERRIDE_NCA_ID, 2L)).priority());
     }
 
     @Test
@@ -323,7 +330,8 @@ class FunctionWithLlmInvocationConfigPriorityTest {
         assertThat(response.getBody().function().llmInvocationConfig()).isNotNull();
         assertThat(response.getBody().function().llmInvocationConfig().priority().defaultPriority())
                 .isEqualTo(2L);
-        assertThat(storedPriority(created.versionId())).isEqualTo(priorityConfig(2L, null));
+        assertThat(storedPriority(created.versionId()).priority())
+                .isEqualTo(priorityConfig(2L, null).priority());
     }
 
     @Test
@@ -497,10 +505,10 @@ class FunctionWithLlmInvocationConfigPriorityTest {
         // sibling's staged instance, so neither write clobbers the other.
         assertModelConfig(first.versionId(), "9-M", "pulsar");
         assertModelConfig(secondVersionId, "9-M", "pulsar");
-        assertThat(storedPriority(first.versionId()))
-                .isEqualTo(priorityConfig(5L, Map.of(OVERRIDE_NCA_ID, 4L)));
-        assertThat(storedPriority(secondVersionId))
-                .isEqualTo(priorityConfig(5L, Map.of(OVERRIDE_NCA_ID, 4L)));
+        assertThat(storedPriority(first.versionId()).priority())
+                .isEqualTo(priorityConfig(5L, Map.of(OVERRIDE_NCA_ID, 4L)).priority());
+        assertThat(storedPriority(secondVersionId).priority())
+                .isEqualTo(priorityConfig(5L, Map.of(OVERRIDE_NCA_ID, 4L)).priority());
     }
 
     @Test
@@ -534,10 +542,130 @@ class FunctionWithLlmInvocationConfigPriorityTest {
         // propagates both to the existing sibling and stores both on the new version.
         assertModelConfig(first.versionId(), "7-M", "pulsar");
         assertModelConfig(newVersion.versionId(), "7-M", "pulsar");
-        assertThat(storedPriority(first.versionId()))
-                .isEqualTo(priorityConfig(9L, Map.of(OVERRIDE_NCA_ID, 2L)));
-        assertThat(storedPriority(newVersion.versionId()))
-                .isEqualTo(priorityConfig(9L, Map.of(OVERRIDE_NCA_ID, 2L)));
+        assertThat(storedPriority(first.versionId()).priority())
+                .isEqualTo(priorityConfig(9L, Map.of(OVERRIDE_NCA_ID, 2L)).priority());
+        assertThat(storedPriority(newVersion.versionId()).priority())
+                .isEqualTo(priorityConfig(9L, Map.of(OVERRIDE_NCA_ID, 2L)).priority());
+    }
+
+    @Test
+    void omittedConfigStaysAbsentAndReplacementClearsGracePeriod() {
+        var name = uniqueName("grace-default");
+        var created = createLlmFunction(name, null);
+        assertThat(created.llmInvocationConfig()).isNull();
+        assertThat(functionLookupService.lookupUsingVersionIdOrThrow(created.versionId())
+                .getLlmConfig()).isNull();
+        var inherited = addLlmVersion(created.id(), name, null);
+        assertThat(functionLookupService.lookupUsingVersionIdOrThrow(inherited.versionId())
+                .getLlmConfig()).isNull();
+
+        var updated = updateLlmInvocationConfig(created.id(), created.versionId(),
+                new LlmInvocationConfigDto(null, Duration.ofMinutes(3)));
+        assertThat(updated.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(storedPriority(created.versionId()).terminationGracePeriodDuration())
+                .isEqualTo(Duration.ofMinutes(3));
+
+        var reset = updateLlmInvocationConfig(created.id(), created.versionId(),
+                new LlmInvocationConfigDto(null));
+        assertThat(reset.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(storedPriority(created.versionId()).terminationGracePeriodDuration()).isNull();
+        assertThat(storedPriority(inherited.versionId()).terminationGracePeriodDuration()).isNull();
+    }
+
+    @Test
+    void gracePeriodUpdatePropagatesAndConfigWithoutItResetsAllVersions() {
+        var name = uniqueName("grace-update");
+        var first = createLlmFunction(name, null);
+        var second = addLlmVersion(first.id(), name, null);
+
+        var update = updateLlmInvocationConfig(first.id(), second.versionId(),
+                new LlmInvocationConfigDto(null, Duration.ofMinutes(5)));
+        assertThat(update.getStatusCode()).isEqualTo(HttpStatus.OK);
+        for (var id : List.of(first.versionId(), second.versionId())) {
+            assertThat(storedPriority(id).terminationGracePeriodDuration())
+                    .isEqualTo(Duration.ofMinutes(5));
+        }
+
+        var reset = updateLlmInvocationConfig(first.id(), first.versionId(),
+                new LlmInvocationConfigDto(null));
+        assertThat(reset.getStatusCode()).isEqualTo(HttpStatus.OK);
+        for (var id : List.of(first.versionId(), second.versionId())) {
+            assertThat(storedPriority(id).terminationGracePeriodDuration()).isNull();
+        }
+    }
+
+    @Test
+    void gracePeriodPropagatesAcrossVersionsAndOmittedConfigPreservesIt() {
+        var name = uniqueName("grace-versions");
+        var first = createLlmFunction(name,
+                new LlmInvocationConfigDto(null, Duration.ofMinutes(3)));
+        var second = addLlmVersion(first.id(), name, null);
+        assertThat(storedPriority(second.versionId()).terminationGracePeriodDuration())
+                .isEqualTo(Duration.ofMinutes(3));
+
+        var third = addLlmVersion(first.id(), name,
+                new LlmInvocationConfigDto(null, Duration.ofMinutes(5)));
+        for (var id : List.of(first.versionId(), second.versionId(), third.versionId())) {
+            assertThat(storedPriority(id).terminationGracePeriodDuration())
+                    .isEqualTo(Duration.ofMinutes(5));
+        }
+
+        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
+                                                    List.of(SCOPE_UPDATE_FUNCTION), 100);
+        var entity = RequestEntity.put(URI.create("/v2/nvcf/functions/" + first.id()
+                                                  + "/versions/" + second.versionId()))
+                .contentType(MediaType.APPLICATION_JSON)
+                .header("Authorization", "Bearer " + token)
+                .body(UpdateFunctionRequest.builder().tags(Set.of("team-a")).build());
+        assertThat(testRestTemplate.exchange(entity, FunctionResponse.class).getStatusCode())
+                .isEqualTo(HttpStatus.OK);
+        assertThat(storedPriority(second.versionId()).terminationGracePeriodDuration())
+                .isEqualTo(Duration.ofMinutes(5));
+    }
+
+    @Test
+    void negativeAndMalformedGracePeriodsAreRejected() {
+        var created = createLlmFunction(uniqueName("grace-invalid"), null);
+        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
+                                                    List.of(SCOPE_UPDATE_FUNCTION), 100);
+        for (var value : List.of("-PT1S", "PT0S", "PT59S", "PT5M1S", "ten minutes")) {
+            var entity = RequestEntity.put(URI.create("/v2/nvcf/functions/" + created.id()
+                                                      + "/versions/" + created.versionId()))
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .header("Authorization", "Bearer " + token)
+                    .body("{\"llmInvocationConfig\":{\"terminationGracePeriodDuration\":\""
+                            + value + "\"}}");
+            var response = testRestTemplate.exchange(entity, String.class);
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+            if (!value.equals("ten minutes")) {
+                assertThat(response.getBody()).contains(created.id().toString())
+                        .contains(created.versionId().toString())
+                        .contains("PT1M").contains("PT5M");
+            }
+        }
+        assertThat(storedPriority(created.versionId())).isNull();
+    }
+
+    @Test
+    void outOfRangeGracePeriodOnCreateIsRejected() {
+        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
+                                                    List.of(SCOPE_REGISTER_FUNCTION), 100);
+        var request = CreateFunctionRequest.builder()
+                .name(uniqueName("over-max-grace"))
+                .containerImage(TEST_NGC_CONTAINER_IMAGE)
+                .inferenceUrl(TEST_INFERENCE_URL)
+                .inferencePort(TEST_INFERENCE_PORT)
+                .functionType(FunctionTypeEnum.LLM)
+                .models(List.of(llmModel()))
+                .llmInvocationConfig(new LlmInvocationConfigDto(null, Duration.ofMinutes(5).plusSeconds(1)))
+                .build();
+        var entity = RequestEntity.post(URI.create("/v2/nvcf/functions"))
+                .contentType(MediaType.APPLICATION_JSON)
+                .header("Authorization", "Bearer " + token)
+                .body(request);
+
+        assertThat(testRestTemplate.exchange(entity, String.class).getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     private FunctionDto createLlmFunction(String name, LlmInvocationConfigDto llmConfig) {

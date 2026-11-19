@@ -62,37 +62,43 @@ read_remote_config_address() {
 
     /^[^[:space:]]/ {
       in_api = ($0 == "api:")
-      in_remote_config = in_config_data = in_nvcf = in_router = 0
+      in_remote_config = in_config_data = in_nvcf = in_llm = in_router = 0
       next
     }
 
     in_api && /^  [^[:space:]]/ {
       in_remote_config = ($0 == "  remoteConfig:")
-      in_config_data = in_nvcf = in_router = 0
+      in_config_data = in_nvcf = in_llm = in_router = 0
       next
     }
 
     in_remote_config && /^    [^[:space:]]/ {
       in_config_data = ($0 == "    configData:")
-      in_nvcf = in_router = 0
+      in_nvcf = in_llm = in_router = 0
       next
     }
 
     in_config_data && /^      [^[:space:]]/ {
       in_nvcf = ($0 == "      nvcf:")
-      in_router = 0
+      in_llm = in_router = 0
       next
     }
 
     in_nvcf && /^        [^[:space:]]/ {
-      in_router = ($0 == "        llm-request-router:")
+      in_llm = ($0 == "        llm:")
+      in_router = 0
       next
     }
 
-    in_router && /^          [^[:space:]]/ {
-      if ($0 ~ /^          worker-address:[[:space:]]*/) {
+    in_llm && /^          [^[:space:]]/ {
+      in_router = ($0 == "          request-router:")
+      next
+    }
+
+    in_router && /^            [^[:space:]]/ {
+      if ($0 ~ /^            worker-address:[[:space:]]*/) {
         address = $0
-        sub(/^          worker-address:[[:space:]]*/, "", address)
+        sub(/^            worker-address:[[:space:]]*/, "", address)
         first = substr(address, 1, 1)
         last = substr(address, length(address), 1)
         if ((first == "\"" && last == "\"") ||
@@ -213,8 +219,9 @@ printf '%s\n' \
   '  remoteConfig:' \
   '    configData:' \
   '      nvcf:' \
-  '        llm-request-router:' \
-  "          worker-address: $wrong_owner_address" \
+   '        llm:' \
+   '          request-router:' \
+   "            worker-address: $wrong_owner_address" \
   >"$work_dir/wrong-owner-values.yaml"
 if assert_remote_config_address "$work_dir/wrong-owner-values.yaml" \
   "$wrong_owner_address"; then

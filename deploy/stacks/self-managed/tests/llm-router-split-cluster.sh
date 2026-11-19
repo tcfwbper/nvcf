@@ -173,7 +173,7 @@ assert_value '.llmRequestRouter.grpcTls.dnsNames[0]' 'llm-grpc.example.com'
 assert_value '.llmRequestRouter.grpcTls.issuerRef.name' 'nvcf-openbao-pki'
 
 assert_file_value "$work_dir/api-values.yaml" \
-  '.api.remoteConfig.configData.nvcf.llm-request-router.worker-address' \
+  '.api.remoteConfig.configData.nvcf.llm.request-router.worker-address' \
   'https://llm-grpc.example.com:50071'
 assert_file_value "$work_dir/router-values.yaml" \
   '.llmRequestRouter.backendRouter.pylonGrpcDialAddress' \

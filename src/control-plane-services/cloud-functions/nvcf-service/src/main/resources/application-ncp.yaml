@@ -92,9 +92,10 @@ nvcf:
   global-fqdn-grpc: http://api.nvcf.svc.cluster.local:9090
   # Host:port the LLM router client dials to reach the request router.
   # Advertised to the LLM worker env as LLM_REQUEST_ROUTER_ADDRESS.
-  # Self-managed deployments override via the chart (NVCF_LLM_REQUEST_ROUTER_WORKER_ADDRESS).
-  llm-request-router:
-    worker-address: llm-request-router.nvcf.svc.cluster.local:50071
+  # Self-managed deployments override via the chart remote config.
+  llm:
+    request-router:
+      worker-address: llm-request-router.nvcf.svc.cluster.local:50071
   # Sidecar container images are configured in configData in nvcf-api-colocated-deploy/nvcf-api/values.yaml:
   # https://gitlab-master.nvidia.com/ncp/nvcf/application-services/nvcf-api-colocated-deploy/-/blob/main/nvcf-api/values.yaml
   sidecars:
