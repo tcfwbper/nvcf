@@ -21,6 +21,7 @@ scenarios:
   - {chart: deploy/helm/admin-token-issuer-proxy/chart, values: admin-token-issuer-proxy.yaml}
   - {chart: deploy/helm/api-keys-colocated/api-keys, values: api-keys-colocated.yaml}
   - {chart: deploy/helm/cassandra/helm, values: cassandra.yaml}
+  - {chart: deploy/helm/cert-manager, values: cert-manager.yaml}
   - {chart: deploy/helm/cloud-functions/nvcf-api, values: cloud-functions.yaml}
   - {chart: deploy/helm/container-cache/deploy, values: container-cache.yaml}
   - {chart: deploy/helm/encrypted-secret-store/ess-api, values: ess.yaml}
@@ -33,6 +34,7 @@ scenarios:
   - {chart: deploy/helm/icms/icms-api, values: icms.yaml}
   - {chart: deploy/helm/llm-api-gateway/llm-api-gateway, values: llm-api-gateway.yaml}
   - {chart: deploy/helm/llm-request-router/llm-request-router, values: llm-request-router.yaml}
+  - {chart: deploy/helm/nats, values: nats.yaml}
   - {chart: deploy/helm/notary/nvcf-notary-service, values: notary.yaml}
   - {chart: deploy/helm/nvca-operator/nvca-operator, values: nvca-operator.yaml}
   - {chart: deploy/helm/nvcf-pki, values: nvcf-pki-cluster-issuer.yaml}

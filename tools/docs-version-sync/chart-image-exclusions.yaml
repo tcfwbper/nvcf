@@ -4,12 +4,17 @@
 # Chart image coverage exclusions, read by TestChartImageCoverage.
 #
 # Every tracked Chart.yaml must either declare an image index (thirdPartyImages
-# or ownedImages in its values.yaml) and pass image coverage, or be listed here.
-# Keys are chart directories relative to the repository root.
+# or ownedImages in its values.yaml) and pass the chart image checks, or be
+# listed here. Keys are chart directories relative to the repository root.
 #
 # reason:
-#   pending-fix        Not yet remediated. Expected to fail coverage. Once the
-#                      chart passes, CI fails until this entry is removed.
+#   pending-fix        Not yet remediated. Expected to fail the chart image
+#                      checks, for example because it still prefills an image
+#                      registry or repository. Only coverage findings are
+#                      expected, including undeclared rendered images. An
+#                      invalid index, an incomplete CI values scenario or a
+#                      render error still fails CI. Once the chart passes, CI
+#                      fails until this entry is removed.
 #   test-fixture       Testdata, validator test charts, and samples that no
 #                      NVCF stack deploys. Skipped.
 #   no-runtime-image   Renders no image in its defaults or any CI values
@@ -30,6 +35,8 @@
 # pending-fix
 deploy/helm/admin-token-issuer-proxy/chart: {reason: pending-fix}
 deploy/helm/api-keys-colocated/api-keys: {reason: pending-fix}
+deploy/helm/cassandra/helm: {reason: pending-fix, issue: https://github.com/dsx-ai-factory/nvcf/issues/3297}
+deploy/helm/cert-manager: {reason: pending-fix, issue: https://github.com/dsx-ai-factory/nvcf/issues/3297}
 deploy/helm/cloud-functions/nvcf-api: {reason: pending-fix}
 deploy/helm/cloud-tasks/nvct-api: {reason: pending-fix}
 deploy/helm/container-cache/deploy: {reason: pending-fix}
@@ -42,10 +49,12 @@ deploy/helm/http-invocation/nvcf-invocation-service: {reason: pending-fix}
 deploy/helm/icms/icms-api: {reason: pending-fix}
 deploy/helm/llm-api-gateway/llm-api-gateway: {reason: pending-fix}
 deploy/helm/llm-request-router/llm-request-router: {reason: pending-fix}
+deploy/helm/nats: {reason: pending-fix, issue: https://github.com/dsx-ai-factory/nvcf/issues/3297}
 deploy/helm/nats-auth-callout: {reason: pending-fix}
 deploy/helm/notary/nvcf-notary-service: {reason: pending-fix}
 deploy/helm/nvca-operator/nvca-operator: {reason: pending-fix}
 deploy/helm/nvcf-unbound: {reason: pending-fix}
+deploy/helm/openbao/helm: {reason: pending-fix, issue: https://github.com/dsx-ai-factory/nvcf/issues/3297}
 deploy/helm/ratelimiter/nvcf-ratelimiter: {reason: pending-fix}
 deploy/helm/vanity-gateway/helm-nvcf-vanity-gateway: {reason: pending-fix}
 deploy/helm/worker-callback-proxy/worker-callback-proxy: {reason: pending-fix}

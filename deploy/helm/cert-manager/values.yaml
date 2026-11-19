@@ -13,9 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CI indexes the prefilled image settings below. Helm consumes those settings
-# directly; override them with ordinary values files. Empty tags inherit the
-# vendored chart's appVersion, keeping the shared version in one place.
+# CI indexes the image settings below. A chart must not choose an image
+# source: registry and repository belong in the stack base.yaml or a values
+# file. This chart still prefills them, so it renders without them today, and
+# is pending-fix in tools/docs-version-sync/chart-image-exclusions.yaml. Once
+# fixed, it must fail to render when either source is missing.
+# An image whose tag and digest are both empty inherits the vendored chart's
+# appVersion, keeping the shared version in one place. A digest with an empty
+# tag renders a digest-only reference.
 thirdPartyImages:
   certManagerController: cert-manager.image
   certManagerWebhook: cert-manager.webhook.image

@@ -14,9 +14,12 @@
 # limitations under the License.
 
 ---
-# CI indexes the prefilled image settings below. Helm consumes those settings
-# directly; override them with ordinary values files. NVCF builds retain
-# their owning image releases.
+# CI indexes the image settings below. A chart must not choose an image
+# source: registry and repository belong in the stack base.yaml or a values
+# file. This chart still prefills them, so it renders without them today, and
+# is pending-fix in tools/docs-version-sync/chart-image-exclusions.yaml. Once
+# fixed, it must fail to render when either source is missing.
+# NVCF builds retain their owning image releases.
 ownedImages:
   cassandraServer: cassandra.image
   cassandraMigrations: cassandra.migrations.image
