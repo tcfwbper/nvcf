@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -20,10 +21,14 @@ const (
 	findingPendingFixed = "pending-fix now passing"
 	findingInvalidEntry = "stale or invalid entry"
 	findingRenderError  = "render error"
-	findingCoverage     = "coverage"
+	// findingScenario: an indexed chart's CI values scenarios do not supply
+	// every image source. Without a complete scenario the override and guard
+	// checks cannot run, so even a pending-fix chart fails on it.
+	findingScenario = "incomplete scenario"
+	findingCoverage = "coverage"
 )
 
-var findingCategories = []string{findingUncovered, findingPendingFixed, findingInvalidEntry, findingRenderError, findingCoverage}
+var findingCategories = []string{findingUncovered, findingPendingFixed, findingInvalidEntry, findingRenderError, findingScenario, findingCoverage}
 
 // chartFinding is one line of the failure report.
 type chartFinding struct {
@@ -233,19 +238,6 @@ func undeclaredImages(catalog []catalogImage, manifest []byte) ([]string, error)
 	return missing, nil
 }
 
-// checkChartImageCoverage uses the release scanner so indirect image settings
-// are subject to the same declaration check as Pod and hook images.
-func checkChartImageCoverage(catalog []catalogImage, manifest []byte) error {
-	missing, err := undeclaredImages(catalog, manifest)
-	if err != nil {
-		return err
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("rendered images %s are absent from the chart image catalog", strings.Join(missing, ", "))
-	}
-	return nil
-}
-
 // imageOverrideTarget is where an override check moves every indexed image.
 type imageOverrideTarget struct {
 	Registry string
@@ -260,11 +252,14 @@ var (
 )
 
 // writeImageOverrides writes an ordinary values file that moves every image to
-// the target in its chart's own override shape, and returns the reference
-// each image identity must then render.
+// the target, with a separate registry and repository, and returns the
+// reference each image identity must then render.
 func writeImageOverrides(catalog []catalogImage, target imageOverrideTarget, path string) (map[string]string, error) {
 	values := make(map[string]any)
 	want := make(map[string]string)
+	// Repositories are lower case, so identities such as API and api would
+	// share a name; a numeric suffix keeps every expected reference distinct.
+	used := make(map[string]bool)
 	for _, image := range catalog {
 		parsed, err := parseResolvedImageReference(image.Reference)
 		if err != nil {
@@ -272,12 +267,17 @@ func writeImageOverrides(catalog []catalogImage, target imageOverrideTarget, pat
 		}
 		version := parsed.Version
 		if version == "" {
-			// A digest-only default still gets a tag, so every format's
-			// tag and digest fields are exercised.
+			// A digest-only default still gets a tag, so the tag and
+			// digest fields are both exercised.
 			version = "override"
 		}
-		repository := target.Repository + "/" + strings.ToLower(image.ID)
-		setImageValues(values, image.Path, image.Format.override(target.Registry, repository, version, target.Digest))
+		base := target.Repository + "/" + strings.ToLower(image.ID)
+		repository := base
+		for n := 1; used[repository]; n++ {
+			repository = base + "-" + strconv.Itoa(n)
+		}
+		used[repository] = true
+		setImageValue(values, image.Path, image.Exception.override(target.Registry, repository, version, target.Digest))
 		want[image.ID] = target.Registry + "/" + repository + ":" + version + "@" + target.Digest
 	}
 	encoded, err := yaml.Marshal(values)
@@ -287,9 +287,9 @@ func writeImageOverrides(catalog []catalogImage, target imageOverrideTarget, pat
 	return want, os.WriteFile(path, encoded, 0o600)
 }
 
-// setImageValues places override fields at a dotted path. Helm merges them
-// with the chart defaults when the file is rendered.
-func setImageValues(values map[string]any, path string, fields map[string]any) {
+// setImageValue places a value at a dotted path, keeping sibling fields.
+// Helm merges the written file with the chart values when it is rendered.
+func setImageValue(values map[string]any, path string, value any) {
 	keys := strings.Split(path, ".")
 	for _, key := range keys[:len(keys)-1] {
 		next, ok := values[key].(map[string]any)
@@ -299,5 +299,5 @@ func setImageValues(values map[string]any, path string, fields map[string]any) {
 		}
 		values = next
 	}
-	values[keys[len(keys)-1]] = fields
+	values[keys[len(keys)-1]] = value
 }

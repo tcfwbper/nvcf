@@ -20,6 +20,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 real_map="${repo_root}/tools/ci/helm-chart-values.yaml"
 fail=0
 
+# Temporary paths of the cases that register them, removed on any exit, so a
+# setup failure under set -e leaves nothing behind.
+temp_paths=()
+remove_temp_paths() {
+    rm -rf ${temp_paths[@]+"${temp_paths[@]}"}
+}
+trap remove_temp_paths EXIT
+
 run() {  # run <values-dir> [repo-root] [map] -> sets $out and $rc
     local values_dir="$1" root="${2:-${repo_root}}" map="${3:-${real_map}}"
     set +e
@@ -137,7 +145,9 @@ fake_chart_count=0
 make_fake_tree() {  # sets $fake_values_dir, $fake_chart_root, and $fake_chart_count from the real map
     local rel values
     fake_values_dir="$(mktemp -d)"
+    temp_paths+=("${fake_values_dir}")
     fake_chart_root="$(mktemp -d)"
+    temp_paths+=("${fake_chart_root}")
     fake_chart_count=0
     while read -r rel values; do
         [ -n "${rel}" ] || continue
@@ -265,6 +275,91 @@ if [ -f "${fake_chart_root}/deploy/helm/openbao/helm/charts/vendored-0.1.0.tgz" 
     printf 'ok   vendored charts directory contents preserved\n'
 else
     printf 'FAIL cleanup removed pre-existing charts directory contents\n'
+    fail=1
+fi
+rm -rf "${fake_values_dir}" "${fake_chart_root}"
+
+# A chart with an HTTPS dependency repository registers it before the build,
+# in a run-owned Helm repository config and cache, so a fresh checkout needs
+# no manual "helm repo add" and the caller's Helm config is untouched.
+make_fake_tree
+printf 'dependencies:\n  - {name: nats, repository: "https://charts.example/nats"}\n' \
+    >>"${fake_chart_root}/deploy/helm/openbao/helm/Chart.yaml"
+stub_dir="$(mktemp -d)"
+temp_paths+=("${stub_dir}")
+tmp_root="$(mktemp -d)"
+temp_paths+=("${tmp_root}")
+cat >"${stub_dir}/helm" <<'STUB'
+#!/usr/bin/env bash
+echo "$* config=${HELM_REPOSITORY_CONFIG:-unset} cache=${HELM_REPOSITORY_CACHE:-unset}" >>"${FAKE_HELM_LOG}"
+exit 0
+STUB
+chmod +x "${stub_dir}/helm"
+run_https_dependency() {  # run_https_dependency <log> -> sets $out and $rc
+    set +e
+    out="$(FAKE_HELM_LOG="$1" HELM_REPOSITORY_CONFIG=/caller/repositories.yaml \
+        HELM_REPOSITORY_CACHE=/caller/cache PATH="${stub_dir}:${PATH}" bash "${script}" \
+        --values-dir "${fake_values_dir}" --repo-root "${fake_chart_root}" --map "${real_map}" 2>&1)"
+    rc=$?
+    set -e
+}
+run_https_dependency "${tmp_root}/helm-1.log"
+expect "https dependency run succeeds" 0 "${fake_chart_count} scenarios linted and rendered"
+helm_log="${tmp_root}/helm-1.log"
+first_add="$(grep -n '^repo add --force-update .* https://charts.example/nats ' "${helm_log}" | head -1 | cut -d: -f1 || true)"
+first_build="$(grep -n '^dependency build ' "${helm_log}" | head -1 | cut -d: -f1 || true)"
+if [ -n "${first_add}" ] && [ -n "${first_build}" ] && [ "${first_add}" -lt "${first_build}" ]; then
+    printf 'ok   https dependency repository registered before the build\n'
+else
+    printf 'FAIL https dependency repository not registered before the build:\n%s\n' "$(cat "${helm_log}")"
+    fail=1
+fi
+# Every helm command, registration and build alike, uses one config and one
+# cache, both inside one run-owned directory that the run removes on exit.
+configs="$(sed -n 's/.* config=\([^ ]*\) cache=.*/\1/p' "${helm_log}" | sort -u)"
+caches="$(sed -n 's/.* cache=\([^ ]*\)$/\1/p' "${helm_log}" | sort -u)"
+home="$(dirname "${configs}")"
+if [ "$(printf '%s\n' "${configs}" | wc -l | tr -d ' ')" = 1 ] &&
+   [ "$(printf '%s\n' "${caches}" | wc -l | tr -d ' ')" = 1 ] &&
+   [ "$(dirname "${caches}")" = "${home}" ] &&
+   [ "${home}" != /caller ] && [ "${home}" != . ] && [ ! -e "${home}" ]; then
+    printf 'ok   helm repository config and cache isolated to one run-owned directory\n'
+else
+    printf 'FAIL helm repository config and cache not isolated to the run:\n%s\n' "$(cat "${helm_log}")"
+    fail=1
+fi
+run_https_dependency "${tmp_root}/helm-2.log"
+expect "second https dependency run succeeds" 0 "${fake_chart_count} scenarios linted and rendered"
+second_configs="$(sed -n 's/.* config=\([^ ]*\) cache=.*/\1/p' "${tmp_root}/helm-2.log" | sort -u)"
+if [ -n "${second_configs}" ] && [ "${second_configs}" != "${configs}" ]; then
+    printf 'ok   each run owns a new helm repository config\n'
+else
+    printf 'FAIL a second run reused helm repository config %s\n' "${second_configs}"
+    fail=1
+fi
+rm -rf "${stub_dir}" "${tmp_root}" "${fake_values_dir}" "${fake_chart_root}"
+
+# A failed dependency setup fails every scenario of the chart, not only the
+# one that ran it: a later scenario must not render an older archive.
+make_fake_tree
+multi="$(yq -r '[.scenarios[].chart] | group_by(.) | map(select(length > 1)) | .[0][0] // ""' "${real_map}")"
+if [ -n "${multi}" ]; then
+    printf 'dependencies:\n  - name: fixture\n' >>"${fake_chart_root}/${multi}/Chart.yaml"
+    stub_dir="$(mktemp -d)"
+    temp_paths+=("${stub_dir}")
+    printf '#!/usr/bin/env bash\n[ "${1:-}" != dependency ]\n' >"${stub_dir}/helm"
+    chmod +x "${stub_dir}/helm"
+    set +e
+    out="$(PATH="${stub_dir}:${PATH}" bash "${script}" \
+        --values-dir "${fake_values_dir}" --repo-root "${fake_chart_root}" --map "${real_map}" 2>&1)"
+    rc=$?
+    set -e
+    multi_count="$(yq -r "[.scenarios[] | select(.chart == \"${multi}\")] | length" "${real_map}")"
+    expect "failed dependency setup fails every scenario of the chart" 1 "${multi_count} of ${fake_chart_count} scenarios failed"
+    expect "later scenario names the earlier setup failure" 1 "failed in an earlier scenario"
+    rm -rf "${stub_dir}"
+else
+    printf 'FAIL the real map has no chart with several scenarios to exercise a failed setup\n'
     fail=1
 fi
 rm -rf "${fake_values_dir}" "${fake_chart_root}"
