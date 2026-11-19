@@ -13,3 +13,10 @@ openbao:
     image:
       registry: example.com
       repository: nvcf/nvcf-openbao-migrations
+  injector:
+    image:
+      registry: example.com
+      repository: hashicorp/vault-k8s
+    agentImage:
+      registry: example.com
+      repository: nvcf/nvcf-openbao

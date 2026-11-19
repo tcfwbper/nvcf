@@ -1,0 +1,21 @@
+# CI-only values for helm lint/template validation.
+cert-manager:
+  image:
+    registry: example.com
+    repository: jetstack/cert-manager-controller
+  webhook:
+    image:
+      registry: example.com
+      repository: jetstack/cert-manager-webhook
+  cainjector:
+    image:
+      registry: example.com
+      repository: jetstack/cert-manager-cainjector
+  startupapicheck:
+    image:
+      registry: example.com
+      repository: jetstack/cert-manager-startupapicheck
+  acmesolver:
+    image:
+      registry: example.com
+      repository: jetstack/cert-manager-acmesolver

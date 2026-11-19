@@ -1,0 +1,15 @@
+# CI-only values for helm lint/template validation.
+nats:
+  container:
+    image:
+      registry: example.com
+      repository: synadia/nats-server
+  reloader:
+    image:
+      registry: example.com
+      repository: natsio/nats-server-config-reloader
+  natsBox:
+    container:
+      image:
+        registry: example.com
+        repository: natsio/nats-box
