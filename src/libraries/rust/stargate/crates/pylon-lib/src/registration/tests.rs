@@ -41,7 +41,7 @@ use tower::util::MapRequestLayer;
 use crate::quic_http_tunnel::{TunnelError, TunnelForwardingConfig};
 use crate::request_quality_monitor::RequestQualityMonitorConfig;
 use crate::runtime_state::{CurrentModelStats, PylonRuntimeState, gated_model_status};
-use crate::stats::PylonMetrics;
+use crate::stats::{PylonMetrics, StartupReadiness};
 use crate::test_support::{RecordedTracingEvent, RecordingTracingSubscriber};
 
 use super::discovery::*;
@@ -955,6 +955,41 @@ async fn stats_changes_publish_before_the_heartbeat_and_coalesce() {
 
     client.shutdown().await;
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn readiness_turns_ready_only_after_a_router_acknowledges_registration() {
+    let cases = [
+        ("router acknowledges", None, true),
+        (
+            "router ends the stream without an ack",
+            Some(Err(Status::unavailable("registration rejected"))),
+            false,
+        ),
+    ];
+    for (label, terminal, expected_ready) in cases {
+        let ca = TestCertificateAuthority::new("registration-readiness-ca");
+        let mut server = TestTlsControlPlane::spawn_with_terminal(&ca, "localhost", terminal).await;
+        let mut config = test_registration_config();
+        config.seeds = vec![server.dial_url.clone()];
+        config.grpc_tls_ca_cert_pem = Some(ca.pem());
+        let readiness = StartupReadiness::default();
+        let mut client = InferenceServerRegistrationClient::with_readiness(readiness.clone());
+
+        client.start(config).expect("registration should start");
+        server.first_registration().await;
+        let became_ready = tokio::time::timeout(Duration::from_millis(500), async {
+            while !readiness.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        assert_eq!(became_ready, expected_ready, "{label}");
+        client.shutdown().await;
+        server.shutdown().await;
+    }
 }
 
 #[test]

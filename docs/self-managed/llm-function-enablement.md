@@ -70,9 +70,10 @@ per second. To start it at a measured rate instead, set
 `nvca-operator` chart values. `pylon` then measures each model's input rate
 before it registers. Older `pylon` versions ignore this variable and start at
 100. A model whose calibration fails starts at 100 and logs a warning.
-Calibration adds about 5 to 15 seconds per model name to worker startup. The
-worker pod can be Ready during that time. If the function has no other
-registered worker, a request then gets `404` with `no_eligible_candidates`.
+Calibration adds about 5 to 15 seconds per model name to worker startup. Unless
+`PYLON_READINESS_GATE` is on, the worker pod can be Ready during that time. If
+the function has no other registered worker, a request then gets `404` with
+`no_eligible_candidates`.
 
 To change the time limit for each calibration load step, 5 seconds by default,
 set `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` there. `PYLON_DO_CALIBRATION` must
@@ -80,6 +81,35 @@ be `true` or `false`, and `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` must be a
 positive number of milliseconds. The overrides apply to every LLM function on
 the cluster, so an invalid value stops `pylon` on every new LLM worker there.
 Both variables apply to worker pods created after NVCA picks up the new values.
+
+By default an LLM worker pod is Ready as soon as `pylon` starts, so a version
+can become `ACTIVE` before its model workers load. To hold readiness until the
+function's health check passes, set `PYLON_READINESS_GATE: "true"` in
+`agent.functionEnvOverrides`. Any value other than `true` or `false` stops
+`pylon`. `pylon` then waits for the declared check, with its path, port,
+expected status, and timeout, before it calibrates and registers. NVCA adds a
+readiness probe on `pylon`'s `/ready`. It returns `200` after
+`llm-request-router` accepts the registration. NVCA runs `pylon` with a reverse
+tunnel, so `/ready` also waits until the tunnel connects.
+
+Before you enable the switch:
+
+- Make sure every LLM worker runs a `pylon` that serves `/ready`. The control
+  plane sets the image with `nvcf.sidecars.llm-router-client-image`. If it is
+  empty, NVCA uses a built-in image without `/ready`. An older `pylon` exits at
+  startup with an `unexpected argument` error.
+- Verify the health check of each LLM function: path, port, expected status,
+  and timeout. For a Helm function, the `pylon` pod must reach the health port.
+  If the check never passes, NVCA removes the worker when
+  `INFERENCE_READY_TIMEOUT` ends.
+- If you override `INFERENCE_HEALTH_TIMEOUT`, use an ISO-8601 value such as
+  `PT10S`. `pylon` stops at startup on a Go duration such as `1m30s`.
+
+Declare a check that waits for the model workers, for example a sidecar that
+returns `200` only when enough workers are ready. Without a declared check, the
+NVCF default `/v2/health/ready` applies. If the backend answers it with `401`,
+`403`, `404`, or `405`, `pylon` uses its usual health paths, and readiness does
+not wait for the workers. A gRPC health check gets no readiness probe.
 
 ## Enable on an Existing Installation
 

@@ -230,6 +230,8 @@ pub(super) async fn run_router_registration_stream(
                         reverse_state_tx.send_if_modified(move |state| {
                             state.replace_endpoint(endpoint)
                         });
+                    } else {
+                        config.mark_ready();
                     }
                     continue;
                 }
@@ -244,6 +246,9 @@ pub(super) async fn run_router_registration_stream(
             }
             advertised_status.record_successful_advertisement(advertised);
             advertised_reverse_connected = reverse_connected;
+            if reverse_connected {
+                config.mark_ready();
+            }
             last_send = Instant::now();
         };
         // A stop that cancels a pending update send ends the loop as a failed

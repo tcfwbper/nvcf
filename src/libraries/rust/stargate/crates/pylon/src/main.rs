@@ -87,6 +87,28 @@ struct Args {
     /// Upstream health path probed ahead of the built-in defaults; repeat to try several in order
     #[arg(long = "upstream-health-path", value_name = "PATH")]
     upstream_health_paths: Vec<String>,
+    /// Hold startup and `GET /ready` on the metrics port until the function's declared HTTP health check returns its expected status. A 401, 403, 404, or 405 from a check equal to the NVCF default (`/v2/health/ready` on the upstream port) falls back to the upstream health paths
+    #[arg(long, default_value_t = false, env = "PYLON_READINESS_GATE")]
+    readiness_gate: bool,
+    /// Path of the declared health check used by --readiness-gate
+    #[arg(long, env = "INFERENCE_HEALTH_ENDPOINT", value_name = "PATH")]
+    readiness_health_path: Option<String>,
+    /// Port of the declared health check. Defaults to the upstream port
+    #[arg(long, env = "INFERENCE_HEALTH_PORT", value_name = "PORT")]
+    readiness_health_port: Option<String>,
+    /// Protocol of the declared health check. --readiness-gate checks only HTTP
+    #[arg(long, env = "INFERENCE_HEALTH_PROTOCOL", value_name = "PROTOCOL")]
+    readiness_health_protocol: Option<String>,
+    /// Status the declared health check must return. Defaults to 200
+    #[arg(
+        long,
+        env = "INFERENCE_HEALTH_EXPECTED_RESPONSE_CODE",
+        value_name = "STATUS"
+    )]
+    readiness_health_expected_status: Option<String>,
+    /// Timeout of each declared health check probe, as an ISO-8601 duration such as `PT10S`. Defaults to the bringup canary timeout
+    #[arg(long, env = "INFERENCE_HEALTH_TIMEOUT", value_name = "DURATION")]
+    readiness_health_timeout: Option<String>,
     /// How long startup retries the upstream health probe before exiting. `0` probes once.
     /// Defaults to INFERENCE_READY_TIMEOUT when set, otherwise 60000
     #[arg(long, value_name = "MS")]
@@ -405,6 +427,30 @@ mod tests {
 
             assert_eq!(argument.get_env(), Some(std::ffi::OsStr::new(env)), "{id}");
         }
+    }
+
+    #[test]
+    fn readiness_gate_flags_declare_environment_bindings() {
+        let command = <Args as clap::CommandFactory>::command();
+        for (id, env) in [
+            ("readiness_gate", "PYLON_READINESS_GATE"),
+            ("readiness_health_path", "INFERENCE_HEALTH_ENDPOINT"),
+            ("readiness_health_port", "INFERENCE_HEALTH_PORT"),
+            ("readiness_health_protocol", "INFERENCE_HEALTH_PROTOCOL"),
+            (
+                "readiness_health_expected_status",
+                "INFERENCE_HEALTH_EXPECTED_RESPONSE_CODE",
+            ),
+            ("readiness_health_timeout", "INFERENCE_HEALTH_TIMEOUT"),
+        ] {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} argument should exist"));
+
+            assert_eq!(argument.get_env(), Some(std::ffi::OsStr::new(env)), "{id}");
+        }
+        assert!(!parse_args("").readiness_gate);
     }
 
     #[test]

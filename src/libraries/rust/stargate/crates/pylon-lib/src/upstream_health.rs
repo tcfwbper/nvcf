@@ -14,13 +14,133 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use parking_lot::Mutex;
+use reqwest::StatusCode;
+use url::Url;
 
 /// Upstream health paths probed in order. Dynamo-style engines serve `/health`;
 /// OpenAI-style NIM images serve `/v1/health/ready` and no `/health`.
 pub const DEFAULT_UPSTREAM_HEALTH_PATHS: [&str; 2] = ["/health", "/v1/health/ready"];
 
+/// Health path NVCF stores for a function that declares no health check.
+const CONTROL_PLANE_DEFAULT_HEALTH_PATH: &str = "/v2/health/ready";
+
 const UNRESOLVED: usize = usize::MAX;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReadinessGateError {
+    #[error("invalid upstream URL for the readiness gate: {0}")]
+    Url(#[from] url::ParseError),
+    #[error("upstream URL {0} cannot take a health port")]
+    PortNotSupported(String),
+    #[error("readiness gate expected status {0} is not an HTTP status code")]
+    InvalidStatus(u16),
+}
+
+/// The function's declared HTTP health check. Unlike [`UpstreamHealthPaths`],
+/// only the expected status passes, as in the NVCF `utils` worker.
+#[derive(Clone, Debug)]
+pub struct ReadinessGate {
+    url: String,
+    expected_status: StatusCode,
+    timeout: Option<Duration>,
+    // A check equal to the control-plane default is often one the function
+    // never declared, so it keeps the lenient probe when the backend does not
+    // serve that path.
+    is_control_plane_default: bool,
+    fallback_logged: Arc<AtomicBool>,
+    last_failure: Arc<Mutex<Option<String>>>,
+}
+
+impl ReadinessGate {
+    /// `port` is the declared health port; `None` uses the upstream's port. An
+    /// empty `path` is the control-plane default, as in the `utils` worker.
+    pub fn new(
+        upstream_http_base_url: &str,
+        path: &str,
+        port: Option<u16>,
+        expected_status: u16,
+    ) -> Result<Self, ReadinessGateError> {
+        let path = match normalize_path(path) {
+            path if path.is_empty() => CONTROL_PLANE_DEFAULT_HEALTH_PATH.to_string(),
+            path => path,
+        };
+        let expected_status = StatusCode::from_u16(expected_status)
+            .map_err(|_| ReadinessGateError::InvalidStatus(expected_status))?;
+        let mut url = Url::parse(upstream_http_base_url)?;
+        let upstream_port = url.port_or_known_default();
+        let port = port.or(upstream_port);
+        url.set_port(port).map_err(|()| {
+            ReadinessGateError::PortNotSupported(upstream_http_base_url.to_string())
+        })?;
+        // Replaces any path prefix: the declared check is host, port, and path,
+        // as the `utils` worker probes it.
+        url.set_path(&path);
+        Ok(Self {
+            url: url.into(),
+            expected_status,
+            timeout: None,
+            is_control_plane_default: path == CONTROL_PLANE_DEFAULT_HEALTH_PATH
+                && port == upstream_port,
+            fallback_logged: Arc::new(AtomicBool::new(false)),
+            last_failure: Arc::default(),
+        })
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Probe timeout from the declared check; without one, callers use their
+    /// own.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn expected_status(&self) -> StatusCode {
+        self.expected_status
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    pub(crate) fn is_control_plane_default(&self) -> bool {
+        self.is_control_plane_default
+    }
+
+    pub(crate) fn log_fallback_once(&self, status: StatusCode) {
+        if !self.fallback_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                url = %self.url,
+                status = %status,
+                "upstream does not serve the default health check; using the fallback health paths"
+            );
+        }
+    }
+
+    /// Logs a failure only when its outcome changes, so a long wait shows why
+    /// the check fails without a line for every probe.
+    pub(crate) fn record_failure(&self, outcome: String) {
+        let mut last_failure = self.last_failure.lock();
+        if last_failure.as_deref() != Some(outcome.as_str()) {
+            tracing::warn!(url = %self.url, outcome = %outcome, "readiness gate check failed");
+            *last_failure = Some(outcome);
+        }
+    }
+
+    pub(crate) fn record_pass(&self) {
+        *self.last_failure.lock() = None;
+    }
+
+    pub(crate) fn last_failure(&self) -> Option<String> {
+        self.last_failure.lock().clone()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct UpstreamHealthPaths {
@@ -139,6 +259,67 @@ mod tests {
             vec![(0, "/ping"), (1, "/health"), (2, "/v1/health/ready")]
         );
         assert_eq!(paths.probe_path(), "/ping");
+    }
+
+    #[test]
+    fn readiness_gate_targets_the_declared_port_and_path() {
+        for (label, path, port, expected_url, is_default) in [
+            (
+                "sidecar port",
+                "/ready",
+                Some(8001),
+                "http://frontend:8001/ready",
+                false,
+            ),
+            (
+                "upstream port",
+                "v1/health/ready",
+                None,
+                "http://frontend:8000/v1/health/ready",
+                false,
+            ),
+            (
+                "default check",
+                "/v2/health/ready",
+                None,
+                "http://frontend:8000/v2/health/ready",
+                true,
+            ),
+            (
+                "default path, explicit same port",
+                "/v2/health/ready",
+                Some(8000),
+                "http://frontend:8000/v2/health/ready",
+                true,
+            ),
+            (
+                "default path, other port",
+                "/v2/health/ready",
+                Some(8001),
+                "http://frontend:8001/v2/health/ready",
+                false,
+            ),
+            (
+                "empty path",
+                " ",
+                None,
+                "http://frontend:8000/v2/health/ready",
+                true,
+            ),
+        ] {
+            let gate = ReadinessGate::new("http://frontend:8000", path, port, 200).expect(label);
+
+            assert_eq!(gate.url(), expected_url, "{label}");
+            assert_eq!(gate.is_control_plane_default(), is_default, "{label}");
+        }
+    }
+
+    #[test]
+    fn readiness_gate_rejects_an_invalid_status() {
+        assert!(matches!(
+            ReadinessGate::new("http://frontend:8000", "/ready", None, 1000),
+            Err(ReadinessGateError::InvalidStatus(1000))
+        ));
     }
 
     #[test]

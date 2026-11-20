@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use stargate_runtime::{OwnedTask, TASK_SHUTDOWN_TIMEOUT};
 
 use crate::drain::{DrainRecorder, DrainSummary};
+use crate::stats::StartupReadiness;
 
 use super::discovery::run_watch_stargate_discovery;
 use super::grpc_endpoint::StargateGrpcEndpoint;
@@ -130,9 +131,18 @@ pub struct InferenceServerRegistrationClient {
     drain: Option<Arc<DrainRecorder>>,
     /// The drain of a session that stopped on its own, kept for `shutdown`.
     exited_drain: Option<DrainSummary>,
+    /// Marked ready once a router can reach this server.
+    readiness: Option<StartupReadiness>,
 }
 
 impl InferenceServerRegistrationClient {
+    pub fn with_readiness(readiness: StartupReadiness) -> Self {
+        Self {
+            readiness: Some(readiness),
+            ..Self::default()
+        }
+    }
+
     pub fn stop(&mut self) {
         self.running = None;
         self.exited_drain = None;
@@ -165,7 +175,8 @@ impl InferenceServerRegistrationClient {
 
     pub fn start(&mut self, config: InferenceServerRegistrationConfig) -> Result<(), ClientError> {
         self.stop();
-        let config: RegistrationSessionConfig = config.try_into()?;
+        let mut config: RegistrationSessionConfig = config.try_into()?;
+        config.readiness = self.readiness.clone();
         self.drain_timeout = config.shutdown_drain_timeout;
         self.drain = config.reverse_tunnel.then(|| {
             Arc::new(DrainRecorder::new(
@@ -248,6 +259,7 @@ mod tests {
             drain_timeout,
             drain: Some(drain),
             exited_drain: None,
+            readiness: None,
         };
 
         tokio::time::timeout(Duration::from_secs(5), client.wait_for_exit())

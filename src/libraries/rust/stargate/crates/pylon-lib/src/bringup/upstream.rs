@@ -23,7 +23,7 @@ use crate::request_observer::{
 };
 use crate::runtime_state::{ModelGeneration, PylonRuntimeState};
 use crate::sse_message_stream::{RelayOutcome, UpstreamSseReadError, upstream_sse_message_stream};
-use crate::upstream_health::UpstreamHealthPaths;
+use crate::upstream_health::{ReadinessGate, UpstreamHealthPaths};
 use crate::upstream_url::upstream_endpoint;
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -50,6 +50,57 @@ pub(crate) async fn check_upstream_health(
         }
     }
     false
+}
+
+// Statuses that mean the backend does not serve the default check or does not
+// let Pylon call it. 400, 429, and 5xx can mean "not ready", so they never fall
+// back.
+const DEFAULT_CHECK_NOT_SERVED: [StatusCode; 4] = [
+    StatusCode::UNAUTHORIZED,
+    StatusCode::FORBIDDEN,
+    StatusCode::NOT_FOUND,
+    StatusCode::METHOD_NOT_ALLOWED,
+];
+
+pub(crate) async fn check_readiness_gate(
+    http_client: &reqwest::Client,
+    upstream_http_base_url: &str,
+    timeout: Duration,
+    gate: &ReadinessGate,
+    fallback_paths: &UpstreamHealthPaths,
+) -> bool {
+    let timeout = gate.timeout().unwrap_or(timeout);
+    let status = match http_client.get(gate.url()).timeout(timeout).send().await {
+        Ok(response) => response.status(),
+        Err(error) => {
+            let outcome = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connection failed"
+            } else {
+                "request failed"
+            };
+            gate.record_failure(outcome.to_string());
+            return false;
+        }
+    };
+    if status == gate.expected_status() {
+        gate.record_pass();
+        return true;
+    }
+    if !gate.is_control_plane_default() || !DEFAULT_CHECK_NOT_SERVED.contains(&status) {
+        gate.record_failure(format!("HTTP {status}"));
+        return false;
+    }
+    gate.log_fallback_once(status);
+    let is_healthy =
+        check_upstream_health(http_client, upstream_http_base_url, timeout, fallback_paths).await;
+    if is_healthy {
+        gate.record_pass();
+    } else {
+        gate.record_failure(format!("HTTP {status}; the fallback health paths failed"));
+    }
+    is_healthy
 }
 
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response, BringupError> {

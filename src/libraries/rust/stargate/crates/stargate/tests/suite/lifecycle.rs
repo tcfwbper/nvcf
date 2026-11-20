@@ -1364,6 +1364,7 @@ impl LifecycleBackendOptions<'_> {
                 initialization: ModelInitialization::ConfiguredInputTps { input_tps: 1.0 },
                 bringup,
                 health_paths: pylon_lib::UpstreamHealthPaths::default(),
+                readiness_gate: None,
                 startup_health_wait: std::time::Duration::ZERO,
             },
             runtime_state.clone(),

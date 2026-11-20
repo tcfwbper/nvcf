@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 )
@@ -393,6 +394,32 @@ func TestNewLLMRouterClientContainer(t *testing.T) {
 			},
 		},
 		{
+			name: "readiness gate probes pylon for a helm function with a sidecar health check",
+			ls:   &LaunchSpecification{},
+			allEnvSet: map[string]string{
+				"LLM_REQUEST_ROUTER_ADDRESS": "llm-router.example.com:443",
+				"INFERENCE_PORT":             "80",
+				"INFERENCE_HEALTH_ENDPOINT":  "/ready",
+				"INFERENCE_HEALTH_PORT":      "8001",
+				"INFERENCE_HEALTH_PROTOCOL":  "HTTP",
+				"PYLON_READINESS_GATE":       "true",
+			},
+			tcfg:       TranslateConfig{},
+			instanceID: "inst-readiness",
+			isHelm:     true,
+			validate: func(t *testing.T, c corev1.Container) {
+				require.NotNil(t, c.ReadinessProbe)
+				assert.Equal(t, &corev1.HTTPGetAction{
+					Path: "/ready",
+					Port: intstr.FromString(common.WorkerMetricsPortName),
+				}, c.ReadinessProbe.HTTPGet)
+				assert.Contains(t, c.Args, "--readiness-gate")
+				envMap := envSliceToMap(c.Env)
+				assert.Equal(t, "true", envMap["PYLON_READINESS_GATE"])
+				assert.Equal(t, "8001", envMap["INFERENCE_HEALTH_PORT"])
+			},
+		},
+		{
 			name: "no declared health endpoint leaves the pylon defaults in place",
 			ls:   &LaunchSpecification{},
 			allEnvSet: map[string]string{
@@ -404,6 +431,8 @@ func TestNewLLMRouterClientContainer(t *testing.T) {
 			isHelm:     false,
 			validate: func(t *testing.T, c corev1.Container) {
 				assert.Empty(t, healthPathArgs(c.Args))
+				assert.NotContains(t, c.Args, "--readiness-gate")
+				assert.Nil(t, c.ReadinessProbe)
 			},
 		},
 	}
@@ -422,6 +451,47 @@ func TestNewLLMRouterClientContainer(t *testing.T) {
 				Protocol:      corev1.ProtocolTCP,
 			}}, c.Ports)
 			tt.validate(t, c)
+		})
+	}
+}
+
+func TestLLMWorkerReadinessProbe(t *testing.T) {
+	cases := []struct {
+		name         string
+		gate         string
+		protocol     string
+		hasReadiness bool
+	}{
+		{name: "switch unset", gate: "", protocol: "HTTP", hasReadiness: false},
+		{name: "switch off", gate: "false", protocol: "HTTP", hasReadiness: false},
+		{name: "switch not a boolean", gate: "yes", protocol: "HTTP", hasReadiness: false},
+		{name: "Go boolean that Pylon rejects", gate: "1", protocol: "HTTP", hasReadiness: false},
+		{name: "upper case that Pylon rejects", gate: "TRUE", protocol: "HTTP", hasReadiness: false},
+		{name: "switch on", gate: "true", protocol: "HTTP", hasReadiness: true},
+		{name: "switch on, protocol unset", gate: "true", protocol: "", hasReadiness: true},
+		{name: "switch on, gRPC health check", gate: "true", protocol: "gRPC", hasReadiness: false},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			probe := llmWorkerReadinessProbe(map[string]string{
+				"PYLON_READINESS_GATE":      tt.gate,
+				"INFERENCE_HEALTH_PROTOCOL": tt.protocol,
+			})
+
+			if !tt.hasReadiness {
+				assert.Nil(t, probe)
+				return
+			}
+			// Pylon's /ready replaces the utils readiness probe, timings included.
+			var utils corev1.Container
+			common.MutateUtilsProbes(&utils)
+			expected := *utils.ReadinessProbe
+			expected.HTTPGet = &corev1.HTTPGetAction{
+				Path: "/ready",
+				Port: intstr.FromString(common.WorkerMetricsPortName),
+			}
+			assert.Equal(t, &expected, probe)
 		})
 	}
 }

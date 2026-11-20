@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -737,13 +738,29 @@ async fn get_metrics(
 
 owned_task_handle!(MetricsServerHandle);
 
+/// Backs `GET /ready`: 503 until a router acknowledges registration, or in
+/// reverse mode until a router has the connected tunnel, then 200 for the rest
+/// of the process. Canaries handle later upstream failures, so readiness never
+/// turns back.
+#[derive(Clone, Debug, Default)]
+pub struct StartupReadiness(Arc<AtomicBool>);
+
+impl StartupReadiness {
+    pub fn mark_ready(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 pub async fn start_metrics_server(
     addr: SocketAddr,
     registry: Arc<Registry>,
+    readiness: StartupReadiness,
 ) -> anyhow::Result<MetricsServerHandle> {
-    let router = Router::new()
-        .route("/metrics", get(get_metrics))
-        .with_state(registry);
+    let router = metrics_router(registry, readiness);
 
     let listener = TcpListener::bind(addr).await?;
     info!(addr = %addr, "pylon metrics server listening");
@@ -759,6 +776,25 @@ pub async fn start_metrics_server(
     Ok(MetricsServerHandle { task })
 }
 
+fn metrics_router(registry: Arc<Registry>, readiness: StartupReadiness) -> Router {
+    Router::new()
+        .route("/metrics", get(get_metrics))
+        .with_state(registry)
+        .route(
+            "/ready",
+            get(move || {
+                let is_ready = readiness.is_ready();
+                async move {
+                    if is_ready {
+                        (StatusCode::OK, "ready")
+                    } else {
+                        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+                    }
+                }
+            }),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -766,12 +802,39 @@ mod tests {
 
     use stargate_proto::pb::InferenceServerStatus;
 
-    use super::{CalibrationOutcome, CanaryPhase, CanaryResult};
+    use super::{CalibrationOutcome, CanaryPhase, CanaryResult, StartupReadiness, metrics_router};
+    use crate::test_support::TestHttpServer;
 
     use crate::{
         CurrentModelStats, PylonMetrics, PylonRuntimeState, RequestObservation,
         RequestObservationEndpoint, RequestObservationState,
     };
+
+    #[tokio::test]
+    async fn ready_endpoint_turns_ready_once_and_stays_ready() {
+        let readiness = StartupReadiness::default();
+        let server = TestHttpServer::spawn(metrics_router(
+            PylonMetrics::new()
+                .expect("metrics should build")
+                .registry(),
+            readiness.clone(),
+        ))
+        .await;
+        let ready_url = format!("{}/ready", server.as_str());
+        let status = || async {
+            reqwest::get(&ready_url)
+                .await
+                .expect("ready request should succeed")
+                .status()
+        };
+
+        assert_eq!(status().await, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        readiness.mark_ready();
+        assert_eq!(status().await, reqwest::StatusCode::OK);
+        assert_eq!(status().await, reqwest::StatusCode::OK);
+
+        server.shutdown().await;
+    }
 
     #[test]
     fn tls_reload_metrics_are_preinitialized() {
