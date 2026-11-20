@@ -106,6 +106,10 @@ jobs:
           distribution: temurin
           java-version: '25'
 
+      - name: Configure CI Java runtime options
+        if: steps.scope.outputs.run == 'true'
+        run: bash tools/ci/configure-java-runtime
+
       # The dependency collector builds each registered Java component's
       # runtime inventory. Bazelisk honors the repository's .bazelversion.
       - name: Install Bazelisk

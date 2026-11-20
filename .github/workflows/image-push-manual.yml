@@ -296,6 +296,11 @@ jobs:
             echo "layout: root module, scoped to //$SVC_PATH/..."
           fi
 
+      - name: Configure CI Java runtime options
+        env:
+          JAVA_CI_WORKDIR: ${{ steps.layout.outputs.workdir }}
+        run: bash tools/ci/configure-java-runtime --workspace "$GITHUB_WORKSPACE" --workspace "$JAVA_CI_WORKDIR"
+
       - name: Build and push multi-arch image(s)
         working-directory: ${{ steps.layout.outputs.workdir }}
         env:

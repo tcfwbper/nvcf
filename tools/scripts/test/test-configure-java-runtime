@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+script="$repo/tools/ci/configure-java-runtime"
+fixture="$(mktemp -d)"
+trap 'rm -rf "$fixture"' EXIT
+# Reuse the Go build cache while each helper call uses an isolated HOME.
+export GOCACHE="${GOCACHE:-$fixture/go-cache}"
+mkdir -p "$fixture/home"
+mkdir -p "$fixture/workspace"
+touch "$fixture/workspace/MODULE.bazel"
+cd "$fixture/workspace"
+unset BAZELRC
+env_file="$fixture/github-env"
+bazelrc="$fixture/home/.bazelrc"
+expected_controls=(
+    'startup --host_jvm_args=-XX:-UseBASE64Intrinsics'
+    'build --host_jvmopt=-XX:-UseBASE64Intrinsics'
+    'build --jvmopt=-XX:-UseBASE64Intrinsics'
+    'test --host_jvmopt=-XX:-UseBASE64Intrinsics'
+    'test --jvmopt=-XX:-UseBASE64Intrinsics'
+    'common --action_env=JAVA_TOOL_OPTIONS'
+    'common --host_action_env=JAVA_TOOL_OPTIONS'
+    'common --test_env=JAVA_TOOL_OPTIONS'
+)
+
+# Preserve caller options and a pre-existing rc file without a final newline.
+printf 'build --color=no' > "$bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" \
+    JAVA_TOOL_OPTIONS='-Dfixture=preserved -XX:+UseBASE64Intrinsics' \
+    bash "$script" >/dev/null
+options="$(sed -n 's/^JAVA_TOOL_OPTIONS=//p' "$env_file" | tail -1)"
+[[ "$options" == '-Dfixture=preserved -XX:+UseBASE64Intrinsics -XX:-UseBASE64Intrinsics' ]]
+grep -Fxq 'build --color=no' "$bazelrc"
+for option in "${expected_controls[@]}"; do
+    grep -Fxq -- "$option" "$bazelrc" || {
+        echo "FAIL missing Bazel control: $option" >&2
+        exit 1
+    }
+done
+echo 'ok   preserves caller options and existing Bazel settings'
+
+# Calling the helper again must not grow the rc file or repeat the last flag.
+cp "$bazelrc" "$fixture/first.bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+cmp "$bazelrc" "$fixture/first.bazelrc"
+[[ "$(sed -n 's/^JAVA_TOOL_OPTIONS=//p' "$env_file" | tail -1)" == "$options" ]]
+echo 'ok   repeated setup is idempotent'
+
+# Later conflicting settings must not override the helper's mitigation.
+cat >> "$bazelrc" <<'EOF'
+startup --host_jvm_args=-XX:+UseBASE64Intrinsics
+build --host_jvmopt=-XX:+UseBASE64Intrinsics
+build --jvmopt=-XX:+UseBASE64Intrinsics
+test --jvmopt=-Dtest.fixture=preserved
+test --jvmopt=-XX:+UseBASE64Intrinsics
+test --host_jvmopt=-XX:+UseBASE64Intrinsics
+test:fixture --jvmopt=-XX:+UseBASE64Intrinsics
+test:fixture --jvmopt=-Dconfig.fixture=preserved
+build --action_env=JAVA_TOOL_OPTIONS=-XX:+UseBASE64Intrinsics
+build --host_action_env=JAVA_TOOL_OPTIONS=-XX:+UseBASE64Intrinsics
+test --test_env=JAVA_TOOL_OPTIONS=-XX:+UseBASE64Intrinsics
+build --jobs=2
+EOF
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+for option in "${expected_controls[@]}"; do
+    prefix="${option%%=*}="
+    effective="$(awk -v prefix="$prefix" 'index($0, prefix) == 1 { last = $0 } END { print last }' "$bazelrc")"
+    [[ "$effective" == "$option" && "$(grep -Fxc -- "$option" "$bazelrc")" == 1 ]] || {
+        echo "FAIL Bazel control must be last and occur once: $option" >&2
+        exit 1
+    }
+done
+grep -Fxq 'startup --host_jvm_args=-XX:+UseBASE64Intrinsics' "$bazelrc"
+grep -Fxq 'build --color=no' "$bazelrc"
+grep -Fxq 'build --jobs=2' "$bazelrc"
+grep -Fxq 'test --jvmopt=-Dtest.fixture=preserved' "$bazelrc"
+grep -Fxq 'test:fixture --jvmopt=-Dconfig.fixture=preserved' "$bazelrc"
+[[ "$(grep '^test:fixture --jvmopt=' "$bazelrc" | tail -1)" == 'test:fixture --jvmopt=-XX:-UseBASE64Intrinsics' ]]
+cp "$bazelrc" "$fixture/first.bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+cmp "$bazelrc" "$fixture/first.bazelrc"
+echo 'ok   moves mitigation after conflicting options without duplicating it'
+
+# Fixed values retain their scope and Java properties instead of being
+# overridden by a later inherited-value entry in the same scope.
+cat >> "$bazelrc" <<'EOF'
+common --action_env=JAVA_TOOL_OPTIONS=-Dcommon.fixture=preserved
+build --action_env=JAVA_TOOL_OPTIONS=-Daction.fixture=preserved
+build --host_action_env='JAVA_TOOL_OPTIONS=-Dhost.fixture=preserved -XX:+UseBASE64Intrinsics'
+test --test_env="JAVA_TOOL_OPTIONS=-Dtest.fixture=preserved -Dmessage='hello world'"
+build:fixture --action_env=JAVA_TOOL_OPTIONS=-Dconfig.fixture=preserved
+test --test_env=UNRELATED=preserved
+EOF
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+for expected in \
+    'common "--action_env=JAVA_TOOL_OPTIONS=-Dcommon.fixture=preserved -XX:-UseBASE64Intrinsics"' \
+    'build "--action_env=JAVA_TOOL_OPTIONS=-Daction.fixture=preserved -XX:-UseBASE64Intrinsics"' \
+    'build "--host_action_env=JAVA_TOOL_OPTIONS=-Dhost.fixture=preserved -XX:+UseBASE64Intrinsics -XX:-UseBASE64Intrinsics"' \
+    'build:fixture "--action_env=JAVA_TOOL_OPTIONS=-Dconfig.fixture=preserved -XX:-UseBASE64Intrinsics"' \
+    'test --test_env=UNRELATED=preserved'; do
+    grep -Fxq -- "$expected" "$bazelrc" || {
+        echo "FAIL scoped Java options were not preserved: $expected" >&2
+        exit 1
+    }
+done
+grep -Fq -- '-Dtest.fixture=preserved -Dmessage=' "$bazelrc"
+grep -Fq -- 'hello world' "$bazelrc"
+if grep -Fxq 'common --action_env=JAVA_TOOL_OPTIONS' "$bazelrc"; then
+    echo 'FAIL inherited default overrides fixed common Java options' >&2
+    exit 1
+fi
+cp "$bazelrc" "$fixture/first.bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+cmp "$bazelrc" "$fixture/first.bazelrc"
+echo 'ok   preserves fixed Java options in common, action, host, test and config scopes'
+
+cat >> "$bazelrc" <<'EOF'
+build --action_env JAVA_TOOL_OPTIONS=-Dseparate.fixture=preserved # retained comment
+build:empty --action_env=JAVA_TOOL_OPTIONS=
+build:quoted --host_action_env="JAVA_TOOL_OPTIONS=-Dpath=C:\\fixture -Dquote=\"kept\"" \
+  --action_env='JAVA_TOOL_OPTIONS=-Dother=preserved'
+EOF
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+grep -Fxq 'build --action_env "JAVA_TOOL_OPTIONS=-Dseparate.fixture=preserved -XX:-UseBASE64Intrinsics" # retained comment' "$bazelrc"
+grep -Fxq 'build:empty "--action_env=JAVA_TOOL_OPTIONS=-XX:-UseBASE64Intrinsics"' "$bazelrc"
+grep -Fq -- '-Dpath=C:\\fixture -Dquote=\"kept\" -XX:-UseBASE64Intrinsics' "$bazelrc"
+grep -Fq -- '--action_env=JAVA_TOOL_OPTIONS=-Dother=preserved -XX:-UseBASE64Intrinsics' "$bazelrc"
+cp "$bazelrc" "$fixture/first.bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+cmp "$bazelrc" "$fixture/first.bazelrc"
+echo 'ok   preserves escaped values, continuations, comments and separated flag arguments'
+
+# A quoted value continued with backslash-CRLF has the same Bazel meaning as
+# the LF fixture above, including when the managed block is rewritten again.
+cp "$bazelrc" "$fixture/lf.bazelrc"
+printf 'build:crlf --action_env="JAVA_TOOL_OPTIONS=-Dcrlf.fixture=preserved \\\r\n-Dmessage=continued"\r\n' >> "$fixture/lf.bazelrc"
+awk '{ sub(/\r$/, ""); printf "%s\r\n", $0 }' "$fixture/lf.bazelrc" > "$bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+grep -Fxq 'build:crlf "--action_env=JAVA_TOOL_OPTIONS=-Dcrlf.fixture=preserved -Dmessage=continued -XX:-UseBASE64Intrinsics"' "$bazelrc"
+cp "$bazelrc" "$fixture/first.bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+cmp "$bazelrc" "$fixture/first.bazelrc"
+echo 'ok   preserves quoted CRLF continuations and repeated-run stability'
+
+# A multiline value must not inject extra GitHub environment entries or make
+# any partial changes to the rc/environment files.
+cp "$env_file" "$fixture/first.env"
+for invalid in $'value\nINJECTED=true' $'value\rINJECTED=true'; do
+    if env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$invalid" \
+        bash "$script" >"$fixture/output" 2>&1; then
+        echo 'FAIL multiline options were accepted' >&2
+        exit 1
+    fi
+    cmp "$env_file" "$fixture/first.env"
+    cmp "$bazelrc" "$fixture/first.bazelrc"
+done
+echo 'ok   rejects environment-file injection before writing'
+
+if env -u GITHUB_ENV HOME="$fixture/home" bash "$script" >"$fixture/output" 2>&1; then
+    echo 'FAIL missing GitHub environment file was accepted' >&2
+    exit 1
+fi
+cmp "$bazelrc" "$fixture/first.bazelrc"
+echo 'ok   requires a GitHub Actions environment file'
+
+printf "test --test_env='JAVA_TOOL_OPTIONS=unterminated\n" >> "$bazelrc"
+cp "$bazelrc" "$fixture/invalid.bazelrc"
+if env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >"$fixture/output" 2>&1; then
+    echo 'FAIL malformed rc input was accepted' >&2
+    exit 1
+fi
+cmp "$env_file" "$fixture/first.env"
+cmp "$bazelrc" "$fixture/invalid.bazelrc"
+echo 'ok   malformed rc input does not partially rewrite configuration'
+
+cp "$fixture/first.bazelrc" "$bazelrc"
+assert_guard_failure() {
+    cp "$bazelrc" "$fixture/before-guard.bazelrc"
+    cp "$env_file" "$fixture/before-guard.env"
+    if env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+        BAZELRC="${TEST_BAZELRC:-}" bash "$script" "$@" >"$fixture/output" 2>&1; then
+        echo 'FAIL external fixed options were accepted' >&2
+        exit 1
+    fi
+    cmp "$bazelrc" "$fixture/before-guard.bazelrc"
+    cmp "$env_file" "$fixture/before-guard.env"
+    grep -Fq "${TEST_GUARD_ERROR:-fixed JAVA_TOOL_OPTIONS}" "$fixture/output"
+    if grep -Fq 'secret-must-not-appear' "$fixture/output"; then
+        echo 'FAIL fixed option contents leaked into the error' >&2
+        exit 1
+    fi
+}
+
+printf 'common --action_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > .bazelrc
+assert_guard_failure
+echo 'ok   rejects fixed workspace values without changing rc or environment'
+
+printf 'try-import %%workspace%%/nested.rc\n' > .bazelrc
+printf 'import "%s/external.rc"\n' "$fixture/home" > nested.rc
+printf 'common --host_action_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > "$fixture/home/external.rc"
+assert_guard_failure
+printf '# workspace has no fixed options\n' > .bazelrc
+printf 'import "%s/external.rc"\n' "$fixture/home" >> "$bazelrc"
+assert_guard_failure
+cp "$fixture/first.bazelrc" "$bazelrc"
+echo 'ok   rejects fixed values in workspace and home import chains'
+
+mkdir -p "$fixture/child"
+touch "$fixture/child/MODULE.bazel"
+printf 'test --test_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > "$fixture/child/.bazelrc"
+assert_guard_failure --workspace "$fixture/workspace" --workspace "$fixture/child"
+TEST_BAZELRC="$fixture/child/.bazelrc" assert_guard_failure
+echo 'ok   checks every selected workspace and BAZELRC file'
+
+mkdir -p "$fixture/empty-home"
+if env HOME="$fixture/empty-home" GITHUB_ENV="$fixture/absent-env" \
+    bash "$script" --workspace "$fixture/child" >"$fixture/output" 2>&1; then
+    echo 'FAIL unsafe first-time setup was accepted' >&2
+    exit 1
+fi
+[[ ! -e "$fixture/empty-home/.bazelrc" && ! -e "$fixture/absent-env" ]]
+echo 'ok   rejected first-time setup creates neither rc nor environment files'
+
+printf 'try-import %%user.home%%/.bazelrc.user\n' > .bazelrc
+printf 'common --action_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > "$fixture/home/.bazelrc.user"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+echo 'ok   literal optional home import does not read an unrelated home file'
+
+printf 'startup:linux --host_jvm_args=-XX:+UseBASE64Intrinsics\n' > "$fixture/later.rc"
+TEST_BAZELRC="$fixture/later.rc" TEST_GUARD_ERROR='JVM mitigation conflict' assert_guard_failure
+echo 'ok   later startup overrides are rejected before rc or environment writes'
+
+printf 'startup:linux --host_jvm_args\nstartup:linux -XX:+UseBASE64Intrinsics\n' > "$fixture/later.rc"
+TEST_BAZELRC="$fixture/later.rc" TEST_GUARD_ERROR='missing value for --host_jvm_args' assert_guard_failure
+echo 'ok   split JVM arguments are rejected before rc or environment writes'
+
+printf 'build:ci --jvmopt=-XX:+UseBASE64Intrinsics\n' > .bazelrc
+TEST_GUARD_ERROR='JVM mitigation conflict' assert_guard_failure
+echo 'ok   external named enabling controls are rejected before rc or environment writes'

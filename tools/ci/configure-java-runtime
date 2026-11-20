@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Temporary CI mitigation until all Java runtimes use qualified patched JDKs.
+set -euo pipefail
+
+: "${GITHUB_ENV:?GITHUB_ENV must point to the GitHub Actions environment file}"
+: "${HOME:?HOME must be set for the Bazel user configuration}"
+
+java_options="${JAVA_TOOL_OPTIONS:-}"
+case "$java_options" in
+    *$'\n'* | *$'\r'*)
+        echo "configure-java-runtime: JAVA_TOOL_OPTIONS must be a single line" >&2
+        exit 1
+        ;;
+esac
+if [[ ! "$java_options" =~ (^|[[:space:]])-XX:-UseBASE64Intrinsics[[:space:]]*$ ]]; then
+    java_options="${java_options:+$java_options }-XX:-UseBASE64Intrinsics"
+fi
+
+# Bazel clears Java option variables before starting its server. Execution
+# actions also use a separate environment, including compiler/toolchain JVMs.
+bazelrc="${HOME}/.bazelrc"
+rc_input="$bazelrc"
+if [[ ! -e "$rc_input" ]]; then
+    rc_input=/dev/null
+fi
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+go_bin="$(command -v go || true)"
+if [[ -z "$go_bin" && -x /usr/local/go/bin/go ]]; then
+    go_bin=/usr/local/go/bin/go
+fi
+if [[ -z "$go_bin" ]]; then
+    echo "configure-java-runtime: install Go before configuring CI Java options" >&2
+    exit 1
+fi
+bazelrc_tmp="$(mktemp "${bazelrc}.XXXXXX")"
+trap 'rm -f "$bazelrc_tmp"' EXIT
+GOWORK=off GOTOOLCHAIN=local "$go_bin" -C "$script_dir/../java-runtime-config" run . \
+    --cwd "$PWD" "$@" < "$rc_input" > "$bazelrc_tmp"
+cat "$bazelrc_tmp" > "$bazelrc"
+printf 'JAVA_TOOL_OPTIONS=%s\n' "$java_options" >> "$GITHUB_ENV"
+
+echo "Configured CI JVM options for Bazel servers, actions and tests."

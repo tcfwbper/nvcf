@@ -28,6 +28,8 @@ on:
       - 'platforms/**'
       - 'rules/oci/**'
       - 'tools/bazel/**'
+      - 'tools/ci/configure-java-runtime'
+      - 'tools/java-runtime-config/**'
   pull_request:
     branches: [main, 'release-**', 'release/**']
     paths: *paths
@@ -97,6 +99,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go-toolchain/go.mod
+          cache: false
+
+      - name: Configure CI Java runtime options
+        run: bash tools/ci/configure-java-runtime
 
       # One build of the image index: nvstor-peer for both architectures,
       # optimised by the image's own opt_binary whatever the compilation

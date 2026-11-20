@@ -85,6 +85,14 @@ jobs:
           bash tools/scripts/test/test-check-java-import-boundaries
           bash tools/ci/check-java-import-boundaries
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go-toolchain/go.mod
+          cache: false
+
+      - name: Test CI Java configuration parser
+        run: GOWORK=off GOTOOLCHAIN=local go -C tools/java-runtime-config test ./...
+
       # Behavioral tests for the CI shell this workflow depends on. actionlint
       # covers syntax; these cover the decisions.
       - name: Test CI shell helpers
@@ -93,6 +101,7 @@ jobs:
           bash tools/ci/test-bazel-remote-probe
           bash tools/ci/test-bazel-lock-touches-java
           python3 tools/ci/test-bazel-lock-touches-java-properties
+          bash tools/scripts/test/test-configure-java-runtime
           python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_compatibility_scope.py'
 
       - name: Compute changed subtrees
@@ -299,6 +308,9 @@ jobs:
             rules/java/
             tools/bazel/java/
             tools/ci/stage-bazel-java-artifacts
+            tools/ci/configure-java-runtime
+            tools/java-runtime-config/
+            tools/scripts/test/test-configure-java-runtime
           )
           # Two of these globs fire far more often than they carry Java
           # meaning, so a path hit on them is confirmed against content before
@@ -629,6 +641,12 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Configure CI Java runtime options
+        if: steps.precheck.outputs.skip == 'false'
+        env:
+          JAVA_CI_WORKDIR: ${{ matrix.subtree.workdir }}
+        run: bash tools/ci/configure-java-runtime --workspace "$GITHUB_WORKSPACE" --workspace "$JAVA_CI_WORKDIR"
 
       # bazelisk is preinstalled in the bazel-ci image as `bazel`.
       - name: bazel version
@@ -1109,10 +1127,18 @@ jobs:
       # The Java tree builds with local_jdk (root .bazelrc). Unlike the fast
       # matrix, this lane runs on a bare runner rather than the bazel-ci image,
       # so provide JDK 25 explicitly for the Java requires-docker tests.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go-toolchain/go.mod
+          cache: false
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
+      - name: Configure CI Java runtime options
+        env:
+          JAVA_CI_WORKDIR: ${{ matrix.subtree.workdir }}
+        run: bash tools/ci/configure-java-runtime --workspace "$GITHUB_WORKSPACE" --workspace "$JAVA_CI_WORKDIR"
       - name: Install bazelisk
         run: |
           sudo curl -fsSLo /usr/local/bin/bazel \
