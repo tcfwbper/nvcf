@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Stack image source exclusions, read by TestStackImageSources.
+#
+# Every Helmfile stack under deploy/stacks must take each image registry and
+# repository from its environments/base.yaml (or from an included stack's
+# base.yaml that it forwards), and must not default an image registry,
+# repository, tag or digest to a literal in a .gotmpl file. A stack that does
+# not comply yet is listed here. Keys are stack directories relative to the
+# repository root.
+#
+# reason:
+#   pending-fix  Not yet remediated. Only image source findings are expected,
+#                including a chart image guard that rejects the probe values.
+#                A render error, an invalid release inventory or an included
+#                Helmfile outside deploy/stacks still fails CI. Once the stack
+#                passes, CI fails until this entry is removed.
+#   dev-only     An unreleased development stack, skipped. Allowed only while
+#                the stack has no release-inventory.yaml.
+#
+# issue (optional, pending-fix only): a free-form note, such as a tracking
+# link. It is not validated. This file is public, so keep private tracker IDs
+# and URLs out of it.
+
+# pending-fix
+deploy/stacks/nvcf-compute-plane: {reason: pending-fix}
+deploy/stacks/observability: {reason: pending-fix}
+deploy/stacks/self-managed: {reason: pending-fix}
+
+# dev-only
+# stargate-dev reads one environment per region and takes real images from a
+# protected values file outside the repository.
+deploy/stacks/stargate-dev: {reason: dev-only}

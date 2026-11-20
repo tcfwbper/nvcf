@@ -54,6 +54,20 @@ const imageCatalogProbe = "{{- $versions := dict \"\" .Chart.AppVersion -}}\n" +
 // renderImageChart probes computed values in a temporary chart copy, without
 // installing resources or changing the source chart.
 func renderImageChart(chart string, values []string) (imageChartSnapshot, error) {
+	return renderImageChartAs(chart, imageRelease{Name: "image-catalog", Namespace: "image-catalog"}, values)
+}
+
+// imageRelease is the release identity a chart renders with, and the
+// helm template flags, such as --set, applied after the values files.
+type imageRelease struct {
+	Name, Namespace string
+	Flags           []string
+}
+
+// renderImageChartAs renders like renderImageChart with a given release
+// identity. The stack image source check renders each release as Helmfile
+// names it, since a chart may render workloads by release or namespace.
+func renderImageChartAs(chart string, release imageRelease, values []string) (imageChartSnapshot, error) {
 	directory, err := os.MkdirTemp("", "nvcf-image-catalog-")
 	if err != nil {
 		return imageChartSnapshot{}, err
@@ -73,10 +87,11 @@ func renderImageChart(chart string, values []string) (imageChartSnapshot, error)
 	if err := os.WriteFile(probePath, []byte(imageCatalogProbe), 0o600); err != nil {
 		return imageChartSnapshot{}, err
 	}
-	args := []string{"template", "image-catalog", copyPath, "--namespace", "image-catalog"}
+	args := []string{"template", release.Name, copyPath, "--namespace", release.Namespace}
 	for _, value := range values {
 		args = append(args, "-f", value)
 	}
+	args = append(args, release.Flags...)
 	raw, err := imageCatalogCommand("helm", args...)
 	if err != nil {
 		return imageChartSnapshot{}, err

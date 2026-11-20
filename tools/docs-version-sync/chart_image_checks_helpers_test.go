@@ -28,11 +28,11 @@ type chartCheck struct {
 	source    string
 	workspace string
 	scenarios []string
-	findings  []chartFinding
+	findings  []imageGateFinding
 }
 
 func (c *chartCheck) fail(category, image, path, problem, expected, fix string) {
-	c.findings = append(c.findings, chartFinding{Category: category, Chart: c.chart, Image: image, ValuesPath: path,
+	c.findings = append(c.findings, imageGateFinding{Category: category, Subject: c.chart, Image: image, ValuesPath: path,
 		Problem: problem, Expected: expected, Fix: fix})
 }
 

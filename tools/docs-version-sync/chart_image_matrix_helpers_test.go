@@ -4,10 +4,8 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,12 +16,9 @@ import (
 
 const chartImageExclusionsFile = "chart-image-exclusions.yaml"
 
-// Exclusion reasons. Every tracked chart that is not covered by an image
+// Chart exclusion reasons, with reasonPendingFix. Every tracked chart that is not covered by an image
 // index carries exactly one of them in chart-image-exclusions.yaml.
 const (
-	// pendingFix: an unremediated chart. It is expected to fail coverage until
-	// its own fix lands and removes the entry.
-	reasonPendingFix = "pending-fix"
 	// reasonTestFixture: testdata, validator test charts and samples that no
 	// NVCF stack deploys.
 	reasonTestFixture = "test-fixture"
@@ -39,29 +34,6 @@ var chartImageReasons = map[string]bool{
 	reasonPendingFix: true, reasonTestFixture: true, reasonNoRuntimeImage: true, reasonVendoredSubchart: true,
 }
 
-// chartImageExclusion is one matrix entry, keyed by repo-root-relative chart directory.
-type chartImageExclusion struct {
-	Reason string `yaml:"reason"`
-	// Issue is a free-form note, such as a tracking link. It is not validated.
-	Issue string `yaml:"issue,omitempty"`
-}
-
-// loadChartImageExclusions decodes the matrix strictly, so a misspelled field
-// fails instead of silently dropping an issue link or reason.
-func loadChartImageExclusions(path string) (map[string]chartImageExclusion, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	decoder := yaml.NewDecoder(bytes.NewReader(raw))
-	decoder.KnownFields(true)
-	entries := make(map[string]chartImageExclusion)
-	if err := decoder.Decode(&entries); err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	return entries, nil
-}
-
 // validateChartImageExclusion checks one matrix entry. charts holds every
 // tracked chart directory, and indexed reports whether the chart declares an
 // image index.
@@ -72,7 +44,7 @@ func loadChartImageExclusions(path string) (map[string]chartImageExclusion, erro
 //   - issue on a test-fixture: only pending work has a tracking issue.
 //   - an indexed chart under test-fixture: an index declares runtime images,
 //     so the chart must be checked, not skipped.
-func validateChartImageExclusion(repoRoot, chart string, entry chartImageExclusion, charts map[string]bool, indexed bool) error {
+func validateChartImageExclusion(repoRoot, chart string, entry imageExclusion, charts map[string]bool, indexed bool) error {
 	if !chartImageReasons[entry.Reason] {
 		return fmt.Errorf("unknown reason %q; use one of %s", entry.Reason, strings.Join(sortedKeys(chartImageReasons), ", "))
 	}
@@ -152,7 +124,7 @@ const (
 
 // classifyChart picks the action for a chart whose matrix entry, if any, is
 // already valid (so an indexed chart can only be listed as pending-fix).
-func classifyChart(indexed bool, entry *chartImageExclusion) chartAction {
+func classifyChart(indexed bool, entry *imageExclusion) chartAction {
 	switch {
 	case entry == nil && indexed:
 		return actionCheck
