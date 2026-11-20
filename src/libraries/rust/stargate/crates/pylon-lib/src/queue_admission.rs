@@ -81,6 +81,7 @@ struct QueueAdmissionState {
 #[derive(Debug, Default)]
 struct QueueModelState {
     last_mean_input_tps: Option<f64>,
+    input_tps_from_seed: bool,
     phase_requests: [usize; 3],
     // Exact totals keep public saturation from making exclusion or removal lossy.
     total_input_tokens: u128,
@@ -194,6 +195,10 @@ pub(crate) enum QueueAdmissionDecision {
     UnknownLocalEstimate {
         expected_ms: u64,
     },
+    UnmeasuredRate {
+        expected_ms: u64,
+        actual_ms: u64,
+    },
     Disabled,
 }
 
@@ -205,6 +210,7 @@ impl QueueAdmissionDecision {
             Self::Rejected { .. } => "rejected",
             Self::MissingEstimate => "missing_estimate",
             Self::UnknownLocalEstimate { .. } => "unknown_local_estimate",
+            Self::UnmeasuredRate { .. } => "unmeasured_rate",
         }
     }
 
@@ -212,14 +218,17 @@ impl QueueAdmissionDecision {
         match self {
             Self::Accepted { expected_ms, .. }
             | Self::Rejected { expected_ms, .. }
-            | Self::UnknownLocalEstimate { expected_ms } => Some(*expected_ms),
+            | Self::UnknownLocalEstimate { expected_ms }
+            | Self::UnmeasuredRate { expected_ms, .. } => Some(*expected_ms),
             _ => None,
         }
     }
 
     pub(crate) fn actual_ms(&self) -> Option<u64> {
         match self {
-            Self::Accepted { actual_ms, .. } | Self::Rejected { actual_ms, .. } => Some(*actual_ms),
+            Self::Accepted { actual_ms, .. }
+            | Self::Rejected { actual_ms, .. }
+            | Self::UnmeasuredRate { actual_ms, .. } => Some(*actual_ms),
             _ => None,
         }
     }
@@ -247,14 +256,13 @@ impl LiveRequestState {
         &self,
         generation: &ModelGeneration,
         last_mean_input_tps: f64,
+        input_tps_from_seed: bool,
     ) {
         let mut state = self.inner.lock();
         if valid_last_mean_input_tps(last_mean_input_tps) {
-            state
-                .models
-                .entry(generation.clone())
-                .or_default()
-                .last_mean_input_tps = Some(last_mean_input_tps);
+            let model = state.models.entry(generation.clone()).or_default();
+            model.last_mean_input_tps = Some(last_mean_input_tps);
+            model.input_tps_from_seed = input_tps_from_seed;
         } else if let Some(model) = state.models.get_mut(generation) {
             model.last_mean_input_tps = None;
             state.remove_model_if_unused(generation);
@@ -277,7 +285,11 @@ impl LiveRequestState {
 
     #[cfg(test)]
     pub(crate) fn update_model_throughput(&self, model_id: &str, last_mean_input_tps: f64) {
-        self.update_generation_throughput(&ModelGeneration::new(model_id, 0), last_mean_input_tps);
+        self.update_generation_throughput(
+            &ModelGeneration::new(model_id, 0),
+            last_mean_input_tps,
+            false,
+        );
     }
 
     #[cfg(test)]
@@ -314,7 +326,7 @@ impl LiveRequestState {
         else {
             return QueueAdmissionDecision::MissingEstimate;
         };
-        let actual_ms = {
+        let local_estimate = {
             let state = self.inner.lock();
             generation.and_then(|generation| {
                 state.models.get(generation).and_then(|model| {
@@ -326,17 +338,27 @@ impl LiveRequestState {
                             LiveRequest::Observed(_) => None,
                         })
                         .filter(|request| request.generation == *generation);
-                    model.queue_estimate_ms_for_priority_excluding(
-                        required.queue_priority(),
-                        excluded_request,
-                        max_engine_concurrency,
-                    )
+                    model
+                        .queue_estimate_ms_for_priority_excluding(
+                            required.queue_priority(),
+                            excluded_request,
+                            max_engine_concurrency,
+                        )
+                        .map(|actual_ms| (actual_ms, model.input_tps_from_seed))
                 })
             })
         };
-        let Some(actual_ms) = actual_ms else {
+        let Some((actual_ms, input_tps_from_seed)) = local_estimate else {
             return QueueAdmissionDecision::UnknownLocalEstimate { expected_ms };
         };
+        // A seeded rate is a guess, so a gap to Stargate's estimate does not
+        // show that Stargate is wrong. Admit until a request measures the rate.
+        if input_tps_from_seed {
+            return QueueAdmissionDecision::UnmeasuredRate {
+                expected_ms,
+                actual_ms,
+            };
+        }
         let threshold_ms = mismatch_threshold_ms(expected_ms, config);
         if actual_ms > threshold_ms {
             QueueAdmissionDecision::Rejected {

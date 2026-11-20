@@ -2395,6 +2395,10 @@ mod tests {
             },
             QueueAdmissionDecision::MissingEstimate,
             QueueAdmissionDecision::UnknownLocalEstimate { expected_ms: 1 },
+            QueueAdmissionDecision::UnmeasuredRate {
+                expected_ms: 1,
+                actual_ms: 2,
+            },
             QueueAdmissionDecision::Disabled,
         ] {
             assert!(!queue_decision_logs_at_info(&decision));

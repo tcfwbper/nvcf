@@ -1650,6 +1650,14 @@ mod tests {
         seeded: &[&str],
     ) {
         for (model_id, input_tps) in published_input_tps(runtime_state) {
+            let stats = runtime_state
+                .model_stats(&model_id)
+                .expect("advertised model should carry stats");
+            assert_eq!(
+                stats.input_tps_from_seed,
+                seeded.contains(&model_id.as_str()),
+                "{label}: {model_id} input_tps_from_seed"
+            );
             if seeded.contains(&model_id.as_str()) {
                 assert_eq!(input_tps, FALLBACK_INPUT_TPS, "{label}: {model_id}");
             } else {

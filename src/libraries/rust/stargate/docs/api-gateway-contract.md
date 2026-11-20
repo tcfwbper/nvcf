@@ -249,7 +249,11 @@ Pylon may return retryable `429` with
 By default it does so only when its local queue estimate exceeds Stargate's by
 at least 10 s and at least 4 times (`--pylon-queue-mismatch-min-delta-ms`,
 `--pylon-queue-mismatch-tolerance-factor`). Stargate's estimate lags behind
-Pylon's under load, so smaller differences are expected.
+Pylon's under load, so smaller differences are expected. Pylon skips the check
+while a model's input rate is still the configured `--initial-input-tps` (also
+after a calibration fallback), because that rate is not measured. The first
+measured rate ends this window. Pylon counts these admissions as
+`unmeasured_rate` in `pylon_queue_admission_decisions_total`.
 
 Pylon marks a model server error retryable from the response head, before any
 output reaches Stargate. By default it marks `529` and `503`

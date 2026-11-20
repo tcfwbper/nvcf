@@ -35,6 +35,7 @@ pub(super) const ENGINE_STATS_SOURCE: &str = "engine_stats_stream";
 pub(super) struct ModelMetricsState {
     pub(super) last_mean_input_tps: f64,
     pub(super) max_input_tps: Option<f64>,
+    input_tps_from_seed: bool,
     pub(super) max_engine_concurrency: Option<u64>,
     pub(super) chat_output_tps_samples: VecDeque<f64>,
     pub(super) chat_output_tps_sum: f64,
@@ -597,6 +598,7 @@ impl StatsAggregator {
                 ModelMetricsState {
                     last_mean_input_tps: input_tps,
                     max_input_tps: Some(input_tps),
+                    input_tps_from_seed: true,
                     input_tps_distribution,
                     aggregate_state_counted: true,
                     ..ModelMetricsState::default()
@@ -1213,15 +1215,25 @@ impl ModelMetricsState {
     // Callers pass update_max = false for a fallback window that may count cached
     // prompt tokens as prefill; the mean still moves, the maximum does not.
     pub(super) fn publish_mean_input_tps(&mut self, input_tps: f64, update_max: bool) -> bool {
-        let before = (self.last_mean_input_tps, self.max_input_tps);
+        let before = (
+            self.last_mean_input_tps,
+            self.max_input_tps,
+            self.input_tps_from_seed,
+        );
         self.last_mean_input_tps = input_tps;
+        self.input_tps_from_seed = false;
         if update_max {
             self.max_input_tps = Some(
                 self.max_input_tps
                     .map_or(input_tps, |max| max.max(input_tps)),
             );
         }
-        before != (self.last_mean_input_tps, self.max_input_tps)
+        before
+            != (
+                self.last_mean_input_tps,
+                self.max_input_tps,
+                self.input_tps_from_seed,
+            )
     }
 
     pub(super) fn clear_live_output_tps(&mut self) -> bool {
@@ -1245,6 +1257,7 @@ impl ModelMetricsState {
         CurrentModelStats {
             last_mean_input_tps: self.last_mean_input_tps,
             max_input_tps: self.max_input_tps,
+            input_tps_from_seed: self.input_tps_from_seed,
             output_tps: active_chat_output_tps.max(average_with_sum(
                 &self.chat_output_tps_samples,
                 self.chat_output_tps_sum,

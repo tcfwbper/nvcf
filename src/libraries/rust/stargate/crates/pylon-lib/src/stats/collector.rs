@@ -1770,12 +1770,14 @@ mod tests {
         let bootstrapped = aggregator.snapshot("model-a");
         assert_eq!(bootstrapped.last_mean_input_tps, 100.0);
         assert_eq!(bootstrapped.max_input_tps, Some(100.0));
+        assert!(bootstrapped.input_tps_from_seed);
         aggregator.stream("req-a", (0, 0), false, Duration::ZERO);
 
         let stats = published_stats(aggregator.stream("req-a", (20, 0), false, milliseconds(100)));
 
         assert!((stats.last_mean_input_tps - (700.0 / 6.0)).abs() < f64::EPSILON);
         assert_eq!(stats.max_input_tps, Some(stats.last_mean_input_tps));
+        assert!(!stats.input_tps_from_seed);
     }
 
     #[test]
@@ -3061,7 +3063,9 @@ mod tests {
             seconds(2),
         );
 
-        assert_eq!(aggregator.snapshot("model-a").last_mean_input_tps, 50.0);
+        let stats = aggregator.snapshot("model-a");
+        assert_eq!(stats.last_mean_input_tps, 50.0);
+        assert!(!stats.input_tps_from_seed);
     }
 
     #[test]
@@ -4012,6 +4016,100 @@ mod tests {
                 .queue_time_estimate_ms_by_priority,
             Some(HashMap::from([(0, 15)]))
         );
+        collector.handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queue_admission_skips_the_mismatch_check_while_the_input_tps_is_the_seed() {
+        let collector = RunningCollector::spawn_empty(StatsCollectorConfig::default(), None, false);
+        collector.begin_configured_model("model-a", 100.0).await;
+        let runtime = &collector.runtime_state;
+        let generation = runtime.current_generation("model-a").unwrap();
+        let required =
+            |request_id: &str, input_tokens| crate::request_observer::RequiredTunnelHeaders {
+                request_id: request_id.to_string(),
+                routing_key: None,
+                model_id: "model-a".to_string(),
+                priority: None,
+                input_tokens,
+                accepted_at: std::time::Instant::now(),
+            };
+        // Over the 10 s allowance at any rate this test reaches: 300 s at the
+        // seed, under 20 s once a 2,000 tok/s sample is in.
+        let _burst = runtime.track_request(&required("burst", 30_000));
+        let incoming = required("incoming", 144);
+        let _incoming = runtime.track_request(&incoming);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            stargate_protocol::tunnel_contract::HEADER_STARGATE_EXPECTED_QUEUE_MS,
+            "0".parse().unwrap(),
+        );
+        let evaluate = || {
+            runtime.evaluate_generation_queue_admission(
+                &crate::PylonQueueMismatchRetryConfig::default(),
+                &incoming,
+                Some(&generation),
+                &headers,
+            )
+        };
+        let seeded = evaluate();
+        assert_eq!(seeded.result_label(), "unmeasured_rate", "{seeded:?}");
+        assert_eq!(seeded.actual_ms(), Some(300_000));
+
+        observe_request_with_test_metadata(
+            runtime,
+            RequestObservation {
+                input_tokens: 1_000,
+                time_to_response_headers: Some(milliseconds(500)),
+                total_duration: milliseconds(500),
+                ..observation(
+                    RequestObservationEndpoint::Decisions,
+                    "completed-decision",
+                    RequestObservationState::Complete,
+                )
+            },
+        );
+        collector
+            .wait_for_stats("a completed request should measure input TPS", |stats| {
+                stats.last_mean_input_tps > 100.0
+            })
+            .await;
+        let measured = evaluate();
+        assert_eq!(measured.result_label(), "rejected", "{measured:?}");
+
+        // A calibration fallback replaces the generation with one at the seed.
+        assert!(runtime.retire_generation(&generation).is_some());
+        assert!(
+            collector
+                .handle
+                .control()
+                .retire_generation(&generation)
+                .await
+                .expect("collector should acknowledge retirement")
+        );
+        let fallback = ModelGeneration::new("model-a", 1);
+        assert!(runtime.begin_generation(fallback.clone()));
+        assert!(
+            collector
+                .handle
+                .control()
+                .begin_generation(
+                    fallback.clone(),
+                    ModelStatsInitialization::ConfiguredInputTps { input_tps: 100.0 }
+                )
+                .await
+                .expect("collector should acknowledge the fallback generation")
+        );
+        let _fallback_burst = runtime.track_request(&required("fallback-burst", 30_000));
+        let fallback_incoming = required("fallback-incoming", 144);
+        let _fallback_incoming = runtime.track_request(&fallback_incoming);
+        let reopened = runtime.evaluate_generation_queue_admission(
+            &crate::PylonQueueMismatchRetryConfig::default(),
+            &fallback_incoming,
+            Some(&fallback),
+            &headers,
+        );
+        assert_eq!(reopened.result_label(), "unmeasured_rate", "{reopened:?}");
         collector.handle.shutdown().await;
     }
 
