@@ -64,7 +64,7 @@ func TestChartSourcesRejectMissingIndexPath(t *testing.T) {
 	}
 	check := &chartCheck{chart: "c"}
 	check.checkChartSources(values, catalog)
-	findings, expected := pendingFixOutcome(check, chartImageExclusion{Reason: reasonPendingFix})
+	findings, expected := chartImageGate.pendingFixOutcome(check.chart, check.findings, imageExclusion{Reason: reasonPendingFix}, findingCoverage)
 	if expected != "" || len(findings) != 1 || findings[0].Category != findingInvalidEntry {
 		t.Fatalf("findings %+v, expected label %q", findings, expected)
 	}

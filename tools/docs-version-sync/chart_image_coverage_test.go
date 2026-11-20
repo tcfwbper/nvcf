@@ -49,16 +49,16 @@ func isolateHelmConfiguration(t *testing.T) {
 
 // evaluateChartImageCoverage validates the matrix, then classifies and checks
 // every tracked chart. workspace returns a fresh temporary directory per chart.
-func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func() string) (*chartCoverageReport, error) {
+func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func() string) (*imageGateReport, error) {
 	charts, err := discoverTrackedCharts(repoRoot)
 	if err != nil {
 		return nil, err
 	}
-	entries, err := loadChartImageExclusions(exclusionsPath)
+	entries, err := loadImageExclusions(exclusionsPath)
 	if err != nil {
 		return nil, err
 	}
-	report := &chartCoverageReport{Skipped: make(map[string][]string)}
+	report := newChartCoverageReport()
 	tracked := make(map[string]bool)
 	indexed := make(map[string]bool)
 	for _, chart := range charts {
@@ -75,7 +75,7 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func(
 	for _, chart := range sortedKeys(entries) {
 		if err := validateChartImageExclusion(repoRoot, chart, entries[chart], tracked, indexed[chart]); err != nil {
 			invalid[chart] = true
-			report.add(chartFinding{Category: findingInvalidEntry, Chart: chart, Problem: err.Error(),
+			report.add(imageGateFinding{Category: findingInvalidEntry, Subject: chart, Problem: err.Error(),
 				Expected: "a valid " + chartImageExclusionsFile + " entry", Fix: "correct or remove the entry"})
 		}
 	}
@@ -83,7 +83,7 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func(
 		if invalid[chart] {
 			continue
 		}
-		var entry *chartImageExclusion
+		var entry *imageExclusion
 		if value, ok := entries[chart]; ok {
 			entry = &value
 		}
@@ -101,7 +101,7 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func(
 			}
 		case actionCheckExpectFailure:
 			checkIndexedChart(check)
-			findings, expected := pendingFixOutcome(check, *entry)
+			findings, expected := chartImageGate.pendingFixOutcome(chart, check.findings, *entry, findingCoverage)
 			report.add(findings...)
 			if expected != "" {
 				report.Expected = append(report.Expected, expected)
@@ -121,39 +121,9 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func(
 	return report, nil
 }
 
-// pendingFixOutcome applies expected-failure strictness to an indexed
-// pending-fix chart: only rule (coverage) findings are expected. It returns
-// the findings that fail the run, or the expected-failure label for the
-// summary. A render, dependency, index or exception-key error still fails,
-// and a clean pass means the entry is stale.
-func pendingFixOutcome(check *chartCheck, entry chartImageExclusion) ([]chartFinding, string) {
-	var hard []chartFinding
-	for _, finding := range check.findings {
-		if finding.Category != findingCoverage {
-			hard = append(hard, finding)
-		}
-	}
-	if len(hard) > 0 {
-		return hard, ""
-	}
-	if len(check.findings) == 0 {
-		return []chartFinding{{Category: findingPendingFixed, Chart: check.chart, Problem: "chart now passes image coverage",
-			Expected: "no " + reasonPendingFix + " entry for a covered chart", Fix: "remove the entry from " + chartImageExclusionsFile}}, ""
-	}
-	return nil, expectedFailureLabel(check.chart, entry, fmt.Sprintf("%d coverage findings", len(check.findings)))
-}
-
-func expectedFailureLabel(chart string, entry chartImageExclusion, detail string) string {
-	parts := []string{detail}
-	if entry.Issue != "" {
-		parts = append(parts, entry.Issue)
-	}
-	return chart + " (" + strings.Join(parts, ", ") + ")"
-}
-
 // TestChartImageFindingFormat pins the one-line failure format.
 func TestChartImageFindingFormat(t *testing.T) {
-	finding := chartFinding{Category: findingCoverage, Chart: "deploy/helm/x", Image: "server", ValuesPath: "x.server.image.registry",
+	finding := imageGateFinding{Category: findingCoverage, Subject: "deploy/helm/x", Image: "server", ValuesPath: "x.server.image.registry",
 		Problem: `prefilled image source "nvcr.io"`, Expected: `""`, Fix: "remove it"}
 	if got, want := finding.String(), `FAIL deploy/helm/x server x.server.image.registry: prefilled image source "nvcr.io"; expected ""; fix: remove it`; got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -167,10 +137,12 @@ func TestChartImageFindingFormat(t *testing.T) {
 // TestChartImageSummaryListsDowngrades requires skips and expected failures in
 // the summary, with counts by failure category.
 func TestChartImageSummaryListsDowngrades(t *testing.T) {
-	report := &chartCoverageReport{
-		Findings: []chartFinding{{Category: findingUncovered, Chart: "new"}, {Category: findingRenderError, Chart: "broken"}},
+	report := newChartCoverageReport()
+	*report = imageGateReport{
+		Name: report.Name, Categories: report.Categories,
+		Findings: []imageGateFinding{{Category: findingUncovered, Subject: "new"}, {Category: findingRenderError, Subject: "broken"}},
 		Skipped:  map[string][]string{reasonTestFixture: {"examples/a"}},
-		Expected: []string{expectedFailureLabel("deploy/helm/p", chartImageExclusion{Reason: reasonPendingFix, Issue: "https://github.com/dsx-ai-factory/nvcf/issues/7"}, "no image index")},
+		Expected: []string{expectedFailureLabel("deploy/helm/p", imageExclusion{Reason: reasonPendingFix, Issue: "https://github.com/dsx-ai-factory/nvcf/issues/7"}, "no image index")},
 		Covered:  []string{"deploy/helm/nats"},
 	}
 	summary := report.Summary()
@@ -187,21 +159,21 @@ func TestChartImageSummaryListsDowngrades(t *testing.T) {
 
 // TestPendingFixOutcome keeps render errors fatal and flags a stale entry.
 func TestPendingFixOutcome(t *testing.T) {
-	entry := chartImageExclusion{Reason: reasonPendingFix}
+	entry := imageExclusion{Reason: reasonPendingFix}
 	for _, test := range []struct {
 		name     string
-		findings []chartFinding
+		findings []imageGateFinding
 		want     string
 		expected bool
 	}{
-		{"coverage failure is expected", []chartFinding{{Category: findingCoverage}}, "", true},
-		{"render error fails", []chartFinding{{Category: findingCoverage}, {Category: findingRenderError}}, findingRenderError, false},
-		{"index or exception key error fails", []chartFinding{{Category: findingCoverage}, {Category: findingInvalidEntry}}, findingInvalidEntry, false},
-		{"incomplete scenario fails", []chartFinding{{Category: findingCoverage}, {Category: findingScenario}}, findingScenario, false},
+		{"coverage failure is expected", []imageGateFinding{{Category: findingCoverage}}, "", true},
+		{"render error fails", []imageGateFinding{{Category: findingCoverage}, {Category: findingRenderError}}, findingRenderError, false},
+		{"index or exception key error fails", []imageGateFinding{{Category: findingCoverage}, {Category: findingInvalidEntry}}, findingInvalidEntry, false},
+		{"incomplete scenario fails", []imageGateFinding{{Category: findingCoverage}, {Category: findingScenario}}, findingScenario, false},
 		{"passing chart is stale", nil, findingPendingFixed, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, label := pendingFixOutcome(&chartCheck{chart: "c", findings: test.findings}, entry)
+			got, label := chartImageGate.pendingFixOutcome("c", test.findings, entry, findingCoverage)
 			if test.want == "" && len(got) != 0 || test.want != "" && (len(got) != 1 || got[0].Category != test.want) {
 				t.Fatalf("findings %+v, want category %q", got, test.want)
 			}
@@ -384,11 +356,11 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	got := make(map[string]map[string]bool)
 	problems := make(map[string][]string)
 	for _, finding := range report.Findings {
-		if got[finding.Chart] == nil {
-			got[finding.Chart] = make(map[string]bool)
+		if got[finding.Subject] == nil {
+			got[finding.Subject] = make(map[string]bool)
 		}
-		got[finding.Chart][finding.Category] = true
-		problems[finding.Chart] = append(problems[finding.Chart], finding.ValuesPath+": "+finding.Problem)
+		got[finding.Subject][finding.Category] = true
+		problems[finding.Subject] = append(problems[finding.Subject], finding.ValuesPath+": "+finding.Problem)
 	}
 	// Each fixture names the check that must report it, so another check
 	// producing the same category cannot stand in for a broken one.
