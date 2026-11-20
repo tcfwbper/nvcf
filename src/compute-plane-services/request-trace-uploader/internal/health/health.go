@@ -53,7 +53,8 @@ type Step struct {
 // succeed. Serve the handler before calling Start, so liveness answers while a
 // slow step runs on a large backlog. A failing step, or a context that ends
 // between steps, stops the sequence and leaves the handler unready; the caller
-// exits non-zero. Remote destinations and telemetry never belong in a step.
+// decides whether to retry. Remote destinations and telemetry never belong in
+// a step.
 func (h *Handler) Start(ctx context.Context, steps ...Step) error {
 	for _, step := range steps {
 		if step.Name == "" || step.Run == nil {

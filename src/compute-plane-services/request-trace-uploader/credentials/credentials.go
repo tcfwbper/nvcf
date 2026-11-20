@@ -38,6 +38,13 @@ const (
 type Config struct {
 	File            string
 	RefreshInterval time.Duration
+	// AllowMissingFile lets Open succeed when File does not exist yet or
+	// cannot be read, such as a mount with the wrong permissions. The Loader
+	// then holds no values until a Reload reads the file, so a missing
+	// secret shows as an authentication failure while the caller keeps
+	// running. A file that is read but holds no usable values is still
+	// refused.
+	AllowMissingFile bool
 }
 
 // DefaultConfig returns the mount path NVCF uses and a five minute re-read.
@@ -102,8 +109,9 @@ type Loader struct {
 	afterRead func()
 }
 
-// Open reads keys from the secrets file. A missing file, or a missing, empty
-// or non-string key, is a startup error.
+// Open reads keys from the secrets file. A missing file, unless
+// cfg.AllowMissingFile is set, or a missing, empty or non-string key, is a
+// startup error.
 func Open(cfg Config, keys ...string) (*Loader, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -123,15 +131,20 @@ func Open(cfg Config, keys ...string) (*Loader, error) {
 	}
 	loader := &Loader{cfg: cfg, keys: append([]string(nil), keys...), newTicker: systemTicker}
 	values, err := loader.read()
-	if err != nil {
+	switch {
+	case err == nil:
+	case cfg.AllowMissingFile && errors.As(err, new(unreadable)):
+		values = map[string]Secret{}
+	default:
 		return nil, err
 	}
 	loader.values = values
 	return loader, nil
 }
 
-// Get returns the last good value of key. It reports false only for a key
-// that was not requested in Open.
+// Get returns the last good value of key. It reports false for a key that
+// was not requested in Open, and, with AllowMissingFile, for every key until
+// the file is first read.
 func (l *Loader) Get(key string) (Secret, bool) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -167,15 +180,22 @@ func (l *Loader) Reload() error {
 	return nil
 }
 
+// unreadable marks a failure to open or read the file, as opposed to a file
+// whose content is not usable.
+type unreadable struct{ err error }
+
+func (u unreadable) Error() string { return u.err.Error() }
+func (u unreadable) Unwrap() error { return u.err }
+
 func (l *Loader) read() (map[string]Secret, error) {
 	file, err := os.Open(l.cfg.File)
 	if err != nil {
-		return nil, fmt.Errorf("read secrets file: %w", withoutPath(err))
+		return nil, fmt.Errorf("read secrets file: %w", unreadable{withoutPath(err)})
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, maxFileBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read secrets file: %w", withoutPath(err))
+		return nil, fmt.Errorf("read secrets file: %w", unreadable{withoutPath(err)})
 	}
 	if len(data) > maxFileBytes {
 		return nil, fmt.Errorf("read secrets file: larger than %d bytes", maxFileBytes)

@@ -215,9 +215,20 @@ func TestRunServesUntilShutdownThenExitsZero(t *testing.T) {
 	}
 }
 
-// TestRunExitsOneWithoutStartingOnABadConfiguration also checks that the
-// startup log names the bad setting and never prints a configured value.
-func TestRunExitsOneWithoutStartingOnABadConfiguration(t *testing.T) {
+// fastStartRetry shortens the wait between startup attempts for a test.
+func fastStartRetry(t *testing.T) {
+	t.Helper()
+	first, limit := startRetryFirst, startRetryMax
+	startRetryFirst, startRetryMax = 20*time.Millisecond, 40*time.Millisecond
+	t.Cleanup(func() { startRetryFirst, startRetryMax = first, limit })
+}
+
+// A sidecar that exits makes its pod unready, which takes the frontend it
+// shares a pod with out of serving. So a startup error keeps the process
+// running and retrying, uploading nothing. The log names the bad setting
+// and never prints a configured value.
+func TestRunStaysUpAndRetriesOnABadConfiguration(t *testing.T) {
+	fastStartRetry(t)
 	const marker = "value-marker-41c"
 	tests := map[string]struct {
 		env   map[string]string
@@ -252,20 +263,38 @@ func TestRunExitsOneWithoutStartingOnABadConfiguration(t *testing.T) {
 			for k, v := range tt.env {
 				env[k] = v
 			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			exited := make(chan int, 1)
 			go func() {
-				exited <- run(context.Background(), lookupOf(env), environOf(env), "test-build", collect(append(tt.opts, WithDefaultBackend(config.BackendDebug))))
+				exited <- run(ctx, lookupOf(env), environOf(env), "test-build", collect(append(tt.opts, WithDefaultBackend(config.BackendDebug))))
 			}()
+			deadline := time.Now().Add(5 * time.Second)
+			for strings.Count(logs.String(), "invalid request trace uploader configuration") < 3 {
+				select {
+				case code := <-exited:
+					t.Fatalf("run exited %d on a bad configuration, want it to stay up\n%s", code, logs.String())
+				default:
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("fewer than 3 startup attempts in 5 s\n%s", logs.String())
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			cancel()
 			select {
 			case code := <-exited:
 				if code != 1 {
-					t.Fatalf("exit = %d, want 1\n%s", code, logs.String())
+					t.Fatalf("exit after shutdown = %d, want 1 for a run that never started\n%s", code, logs.String())
 				}
 			case <-time.After(5 * time.Second):
-				t.Fatalf("run still running after 5 s, want it to stop at startup\n%s", logs.String())
+				t.Fatalf("run still running 5 s after shutdown\n%s", logs.String())
 			}
 			out := logs.String()
-			if !strings.Contains(out, "invalid request trace uploader configuration") || !strings.Contains(out, tt.named) {
+			if !strings.Contains(out, `"msg":"request trace uploader did not start; retrying"`) {
+				t.Fatalf("log = %s, want the retry logged", out)
+			}
+			if !strings.Contains(out, tt.named) {
 				t.Fatalf("log = %s, want the configuration error naming %s", out, tt.named)
 			}
 			if strings.Contains(out, "request trace uploader starting") {
@@ -335,5 +364,86 @@ func TestRunSendsTheLastMetricsAfterTheDrain(t *testing.T) {
 	name := otlp.MetricPrefix + telemetry.SubmitsAmbiguous
 	if backend, ok := received.backend(name); !ok || backend != string(config.BackendDebug) {
 		t.Fatalf("collector got %s with backend %q (%v), want it from the final export with backend debug\n%s", name, backend, ok, logs.String())
+	}
+}
+
+// A cause that clears, such as a volume that is not writable yet, needs no
+// restart: the next attempt starts the uploader.
+func TestRunStartsOnceAStartupFaultClears(t *testing.T) {
+	fastStartRetry(t)
+	logs := captureLog(t)
+	env := validEnv(t)
+	blocker := filepath.Join(t.TempDir(), "not-a-directory-yet")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env[config.EnvStateDir] = filepath.Join(blocker, "state")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exited := make(chan int, 1)
+	go func() {
+		exited <- run(ctx, lookupOf(env), environOf(env), "test-build", collect([]Option{WithDefaultBackend(config.BackendDebug)}))
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for strings.Count(logs.String(), `"msg":"request trace uploader did not start; retrying"`) < 2 {
+		select {
+		case code := <-exited:
+			t.Fatalf("run exited %d while the state dir cannot be created, want it to stay up\n%s", code, logs.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fewer than 2 retries in 5 s\n%s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		request, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+env[config.EnvHealthAddr]+"/readyz", nil)
+		if response, err := http.DefaultClient.Do(request); err == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline.Add(5 * time.Second)) {
+			t.Fatalf("not ready after the state dir could be created\n%s", logs.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case code := <-exited:
+		if code != 0 {
+			t.Fatalf("exit = %d after shutdown of a started uploader, want 0\n%s", code, logs.String())
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("run still running 15 s after shutdown")
+	}
+}
+
+// Shutdown while waiting to retry does not wait out the backoff.
+func TestRunStopsPromptlyWhileWaitingToRetry(t *testing.T) {
+	logs := captureLog(t)
+	env := validEnv(t)
+	env[config.EnvScanInterval] = "not-a-duration"
+	ctx, cancel := context.WithCancel(context.Background())
+	exited := make(chan int, 1)
+	go func() {
+		exited <- run(ctx, lookupOf(env), environOf(env), "test-build", collect([]Option{WithDefaultBackend(config.BackendDebug)}))
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "did not start; retrying") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no retry logged in 5 s\n%s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("run waited out the %v backoff after shutdown", startRetryFirst)
 	}
 }

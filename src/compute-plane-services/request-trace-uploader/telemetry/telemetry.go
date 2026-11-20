@@ -118,6 +118,9 @@ const (
 	// PrepareMemoryWaits counts prepares that waited for room in the memory
 	// that concurrent prepares share for long lines.
 	PrepareMemoryWaits = "prepare_memory_waits"
+	// StartupFailures counts startup attempts that failed, by reason. The
+	// process stays up and retries, so this is how a stuck uploader shows.
+	StartupFailures = "startup_failures"
 )
 
 // Labels are the attributes of one observation, without BackendLabel.
@@ -186,6 +189,12 @@ var payloadRecords = map[string][]string{"record_type": {"request_payload"}}
 // suppression stripped because the rule's header had no value.
 var SuppressionActions = []string{"strip_payload", "drop_record", "strip_unresolved"}
 
+// StartupFailureReasons are the reason label values of StartupFailures:
+// a setting the uploader refuses, the backend that could not be built, the
+// spool (directories, lock, journal), or anything else. A missing secrets
+// file is not one: the uploader starts and the backend waits for the file.
+var StartupFailureReasons = []string{"config", "backend", "spool", "other"}
+
 // QuarantineReasons are the reason label values of SegmentsQuarantined: the
 // reasons prepare, batching and the fault policy record, and the backend
 // fault reasons. "unknown" also counts any reason not listed here.
@@ -243,6 +252,8 @@ var catalog = cloneAll([]Instrument{
 	{Name: PrepareDuration, Kind: Histogram, Unit: "s", Buckets: stepBuckets},
 	{Name: ExportLatency, Kind: Histogram, Unit: "s", Buckets: secondsBuckets},
 	{Name: PrepareMemoryWaits, Kind: Counter, Unit: "1"},
+	{Name: StartupFailures, Kind: Counter, Unit: "1", Labels: []string{"reason"},
+		Values: map[string][]string{"reason": StartupFailureReasons}},
 })
 
 var byName = func() map[string]Instrument {

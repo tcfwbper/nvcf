@@ -320,3 +320,64 @@ func removeFile(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+// A backend that starts before its secrets file is mounted, or whose file is
+// missing, opens with no values and picks the file up on the next Reload,
+// so a missing secret is an authentication failure at runtime, not a
+// process that cannot start.
+func TestOpenWithAllowMissingFileStartsEmptyAndLoadsTheFileLater(t *testing.T) {
+	path := secretsPath(t)
+	loader, err := Open(Config{File: path, RefreshInterval: time.Minute, AllowMissingFile: true}, testIDKey, testSecretKey)
+	if err != nil {
+		t.Fatalf("Open() without the file error = %v, want none", err)
+	}
+	if got, ok := loader.Get(testIDKey); ok || got.Reveal() != "" {
+		t.Fatalf("Get before the file exists = %q, %v; want empty and false", got.Reveal(), ok)
+	}
+	if err := loader.Reload(); err == nil {
+		t.Fatal("Reload() without the file error = nil, want the read error so the caller counts an authentication failure")
+	}
+	writeSecrets(t, path, validSecrets())
+	if err := loader.Reload(); err != nil {
+		t.Fatalf("Reload() after the file appeared error = %v", err)
+	}
+	if got, ok := loader.Get(testSecretKey); !ok || got.Reveal() != testSecret {
+		t.Fatalf("Get after the file appeared = %q, %v; want the secret", got.Reveal(), ok)
+	}
+}
+
+// AllowMissingFile excuses a file that cannot be read, never one that is
+// read but lacks a required key: that is still refused at Open.
+func TestOpenWithAllowMissingFileStillRefusesABadFile(t *testing.T) {
+	path := secretsPath(t)
+	writeSecrets(t, path, `{"`+testIDKey+`":"`+testID+`"}`)
+	if _, err := Open(Config{File: path, RefreshInterval: time.Minute, AllowMissingFile: true}, testIDKey, testSecretKey); err == nil || !strings.Contains(err.Error(), testSecretKey) {
+		t.Fatalf("Open() error = %v, want one naming the missing key %s", err, testSecretKey)
+	}
+}
+
+// A file the process cannot read yet, such as one mounted with the wrong
+// permissions, is treated as missing: the fix may come without a restart.
+func TestOpenWithAllowMissingFileStartsEmptyWhenTheFileCannotBeRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a file whatever its mode")
+	}
+	path := secretsPath(t)
+	writeSecrets(t, path, validSecrets())
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	loader, err := Open(Config{File: path, RefreshInterval: time.Minute, AllowMissingFile: true}, testIDKey, testSecretKey)
+	if err != nil {
+		t.Fatalf("Open() on an unreadable file error = %v, want none", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loader.Reload(); err != nil {
+		t.Fatalf("Reload() once readable error = %v", err)
+	}
+	if got, ok := loader.Get(testIDKey); !ok || got.Reveal() != testID {
+		t.Fatalf("Get after the file became readable = %q, %v; want the id", got.Reveal(), ok)
+	}
+}

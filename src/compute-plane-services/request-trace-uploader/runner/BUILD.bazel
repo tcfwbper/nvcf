@@ -29,6 +29,7 @@ go_test(
     srcs = [
         "logging_test.go",
         "runner_test.go",
+        "startup_metrics_test.go",
     ],
     embed = [":runner"],
     deps = [

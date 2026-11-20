@@ -34,6 +34,14 @@ import (
 // after the drain, all three together.
 const telemetryFlushTimeout = 5 * time.Second
 
+// startRetryFirst and startRetryMax bound the wait between startup
+// attempts. It doubles from the first to the max, as a kubelet restart
+// backoff does. Tests shorten them.
+var (
+	startRetryFirst = 10 * time.Second
+	startRetryMax   = 5 * time.Minute
+)
+
 // Option changes how Run loads configuration.
 type Option func(*options)
 
@@ -57,8 +65,9 @@ func WithDefaultBackend(backend config.Backend) Option {
 
 // Run loads configuration, starts the service, and blocks until SIGINT or
 // SIGTERM. It then drains, sends the last telemetry, and returns the process
-// exit code, so a main can pass it to os.Exit. Logs are JSON lines on
-// stderr.
+// exit code, so a main can pass it to os.Exit. A startup error does not end
+// the process: Run logs it and tries again until it starts or is stopped.
+// Logs are JSON lines on stderr.
 //
 // distribution names the build in the start log only. Which backends exist
 // is decided by what the calling main linked.
@@ -78,40 +87,136 @@ func collect(opts []Option) options {
 }
 
 // run is Run with its environment and shutdown signal passed in. It returns
-// instead of exiting, so the final telemetry export runs on every path.
+// only once ctx ends. An attempt that fails before then is retried after a
+// wait that doubles from startRetryFirst to startRetryMax: the uploader runs
+// as a sidecar, and a sidecar that exits makes its pod unready, which takes
+// the frontend it shares the pod with out of serving. Nothing uploads until
+// an attempt starts, so a bad setting never runs; the error is logged on
+// every attempt, and no uptime is reported until one starts. The exit code is
+// that of the last attempt.
+func run(ctx context.Context, lookup config.LookupFunc, environ []string, distribution string, o options) int {
+	var m processMetrics
+	defer m.flushIfLeft()
+	wait := startRetryFirst
+	for {
+		code := attempt(ctx, lookup, environ, distribution, o, &m)
+		if ctx.Err() != nil {
+			return code
+		}
+		slog.Warn("request trace uploader did not start; retrying", "retry_in", wait.String())
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return code
+		case <-timer.C:
+		}
+		wait = min(2*wait, startRetryMax)
+	}
+}
+
+// processMetrics is the metrics export for the life of the process. It
+// outlives startup attempts, so startup_failures is one counter that keeps
+// growing and is exported on its interval while the process waits to
+// retry, and a reset never hides failures from an alert.
+type processMetrics struct {
+	recorder telemetry.Metrics
+	shutdown *signalShutdown
+	flushed  bool
+}
+
+// start creates the export once, when its endpoint is set. A failure is
+// logged and tried again on the next attempt.
+func (m *processMetrics) start(cfg otlp.Config, label string) error {
+	if m.recorder != nil {
+		return nil
+	}
+	exporter, err := otlp.New(context.Background(), cfg, label)
+	if err != nil {
+		return err
+	}
+	m.recorder = telemetry.Safe(exporter)
+	m.shutdown = &signalShutdown{name: "metrics", shutdown: exporter.Shutdown}
+	return nil
+}
+
+// final returns the metrics shutdown for the final export after the drain,
+// once; later calls return nothing.
+func (m *processMetrics) final() []signalShutdown {
+	if m.shutdown == nil || m.flushed {
+		return nil
+	}
+	m.flushed = true
+	return []signalShutdown{*m.shutdown}
+}
+
+// flushIfLeft sends the final metrics when no attempt did, as when the
+// process stops while it waits to retry.
+func (m *processMetrics) flushIfLeft() { flushTelemetry(m.final()) }
+
+// failed counts one failed startup attempt under reason and returns its
+// exit code.
+func (m *processMetrics) failed(reason string) int {
+	if m.recorder != nil {
+		m.recorder.Add(telemetry.StartupFailures, 1, telemetry.Labels{"reason": reason})
+	}
+	return 1
+}
+
+// attempt loads configuration and runs the service once. It returns instead
+// of exiting, so the final telemetry export runs on every path.
 //
 // Each OTLP signal goes out only when its own endpoint is set. Metrics are
 // wrapped in telemetry.Safe; spans and log records are exported in the
 // background. Log records also still go to the logger already installed.
 // After the drain, a final export of all three runs within
 // telemetryFlushTimeout. A failed export never changes the exit code.
-func run(ctx context.Context, lookup config.LookupFunc, environ []string, distribution string, o options) int {
+func attempt(ctx context.Context, lookup config.LookupFunc, environ []string, distribution string, o options, m *processMetrics) int {
+	metricsCfg, exportMetrics, err := otlp.ConfigFromEnv(lookup)
+	if err != nil {
+		slog.Error("invalid request trace uploader configuration", "error", err)
+		return 1
+	}
+	// Metrics start before the other settings load, so a setting the
+	// uploader refuses is still counted in startup_failures.
+	if exportMetrics {
+		if err := m.start(metricsCfg, backendLabel(lookup, o)); err != nil {
+			slog.Error("create request trace uploader metrics exporter", "error", atomicfile.Pathless(err))
+			return 1
+		}
+	}
+	failed := m.failed
+	// Spans, metrics, then logs go out after the drain. The metrics export
+	// outlives the attempt, so it joins only the final flush.
+	var traceShutdowns, logShutdowns []signalShutdown
+	defer func() {
+		final := traceShutdowns
+		if ctx.Err() != nil {
+			final = append(final, m.final()...)
+		}
+		flushTelemetry(append(final, logShutdowns...))
+	}()
+	if err := errors.Join(checkSignal(otlp.TracesConfigFromEnv(lookup)), checkSignal(otlp.LogsConfigFromEnv(lookup))); err != nil {
+		slog.Error("invalid request trace uploader configuration", "error", err)
+		return failed("config")
+	}
+
 	cfg, err := loadConfig(lookup, environ, o)
 	if err != nil {
 		slog.Error("invalid request trace uploader configuration", "error", err)
-		return 1
+		return failed("config")
 	}
-	metricsCfg, exportMetrics, err := otlp.ConfigFromEnv(lookup)
-	if err == nil {
-		err = errors.Join(checkSignal(otlp.TracesConfigFromEnv(lookup)), checkSignal(otlp.LogsConfigFromEnv(lookup)))
-	}
-	if err != nil {
-		slog.Error("invalid request trace uploader configuration", "error", err)
-		return 1
-	}
-	var shutdowns []signalShutdown
-	defer func() { flushTelemetry(shutdowns) }()
 	if logsCfg, on, _ := otlp.LogsConfigFromEnv(lookup); on {
 		logs, err := otlp.NewLogs(context.Background(), logsCfg)
 		if err != nil {
 			slog.Error("create request trace uploader log exporter", "error", atomicfile.Pathless(err))
-			return 1
+			return failed("other")
 		}
 		local := slog.Default()
 		slog.SetDefault(slog.New(fanout{local.Handler(), logs.Handler()}))
 		// Logs are flushed last, after the local logger is back, so a
 		// warning about the final export still reaches the local log.
-		shutdowns = append(shutdowns, signalShutdown{name: "logs", shutdown: func(ctx context.Context) error {
+		logShutdowns = append(logShutdowns, signalShutdown{name: "logs", shutdown: func(ctx context.Context) error {
 			slog.SetDefault(local)
 			return logs.Shutdown(ctx)
 		}})
@@ -125,38 +230,47 @@ func run(ctx context.Context, lookup config.LookupFunc, environ []string, distri
 	client, err := backend.New(cfg)
 	if err != nil {
 		slog.Error("create request trace uploader backend", "error", atomicfile.Pathless(err))
-		return 1
+		return failed("backend")
 	}
 	serviceOptions := service.Options{}
-	if exportMetrics {
-		exporter, err := otlp.New(context.Background(), metricsCfg, string(cfg.Backend))
-		if err != nil {
-			slog.Error("create request trace uploader metrics exporter", "error", atomicfile.Pathless(err))
-			return 1
-		}
-		shutdowns = append([]signalShutdown{{name: "metrics", shutdown: exporter.Shutdown}}, shutdowns...)
-		serviceOptions.Metrics = telemetry.Safe(exporter)
+	if m.recorder != nil {
+		serviceOptions.Metrics = m.recorder
 	}
 	if tracesCfg, on, _ := otlp.TracesConfigFromEnv(lookup); on {
 		tracing, err := otlp.NewTracing(context.Background(), tracesCfg)
 		if err != nil {
 			slog.Error("create request trace uploader trace exporter", "error", atomicfile.Pathless(err))
-			return 1
+			return failed("other")
 		}
-		shutdowns = append([]signalShutdown{{name: "traces", shutdown: tracing.Shutdown}}, shutdowns...)
+		traceShutdowns = append(traceShutdowns, signalShutdown{name: "traces", shutdown: tracing.Shutdown})
 		serviceOptions.Tracer = tracing.Tracer()
 	}
 	uploader, err := service.NewUploader(cfg, client, serviceOptions)
 	if err != nil {
 		slog.Error("create request trace uploader", "error", atomicfile.Pathless(err))
-		return 1
+		return failed("config")
 	}
 
 	if err := uploader.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("request trace uploader stopped", "error", atomicfile.Pathless(err))
-		return 1
+		return failed(service.StartupFailureReason(err))
 	}
 	return 0
+}
+
+// backendLabel is the backend label metrics carry from the first attempt
+// on: the backend the environment names, or the default, when this build
+// links it, and "unknown" otherwise, so a refused setting never becomes a
+// label value.
+func backendLabel(lookup config.LookupFunc, o options) string {
+	name, _ := lookup(config.EnvBackend)
+	if name = strings.TrimSpace(name); name == "" {
+		name = string(o.defaultBackend)
+	}
+	if telemetry.ValidLabelValue(name) != nil || !slices.Contains(backend.Registered(), name) {
+		return "unknown"
+	}
+	return name
 }
 
 // checkSignal keeps only the error of a signal's configuration.
