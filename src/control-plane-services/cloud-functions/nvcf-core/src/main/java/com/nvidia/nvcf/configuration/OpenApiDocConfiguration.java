@@ -22,6 +22,7 @@ import com.nvidia.nvcf.rest.azp.XAccountAuthorizedPartiesController;
 import com.nvidia.nvcf.rest.client.ClientController;
 import com.nvidia.nvcf.rest.clustergoup.XAccountClusterGroupController;
 import com.nvidia.nvcf.rest.function.deployment.XAccountFunctionDeploymentController;
+import com.nvidia.nvcf.rest.function.invocation.XAccountFunctionInvocationController;
 import com.nvidia.nvcf.rest.function.management.XAccountFunctionManagementController;
 import com.nvidia.nvcf.rest.misc.XAccountMiscEndpointsController;
 import com.nvidia.nvcf.rest.queue.XAccountQueueController;
@@ -89,6 +90,7 @@ public class OpenApiDocConfiguration {
                                                 XAccountAuthorizedPartiesController.class,
                                                 XAccountClusterGroupController.class,
                                                 XAccountFunctionDeploymentController.class,
+                                                XAccountFunctionInvocationController.class,
                                                 XAccountFunctionManagementController.class,
                                                 XAccountMiscEndpointsController.class,
                                                 XAccountQueueController.class,

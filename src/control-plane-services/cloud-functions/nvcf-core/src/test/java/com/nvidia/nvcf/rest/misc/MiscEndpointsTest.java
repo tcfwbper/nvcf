@@ -150,6 +150,16 @@ class MiscEndpointsTest {
                 .path("/v2/nvcf/tokens/functions/{functionId}/versions/{functionVersionId}")
                 .path("post");
         assertPathParameterIsNonNullable(tokenOperation, "functionVersionId");
+
+        // /v3/openapi serves the account spec: OpenApiDocConfiguration hides every
+        // controller tagged for NVIDIA Super Admins.
+        assertThat(spec.path("paths").has("/v2/nvcf/invocable/functions/versions/ids")).isTrue();
+        assertThat(spec.path("paths")
+                .has("/v2/nvcf/accounts/{ncaId}/invocable/functions/versions/ids")).isFalse();
+        assertThat(jsonStringValues(spec.path("tags"), "name"))
+                .contains("Invocable Functions")
+                .noneMatch(MiscEndpointsTest::isSuperAdminTag);
+        assertThat(operationTags(spec)).noneMatch(MiscEndpointsTest::isSuperAdminTag);
     }
 
     @Test
@@ -198,6 +208,17 @@ class MiscEndpointsTest {
 
     private static List<String> parameterNames(JsonNode operation) {
         return jsonStringValues(operation.path("parameters"), "name");
+    }
+
+    private static boolean isSuperAdminTag(String tag) {
+        return tag.contains("Super Admin");
+    }
+
+    private static List<String> operationTags(JsonNode spec) {
+        return spec.path("paths").properties().stream()
+                .flatMap(pathItem -> pathItem.getValue().properties().stream())
+                .flatMap(operation -> jsonStringValues(operation.getValue().path("tags")).stream())
+                .toList();
     }
 
     private static List<String> jsonStringValues(JsonNode arrayNode) {
