@@ -50,25 +50,34 @@ import com.nvidia.nvcf.rest.function.management.dto.LlmInvocationConfigDto;
 import com.nvidia.nvcf.rest.function.management.dto.PriorityDto;
 import com.nvidia.nvcf.service.apikeys.ApiKeyValidationResult.RateLimitAttributes;
 import com.nvidia.nvcf.service.apikeys.ApiKeyValidationResult.Resource;
+import com.nvidia.nvcf.service.token.client.NotaryService.InvocationAssertion;
 import com.nvidia.nvcf.util.MockApiKeysServer;
+import com.nvidia.nvcf.util.MockNotaryServer;
+import com.nvidia.nvcf.util.NotaryTokenUtils;
 import com.nvidia.nvcf.util.TestUtil;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Metadata;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.MetadataUtils;
+import java.net.URL;
+import java.time.Instant;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.test.util.ReflectionTestUtils;
 
 @Slf4j
@@ -76,6 +85,22 @@ class GrpcLlmServiceTest extends BaseFunctionInvocationTest {
 
     @Autowired
     private GrpcLlmService grpcLlmService;
+
+    @Value("${nvcf.notary.base-url}")
+    private URL notaryBaseUrl;
+
+    @Value("${nvcf.notary.audiences.nvcf}")
+    private String nvcfAudience;
+
+    @BeforeAll
+    void startNotary() {
+        MockNotaryServer.start(notaryBaseUrl.toString(), nvcfAudience, nvcfAudience);
+    }
+
+    @AfterAll
+    void stopNotary() {
+        MockNotaryServer.stop();
+    }
 
     // ---------------------------------------------------------------------------
     // Helpers
@@ -268,6 +293,27 @@ class GrpcLlmServiceTest extends BaseFunctionInvocationTest {
         assertThat(response.getAccountInputTokenRateLimit()).isEqualTo("2000-M");
         assertThat(response.hasAccountOutputTokenRateLimit()).isTrue();
         assertThat(response.getAccountOutputTokenRateLimit()).isEqualTo("500-M");
+    }
+
+    @Test
+    void authLlmInvocation_accountRateLimitFromInvocationToken() {
+        setFunctionActive(TEST_FUNCTION_ID, TEST_VERSION_ID_1);
+        setFunctionType(TEST_FUNCTION_ID, TEST_VERSION_ID_1, FunctionType.LLM);
+        saveFunctionModel(TEST_VERSION_ID_1, "meta/llama-3.1-70b-instruct", List.of(), null);
+        MockApiKeysServer.setTieredRateLimitResponse(TEST_NCA_ID, new RateLimitAttributes("5000-M", "1000-M"));
+        var serviceToken = MOCK_OAUTH2_TOKEN_SERVER.getJwt("llm:check_invocation");
+        var assertion = new InvocationAssertion(TEST_NCA_ID, TEST_FUNCTION_ID, TEST_VERSION_ID_1, null,
+                                                "test_client_id");
+        var invocationToken = NotaryTokenUtils.getJwt(TEST_CLIENT_SUBJECT,
+                                                      jsonMapper.writeValueAsString(assertion),
+                                                      notaryBaseUrl,
+                                                      nvcfAudience,
+                                                      Date.from(Instant.now()));
+
+        var response = callLlmAuth(serviceToken, invocationToken, TEST_FUNCTION_ID);
+
+        assertThat(response.getAccountInputTokenRateLimit()).isEqualTo("5000-M");
+        assertThat(response.getAccountOutputTokenRateLimit()).isEqualTo("1000-M");
     }
 
     @Test

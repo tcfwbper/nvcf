@@ -54,7 +54,6 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.oauth2.core.OAuth2AuthenticatedPrincipal;
 import org.springframework.security.oauth2.server.resource.authentication.BearerTokenAuthenticationToken;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 
 @Slf4j
 @GrpcService
@@ -192,29 +191,20 @@ public class GrpcLlmService extends LlmGatewayImplBase {
         return Optional.of(value);
     }
 
-    // The API-key path's rate limit comes from the LLM-specific apikey.llm_allow evaluation
-    // (LlmApiKeyService), attached to its ApiKeyValidationResult. JWT has no such attribute,
-    // so it calls AccountRateLimitService directly by ncaId instead.
+    // API keys: the LLM API-key evaluation returns auth and rates in one call. Client JWTs and
+    // invocation tokens are validated here, so their ncaId goes to the account rate-limit evaluation.
     private Optional<ApiKeyValidationResult.RateLimitAttributes> resolveAccountRateLimit(
             Authentication authentication,
             String ncaId) {
         if (!accountTokenRateLimitEnabled) {
             return Optional.empty();
         }
-        if (authentication instanceof JwtAuthenticationToken) {
-            return Optional.ofNullable(accountRateLimitService.getTieredRateLimit(ncaId));
-        }
-        if (!(authentication.getPrincipal() instanceof OAuth2AuthenticatedPrincipal principal)) {
-            return Optional.empty();
-        }
-        if (principal.getAttribute(ApiKeyValidationResult.POLICY_RESULT_ATTRIBUTE)
-                instanceof ApiKeyValidationResult result
+        if (authentication.getPrincipal() instanceof OAuth2AuthenticatedPrincipal principal
+                && principal.getAttribute(ApiKeyValidationResult.POLICY_RESULT_ATTRIBUTE)
+                        instanceof ApiKeyValidationResult result
                 && result.accountTokenRateLimit() != null) {
             return Optional.of(result.accountTokenRateLimit());
         }
-        // An older policy deploy that doesn't populate accountTokenRateLimit yet - fall back
-        // to the standalone lookup instead of silently skipping enforcement during a
-        // policy/nvcf-core rollout skew.
         return Optional.ofNullable(accountRateLimitService.getTieredRateLimit(ncaId));
     }
 
