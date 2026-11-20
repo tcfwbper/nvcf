@@ -112,6 +112,7 @@ go_test(
         "middleware_test.go",
         "missing_content_type_test.go",
         "model_ids_test.go",
+        "model_name_validation_test.go",
         "model_uris_test.go",
         "openai_routes_test.go",
         "overload_test.go",

@@ -84,6 +84,14 @@ func normalizeOpenAIRequestModel(
 	if routedModel == "" {
 		return "", echo.NewHTTPError(http.StatusBadRequest, "model suffix is required after routing key")
 	}
+	// Router headers drop surrounding spaces and tabs and refuse control bytes, and the router reads
+	// only ASCII. Only the model part also goes in the body, so only it is whitespace-checked.
+	if strings.Trim(routedModel, " \t") != routedModel {
+		return "", echo.NewHTTPError(http.StatusBadRequest, "model has leading or trailing whitespace")
+	}
+	if !isPrintableASCII(model) {
+		return "", echo.NewHTTPError(http.StatusBadRequest, "model contains control or non-ASCII characters")
+	}
 
 	if reqCtx != nil {
 		existingRoutingKey := reqCtx.RoutingKey
@@ -99,6 +107,15 @@ func normalizeOpenAIRequestModel(
 	}
 
 	return routedModel, nil
+}
+
+func isPrintableASCII(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func setRoutingMethodForModel(reqCtx *requestctx.RequestContext, model string) {
