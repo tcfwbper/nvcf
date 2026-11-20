@@ -88,6 +88,8 @@ pub fn stats_aggregator_update_channel(
 #[derive(Clone)]
 pub(crate) struct StatsCollectorControl {
     tx: flume::Sender<StatsCollectorCommand>,
+    /// Cancelled when the collector task ends, however it ends.
+    exited: CancellationToken,
 }
 
 pub struct StatsCollectorHandle {
@@ -144,13 +146,15 @@ impl StatsCollectorControl {
         initialization: ModelStatsInitialization,
     ) -> Result<bool, StatsCollectorStopped> {
         let (reply, acknowledged) = oneshot::channel();
-        self.send(StatsCollectorCommand::Begin {
-            generation,
-            initialization,
-            reply,
-        })
-        .await?;
-        acknowledged.await.map_err(|_| StatsCollectorStopped)
+        self.request(
+            StatsCollectorCommand::Begin {
+                generation,
+                initialization,
+                reply,
+            },
+            acknowledged,
+        )
+        .await
     }
 
     /// Flushes queued observation and engine-stats events into the aggregator,
@@ -161,12 +165,14 @@ impl StatsCollectorControl {
         generation: &ModelGeneration,
     ) -> Result<Option<CurrentModelStats>, StatsCollectorStopped> {
         let (reply, acknowledged) = oneshot::channel();
-        self.send(StatsCollectorCommand::Snapshot {
-            generation: generation.clone(),
-            reply,
-        })
-        .await?;
-        acknowledged.await.map_err(|_| StatsCollectorStopped)
+        self.request(
+            StatsCollectorCommand::Snapshot {
+                generation: generation.clone(),
+                reply,
+            },
+            acknowledged,
+        )
+        .await
     }
 
     pub(crate) async fn retire_generation(
@@ -174,19 +180,43 @@ impl StatsCollectorControl {
         generation: &ModelGeneration,
     ) -> Result<bool, StatsCollectorStopped> {
         let (reply, acknowledged) = oneshot::channel();
-        self.send(StatsCollectorCommand::Retire {
-            generation: generation.clone(),
-            reply,
-        })
-        .await?;
-        acknowledged.await.map_err(|_| StatsCollectorStopped)
+        self.request(
+            StatsCollectorCommand::Retire {
+                generation: generation.clone(),
+                reply,
+            },
+            acknowledged,
+        )
+        .await
     }
 
-    async fn send(&self, command: StatsCollectorCommand) -> Result<(), StatsCollectorStopped> {
-        self.tx
-            .send_async(command)
-            .await
-            .map_err(|_| StatsCollectorStopped)
+    /// Sends `command` and waits for its reply, or until the collector exits.
+    /// The collector checks its stop before its queue, so it can exit with a
+    /// command unread. The channel keeps that command, and with it the reply
+    /// sender, while any sender lives, so the reply alone could wait forever.
+    async fn request<T>(
+        &self,
+        command: StatsCollectorCommand,
+        mut acknowledged: oneshot::Receiver<T>,
+    ) -> Result<T, StatsCollectorStopped> {
+        let exchange = async {
+            self.tx
+                .send_async(command)
+                .await
+                .map_err(|_| StatsCollectorStopped)?;
+            (&mut acknowledged).await.map_err(|_| StatsCollectorStopped)
+        };
+        // A reply sent before the collector exited wins over the exit.
+        // `biased` polls the exchange first, but the collector can reply and
+        // exit between the polls of the two branches, so the exit branch
+        // still returns a reply that is already there.
+        tokio::select! {
+            biased;
+            result = exchange => result,
+            () = self.exited.cancelled() => {
+                acknowledged.try_recv().map_err(|_| StatsCollectorStopped)
+            }
+        }
     }
 }
 
@@ -299,7 +329,10 @@ pub fn start_stats_collector_with_engine_stats(
             .expect("distinct runtime models should initialize once");
     }
     let (control_tx, control_rx) = flume::bounded(aggregator.config.observation_channel_capacity);
+    let exited = CancellationToken::new();
+    let exited_guard = exited.clone().drop_guard();
     let task = OwnedTask::spawn("stats collector", move |stop| async move {
+        let _exited = exited_guard;
         run_stats_collector(
             aggregator,
             observation_rx,
@@ -311,7 +344,10 @@ pub fn start_stats_collector_with_engine_stats(
     });
     StatsCollectorHandle {
         task,
-        control: StatsCollectorControl { tx: control_tx },
+        control: StatsCollectorControl {
+            tx: control_tx,
+            exited,
+        },
     }
 }
 
@@ -576,6 +612,7 @@ fn retain_latest_model_updates(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
 
     use super::super::aggregator::{KvCacheStatsSnapshot, StatsAggregator};
     use super::super::metrics::PylonMetrics;
@@ -4086,6 +4123,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_queued_as_the_collector_stops_returns_instead_of_hanging() {
+        let config = config!(observation_channel_capacity: 16);
+        let (runtime_state, observation_rx) = PylonRuntimeState::observed(
+            stargate_proto::pb::InferenceServerStatus::Active,
+            &[],
+            config.observation_channel_capacity,
+            None,
+        );
+        let collector = start_stats_collector(config, observation_rx, runtime_state);
+        let control = collector.control();
+        let generation = crate::runtime_state::ModelGeneration::new("model-a", 1);
+
+        // Stop the collector, then queue a command before it runs again. It
+        // checks its stop first, so it exits without answering the command.
+        let shutdown = collector.shutdown();
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        let retire = control.retire_generation(&generation);
+        tokio::pin!(retire);
+        assert!(futures::poll!(&mut retire).is_pending());
+
+        let (retired, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), retire),
+            shutdown
+        );
+        assert!(
+            retired
+                .expect("a request queued as the collector stops should not hang")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn stats_collector_owns_exact_generation_initialization_and_retirement() {
         let config = config!(observation_channel_capacity: 16);
         let (runtime_state, observation_rx) = PylonRuntimeState::observed(
@@ -4351,5 +4421,307 @@ mod tests {
         let body = metrics.gather_text().expect("metrics should encode");
         assert!(body.contains(r#"pylon_model_last_mean_input_tps{model="model-a"} 10"#));
         assert!(!body.contains(r#"pylon_model_last_mean_input_tps{model="model-a"} 999"#));
+    }
+
+    /// Bound for each step of the tests below that waits on the collector.
+    const COLLECTOR_STEP_TIMEOUT: Duration = seconds(5);
+
+    async fn bounded<F: Future>(step: &str, future: F) -> F::Output {
+        tokio::time::timeout(COLLECTOR_STEP_TIMEOUT, future)
+            .await
+            .unwrap_or_else(|_| panic!("{step} did not finish within {COLLECTOR_STEP_TIMEOUT:?}"))
+    }
+
+    /// How the collector ends after it has answered every command sent to it.
+    #[derive(Clone, Copy, Debug)]
+    enum CollectorEnding {
+        /// The collector sees its stop and returns.
+        Stop,
+        /// Dropping the handle aborts the collector task.
+        Abort,
+    }
+
+    #[tokio::test]
+    async fn replies_sent_before_the_collector_ends_are_returned() {
+        // Each reply and the collector's end are both ready when the request
+        // polls again. Repeat, so a request that picks between them at random
+        // fails: 8 rounds, 2 endings and 3 requests make 48 picks.
+        for round in 0..8 {
+            for ending in [CollectorEnding::Stop, CollectorEnding::Abort] {
+                // Room for one queued command, so the begin is queued and the
+                // snapshot and the retire wait to send.
+                let RunningCollector {
+                    runtime_state,
+                    handle: collector,
+                    ..
+                } = RunningCollector::spawn_empty(
+                    config!(observation_channel_capacity: 1),
+                    None,
+                    false,
+                );
+                let control = collector.control();
+                let generation = ModelGeneration::new("model-a", 1);
+                assert!(runtime_state.begin_generation(generation.clone()));
+
+                let begin = control.begin_generation(
+                    generation.clone(),
+                    ModelStatsInitialization::ConfiguredInputTps { input_tps: 100.0 },
+                );
+                let snapshot = control.flush_and_snapshot(&generation);
+                let retire = control.retire_generation(&generation);
+                tokio::pin!(begin, snapshot, retire);
+                assert!(futures::poll!(&mut begin).is_pending());
+                assert!(futures::poll!(&mut snapshot).is_pending());
+                assert!(futures::poll!(&mut retire).is_pending());
+
+                // The collector reads commands in order, so it has answered
+                // all three once this later request returns.
+                let later = bounded(
+                    "a later request",
+                    control.flush_and_snapshot(&ModelGeneration::new("model-b", 1)),
+                )
+                .await;
+                assert!(
+                    matches!(later, Ok(None)),
+                    "the collector should be running: {later:?}"
+                );
+                // flume hands a waiting sender's message to the receiver
+                // without polling that sender again. The snapshot and the
+                // retire rely on this, and flume does not document it.
+                assert!(
+                    control.tx.is_empty(),
+                    "flume no longer hands a waiting sender's command to the collector, \
+                     so the snapshot and the retire were not answered"
+                );
+
+                match ending {
+                    CollectorEnding::Stop => bounded("the stop", collector.shutdown()).await,
+                    CollectorEnding::Abort => drop(collector),
+                }
+                bounded("the collector's end", control.exited.cancelled()).await;
+
+                let begun = futures::poll!(&mut begin);
+                assert!(
+                    matches!(begun, Poll::Ready(Ok(true))),
+                    "round {round}, {ending:?}: answered begin: {begun:?}"
+                );
+                let snapshotted = futures::poll!(&mut snapshot);
+                assert!(
+                    matches!(
+                        &snapshotted,
+                        Poll::Ready(Ok(Some(stats))) if stats.last_mean_input_tps == 100.0
+                    ),
+                    "round {round}, {ending:?}: answered snapshot: {snapshotted:?}"
+                );
+                let retired = futures::poll!(&mut retire);
+                assert!(
+                    matches!(retired, Poll::Ready(Ok(true))),
+                    "round {round}, {ending:?}: answered retire: {retired:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replies_sent_as_the_collector_exits_on_its_own_are_returned() {
+        // 12 rounds and 3 requests, so a request that picks between its reply
+        // and the collector's exit at random fails.
+        for round in 0..12 {
+            let (observation_tx, observation_rx) = flume::bounded::<RequestObservationEvent>(1);
+            let runtime_state =
+                PylonRuntimeState::new(stargate_proto::pb::InferenceServerStatus::Active, &[]);
+            let mut collector = start_stats_collector(
+                config!(observation_channel_capacity: 16),
+                observation_rx,
+                runtime_state.clone(),
+            );
+            let control = collector.control();
+            let generation = ModelGeneration::new("model-a", 1);
+            assert!(runtime_state.begin_generation(generation.clone()));
+
+            let begin = control.begin_generation(
+                generation.clone(),
+                ModelStatsInitialization::ConfiguredInputTps { input_tps: 100.0 },
+            );
+            let snapshot = control.flush_and_snapshot(&generation);
+            let retire = control.retire_generation(&generation);
+            tokio::pin!(begin, snapshot, retire);
+            assert!(futures::poll!(&mut begin).is_pending());
+            assert!(futures::poll!(&mut snapshot).is_pending());
+            assert!(futures::poll!(&mut retire).is_pending());
+
+            // With its only observation sender gone, the collector answers the
+            // queued commands, which it reads first, and then exits on its own.
+            drop(observation_tx);
+            bounded("the collector's exit", collector.wait_for_exit())
+                .await
+                .expect("the collector should exit without a panic");
+            assert!(
+                control.exited.is_cancelled(),
+                "the exit token should be cancelled once the collector task ends"
+            );
+            // The channel keeps a command the collector never read.
+            assert!(
+                control.tx.is_empty(),
+                "the collector exited before it read every queued command"
+            );
+
+            let begun = futures::poll!(&mut begin);
+            assert!(
+                matches!(begun, Poll::Ready(Ok(true))),
+                "round {round}: answered begin: {begun:?}"
+            );
+            let snapshotted = futures::poll!(&mut snapshot);
+            assert!(
+                matches!(
+                    &snapshotted,
+                    Poll::Ready(Ok(Some(stats))) if stats.last_mean_input_tps == 100.0
+                ),
+                "round {round}: answered snapshot: {snapshotted:?}"
+            );
+            let retired = futures::poll!(&mut retire);
+            assert!(
+                matches!(retired, Poll::Ready(Ok(true))),
+                "round {round}: answered retire: {retired:?}"
+            );
+        }
+    }
+
+    /// How long the collector's exit token stays locked while the reply lands.
+    const EXIT_LOCK_HOLD: Duration = milliseconds(100);
+
+    /// Bound for each handoff between the threads of the test below.
+    const HANDOFF_TIMEOUT: Duration = seconds(5);
+
+    const REQUEST_NOT_POLLED: u8 = 0;
+    const REQUEST_IN_POLL: u8 = 1;
+    const REQUEST_POLLED: u8 = 2;
+
+    /// Waker for a child of the collector's exit token.
+    ///
+    /// tokio-util 0.7 wakes a child token's waiters from the parent's `cancel`
+    /// while it holds the parent's lock, and the parent's `is_cancelled` takes
+    /// that lock. `CancellationToken` does not document either. The test below
+    /// records whether the request was still in its poll when the reply
+    /// landed, and fails with a message naming this dependency if it never is.
+    struct ReplyWhileExitLocked {
+        poll_again: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        reply: std::sync::Mutex<Option<oneshot::Sender<bool>>>,
+        request: Arc<std::sync::atomic::AtomicU8>,
+        replied_during_poll: std::sync::atomic::AtomicBool,
+    }
+
+    impl Wake for ReplyWhileExitLocked {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            // This runs inside the token's cancel. It must not panic: the
+            // test's own assertions report failures.
+            let Some(poll_again) = self.poll_again.lock().ok().and_then(|mut slot| slot.take())
+            else {
+                return;
+            };
+            let _ = poll_again.send(());
+            // The requester finds no reply yet, then waits on the token's lock.
+            std::thread::sleep(EXIT_LOCK_HOLD);
+            let in_poll =
+                || self.request.load(std::sync::atomic::Ordering::SeqCst) == REQUEST_IN_POLL;
+            let started_before = in_poll();
+            if let Some(reply) = self.reply.lock().ok().and_then(|mut slot| slot.take()) {
+                let _ = reply.send(true);
+            }
+            self.replied_during_poll.store(
+                started_before && in_poll(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+
+    #[test]
+    fn reply_sent_while_the_request_checks_the_collector_exit_is_returned() {
+        // A collector on another worker can reply and exit after a request has
+        // looked for its reply but before it checks whether the collector
+        // exited. Hold the exit token's lock across that window, then reply.
+        let mut skipped = Vec::new();
+        for _ in 0..5 {
+            let (tx, rx) = flume::bounded(1);
+            let exited = CancellationToken::new();
+            let control = StatsCollectorControl {
+                tx,
+                exited: exited.clone(),
+            };
+            let request_state = Arc::new(std::sync::atomic::AtomicU8::new(REQUEST_NOT_POLLED));
+            let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+            let (poll_again_tx, poll_again_rx) = std::sync::mpsc::channel();
+            let requester = std::thread::spawn({
+                let request_state = Arc::clone(&request_state);
+                move || {
+                    let generation = ModelGeneration::new("model-a", 1);
+                    let mut request = std::pin::pin!(control.retire_generation(&generation));
+                    let mut context = Context::from_waker(Waker::noop());
+                    let first = request.as_mut().poll(&mut context);
+                    let _ = polled_tx.send(first.is_pending());
+                    poll_again_rx.recv_timeout(HANDOFF_TIMEOUT).ok()?;
+                    request_state.store(REQUEST_IN_POLL, std::sync::atomic::Ordering::SeqCst);
+                    let result = request.as_mut().poll(&mut context);
+                    request_state.store(REQUEST_POLLED, std::sync::atomic::Ordering::SeqCst);
+                    Some(result)
+                }
+            });
+            assert!(
+                polled_rx
+                    .recv_timeout(HANDOFF_TIMEOUT)
+                    .expect("the requester should poll once"),
+                "the first poll should wait for the reply"
+            );
+            let Ok(StatsCollectorCommand::Retire { reply, .. }) = rx.try_recv() else {
+                panic!("the retire command should be queued");
+            };
+            let child = exited.child_token();
+            let lock_holder = Arc::new(ReplyWhileExitLocked {
+                poll_again: std::sync::Mutex::new(Some(poll_again_tx)),
+                reply: std::sync::Mutex::new(Some(reply)),
+                request: Arc::clone(&request_state),
+                replied_during_poll: std::sync::atomic::AtomicBool::new(false),
+            });
+            let waker = Waker::from(Arc::clone(&lock_holder));
+            let mut child_cancelled = std::pin::pin!(child.cancelled());
+            assert!(
+                child_cancelled
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+
+            exited.cancel();
+            let result = requester
+                .join()
+                .expect("the requester should not panic")
+                .expect(
+                    "cancelling the exit token did not wake its child, so the request was \
+                     never polled again: tokio-util's CancellationToken changed",
+                );
+            if !lock_holder
+                .replied_during_poll
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // The request was not in its poll when the reply landed, so
+                // this run did not open the window. Try again.
+                skipped.push(result);
+                continue;
+            }
+            assert!(
+                matches!(result, Poll::Ready(Ok(true))),
+                "the request should return the reply sent before the exit: {result:?}"
+            );
+            return;
+        }
+        panic!(
+            "the reply never landed while the request was in its poll, so the window \
+             was never opened. tokio-util's CancellationToken may no longer hold the \
+             parent's lock while it wakes a child. Results: {skipped:?}"
+        );
     }
 }
