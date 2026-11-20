@@ -171,7 +171,9 @@ global:
 
 # One profile installs and configures the shared observability stack for the
 # selected planes. Self-managed control-plane installs need no other
-# observability flags.
+# observability flags. The image defaults of the observability releases live in
+# deploy/stacks/observability/environments/base.yaml; override them here under
+# the forwarded keys (collector, opentelemetryOperator, victoriaMetrics).
 observability:
   profile: control
 

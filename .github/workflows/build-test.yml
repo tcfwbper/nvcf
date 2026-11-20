@@ -189,6 +189,11 @@ jobs:
           NVCF_IMAGE_CATALOG_E2E: "1"
         run: go test -C tools/docs-version-sync -run '^(TestChartImageCoverage|TestChartImageCoverageReportsEachFailure|TestImageCatalogRepositoriesReuseNamesAcrossCharts)$' -count=1
 
+      - name: Check image sources for every Helmfile stack
+        env:
+          NVCF_IMAGE_CATALOG_E2E: "1"
+        run: go test -C tools/docs-version-sync -run '^(TestStackImageSources|TestStackImageSourcesReportsEachFailure)$' -count=1
+
       - name: Test NATS and OpenBao chart image guards
         env:
           NVCF_IMAGE_CATALOG_E2E: "1"

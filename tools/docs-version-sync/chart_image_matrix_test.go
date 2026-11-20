@@ -46,25 +46,25 @@ func TestChartImageExclusionValidation(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		chart   string
-		entry   chartImageExclusion
+		entry   imageExclusion
 		indexed bool
 		want    string
 	}{
-		{name: "pending-fix without issue", chart: "plain", entry: chartImageExclusion{Reason: reasonPendingFix}},
-		{name: "pending-fix with public issue", chart: "plain", entry: chartImageExclusion{Reason: reasonPendingFix, Issue: issue}},
-		{name: "indexed pending-fix", chart: "plain", entry: chartImageExclusion{Reason: reasonPendingFix}, indexed: true},
-		{name: "test-fixture", chart: "plain", entry: chartImageExclusion{Reason: reasonTestFixture}},
-		{name: "no-runtime-image", chart: "plain", entry: chartImageExclusion{Reason: reasonNoRuntimeImage}},
-		{name: "declared vendored subchart", chart: "parent/charts/sub", entry: chartImageExclusion{Reason: reasonVendoredSubchart}},
-		{name: "unknown reason", chart: "plain", entry: chartImageExclusion{Reason: "skip"}, want: "unknown reason"},
-		{name: "missing chart directory", chart: "gone", entry: chartImageExclusion{Reason: reasonTestFixture}, want: "no tracked Chart.yaml"},
-		{name: "issue on test-fixture", chart: "plain", entry: chartImageExclusion{Reason: reasonTestFixture, Issue: issue}, want: "issue is allowed only on pending-fix"},
-		{name: "pending-fix with free-form issue note", chart: "plain", entry: chartImageExclusion{Reason: reasonPendingFix, Issue: "tracked with the chart owners"}},
-		{name: "indexed test-fixture", chart: "plain", entry: chartImageExclusion{Reason: reasonTestFixture}, indexed: true, want: "declares an image index"},
-		{name: "indexed no-runtime-image", chart: "plain", entry: chartImageExclusion{Reason: reasonNoRuntimeImage}, indexed: true, want: "declares an image index"},
-		{name: "subchart not declared as a dependency", chart: "parent/charts/loose", entry: chartImageExclusion{Reason: reasonVendoredSubchart}},
-		{name: "charts directory without a parent chart", chart: "orphan/charts/sub", entry: chartImageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart; check as a standalone chart"},
-		{name: "standalone chart as subchart", chart: "plain", entry: chartImageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart"},
+		{name: "pending-fix without issue", chart: "plain", entry: imageExclusion{Reason: reasonPendingFix}},
+		{name: "pending-fix with public issue", chart: "plain", entry: imageExclusion{Reason: reasonPendingFix, Issue: issue}},
+		{name: "indexed pending-fix", chart: "plain", entry: imageExclusion{Reason: reasonPendingFix}, indexed: true},
+		{name: "test-fixture", chart: "plain", entry: imageExclusion{Reason: reasonTestFixture}},
+		{name: "no-runtime-image", chart: "plain", entry: imageExclusion{Reason: reasonNoRuntimeImage}},
+		{name: "declared vendored subchart", chart: "parent/charts/sub", entry: imageExclusion{Reason: reasonVendoredSubchart}},
+		{name: "unknown reason", chart: "plain", entry: imageExclusion{Reason: "skip"}, want: "unknown reason"},
+		{name: "missing chart directory", chart: "gone", entry: imageExclusion{Reason: reasonTestFixture}, want: "no tracked Chart.yaml"},
+		{name: "issue on test-fixture", chart: "plain", entry: imageExclusion{Reason: reasonTestFixture, Issue: issue}, want: "issue is allowed only on pending-fix"},
+		{name: "pending-fix with free-form issue note", chart: "plain", entry: imageExclusion{Reason: reasonPendingFix, Issue: "tracked with the chart owners"}},
+		{name: "indexed test-fixture", chart: "plain", entry: imageExclusion{Reason: reasonTestFixture}, indexed: true, want: "declares an image index"},
+		{name: "indexed no-runtime-image", chart: "plain", entry: imageExclusion{Reason: reasonNoRuntimeImage}, indexed: true, want: "declares an image index"},
+		{name: "subchart not declared as a dependency", chart: "parent/charts/loose", entry: imageExclusion{Reason: reasonVendoredSubchart}},
+		{name: "charts directory without a parent chart", chart: "orphan/charts/sub", entry: imageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart; check as a standalone chart"},
+		{name: "standalone chart as subchart", chart: "plain", entry: imageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateChartImageExclusion(root, test.chart, test.entry, charts, test.indexed)
@@ -89,7 +89,7 @@ func TestChartImageExclusionsLoadStrictly(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(writeChartFixtureTree(t, map[string]string{"m.yaml": content}), "m.yaml")
-			if _, err := loadChartImageExclusions(path); err == nil {
+			if _, err := loadImageExclusions(path); err == nil {
 				t.Fatal("accepted malformed matrix")
 			}
 		})
@@ -114,11 +114,11 @@ func TestChartImageIndexDetection(t *testing.T) {
 
 // TestChartImageClassification follows the agreed order of evaluation.
 func TestChartImageClassification(t *testing.T) {
-	entry := func(reason string) *chartImageExclusion { return &chartImageExclusion{Reason: reason} }
+	entry := func(reason string) *imageExclusion { return &imageExclusion{Reason: reason} }
 	for _, test := range []struct {
 		name    string
 		indexed bool
-		entry   *chartImageExclusion
+		entry   *imageExclusion
 		want    chartAction
 	}{
 		{"indexed and unlisted is checked", true, nil, actionCheck},

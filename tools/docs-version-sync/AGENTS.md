@@ -11,6 +11,7 @@ go test -C tools/docs-version-sync ./...
 go vet -C tools/docs-version-sync ./...
 NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^(TestChartImageCoverage|TestChartImageCoverageReportsEachFailure|TestImageCatalogRepositoriesReuseNamesAcrossCharts)$' -count=1
 NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestNATSAndOpenBaoChartImageGuards$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^(TestStackImageSources|TestStackImageSourcesReportsEachFailure)$' -count=1
 ```
 
 `TestChartImageCoverageReportsEachFailure` runs the same evaluation on a
@@ -45,6 +46,33 @@ temporary tree with `writeChartFixtureTree`, as the matrix tests do.
 When a pending-fix chart is fixed, remove its exclusion entry in the same Pull
 Request. Image value shapes that differ from `registry`/`repository`/`tag`/
 `digest` belong in `imageValueExceptions` in `chart_image_exceptions_test.go`.
+
+## Stack image sources
+
+`TestStackImageSources` checks every Helmfile stack under `deploy/stacks/`. A
+stack passes or carries an entry in `stack-image-exclusions.yaml`
+(`pending-fix`, or `dev-only` for a stack without `release-inventory.yaml`).
+`TestStackImageSourcesReportsEachFailure` runs the same evaluation on a fixture
+repository, one stack per rule. For a stack the test requires:
+
+- No stack `.gotmpl` file defaults an image `registry`, `repository`, `tag` or
+  `digest` to a literal. The forms live in `literalDefaultFormTable`, shared
+  with the chart gate.
+- Every rendered image takes its `registry` and `repository` from the stack's
+  `environments/base.yaml`, or from an included stack's `base.yaml` that the
+  including state forwards. An image value lives in a map named `image`, a
+  map ending in `Image`, or `global.image`; a `registry` under any other map,
+  such as `global.helm.sources`, is not an image source. A single image
+  string or a `repository` with a registry host fails. A `tag` or `digest` set in `base.yaml` reaches a
+  rendered image.
+
+The test renders each state that `release-inventory.yaml` lists, plus
+`stackExtraStates`, with a layered `probe` environment that sets a sentinel for
+every image value in `base.yaml`. Stack charts render from the tracked chart at
+HEAD; third-party charts are pulled from their public repositories. A chart
+whose source is not tracked is skipped only when listed in
+`untrackedStackCharts`. When a pending-fix stack is fixed, remove its entry in
+the same Pull Request.
 
 ## Indirect image convention
 

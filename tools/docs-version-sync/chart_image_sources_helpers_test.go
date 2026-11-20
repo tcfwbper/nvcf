@@ -76,15 +76,6 @@ var (
 	// templateComment matches one template comment, which may span lines and
 	// contain "}}". Helm renders nothing for it.
 	templateComment = regexp.MustCompile(`(?s){{-?\s*/\*.*?\*/\s*-?}}`)
-	// sourceDefault matches a non-empty string literal defaulted onto a field
-	// that names an image source, such as .Values.image.registry or
-	// .imageRegistry, with a quoted or raw string literal:
-	//   .registry | default "x"          pipe form
-	//   .registry | trim | default "x"   after argument-free functions
-	//   default "x" (.registry)          prefix form, optionally parenthesized
-	sourceDefault = regexp.MustCompile("(?i)" +
-		`\.\w*(?:registry|repository)\s*(?:\|\s*\w+\s*)*\|\s*default\s+(?:"([^"]+)"|` + "`([^`]+)`" + `)` +
-		`|\bdefault\s+(?:"([^"]+)"|` + "`([^`]+)`" + `)\s+\(?\s*[\w.$]*\.\w*(?:registry|repository)\b`)
 	// imageField captures the value of a block-style image: key or of a
 	// --<name>-image= argument.
 	imageField = regexp.MustCompile(`(?:^\s*(?:-\s*)?"?image"?\s*:\s*|--[\w-]+-image=)("[^"]*"|'[^']*'|\S+)`)
@@ -105,11 +96,10 @@ var (
 //
 // Template comments and YAML comments are ignored, and a flow-style image key
 // counts only in YAML structure, not inside a quoted or block scalar. Known
-// limit: a default applied to a variable, placed after a function with
-// arguments (| trimSuffix "/" |), or built with printf is not seen, and an
-// image: value is read up to the first space on its line. A block-style
-// image key or an --<name>-image= argument inside a block scalar is still
-// reported. The per-image guard renders still catch a default that fires.
+// limit: a default on a variable that does not name the field, or built with
+// printf, is not seen, and an image: value is read up to the first space on its line. A
+// block-style image key or an --<name>-image= argument inside a block scalar
+// is still reported. The per-image guard renders still catch a default that fires.
 func (c *chartCheck) checkTemplateSources(chart string) {
 	root := filepath.Join(chart, "templates")
 	var files []string
@@ -149,7 +139,7 @@ type templateSource struct {
 // breaks, so every reported line is the line in the original file.
 func implicitTemplateSources(text string) []templateSource {
 	text = blankTemplateComments(text)
-	sources := append(templateDefaultSources(text), templateImageFieldSources(text)...)
+	sources := append(templateDefaultSources(text, chartDefaultForms), templateImageFieldSources(text)...)
 	sort.SliceStable(sources, func(i, j int) bool { return sources[i].line < sources[j].line })
 	return sources
 }
@@ -170,12 +160,12 @@ func blankTemplateComments(text string) string {
 // templateDefaultSources reports each action, possibly spanning lines, that
 // defaults an image source field to a literal. Helm runs an action wherever
 // it sits, even inside a YAML comment or a quoted string.
-func templateDefaultSources(text string) []templateSource {
+func templateDefaultSources(text string, forms *regexp.Regexp) []templateSource {
 	var sources []templateSource
 	for _, span := range templateAction.FindAllStringIndex(text, -1) {
 		action := text[span[0]:span[1]]
-		if match := sourceDefault.FindStringSubmatch(action); match != nil {
-			// The first non-empty literal group: quoted or raw, pipe or prefix form.
+		if match := forms.FindStringSubmatch(action); match != nil {
+			// The first non-empty literal group: quoted or raw, in any form.
 			literal := cmp.Or(match[1:]...)
 			sources = append(sources, templateSource{strings.Count(text[:span[0]], "\n") + 1,
 				fmt.Sprintf("default %q supplies an image source in %s", literal, strings.Join(strings.Fields(action), " "))})

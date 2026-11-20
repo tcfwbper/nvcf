@@ -625,36 +625,19 @@ func prepareResolvedInventoryEnvironment(copiedRepoRoot string) ([]string, resol
 	if err != nil {
 		return nil, resolvedInventoryHelmSource{}, "", err
 	}
-	values, err := yaml.Marshal(map[string]any{
-		"global": map[string]any{
-			"domain": "inventory.example.invalid",
-			"helm": map[string]any{
-				"sources": map[string]any{
-					"registry":   renderSource.Registry,
-					"repository": renderSource.Repository,
-				},
-			},
-			"image": map[string]any{
-				"registry":   "nvcr.io",
-				"repository": "nvidia/nvcf",
-			},
+	renderValues := stackRenderValues("inventory")
+	global := renderValues["global"].(map[string]any)
+	global["helm"] = map[string]any{
+		"sources": map[string]any{
+			"registry":   renderSource.Registry,
+			"repository": renderSource.Repository,
 		},
-		"ingress": map[string]any{
-			"gatewayApi": map[string]any{
-				"controllerNamespace": "gateway-system",
-				"gateways": map[string]any{
-					"grpc": map[string]any{
-						"name":      "inventory-grpc",
-						"namespace": "gateway-system",
-					},
-					"shared": map[string]any{
-						"name":      "inventory-shared",
-						"namespace": "gateway-system",
-					},
-				},
-			},
-		},
-	})
+	}
+	global["image"] = map[string]any{
+		"registry":   "nvcr.io",
+		"repository": "nvidia/nvcf",
+	}
+	values, err := yaml.Marshal(renderValues)
 	if err != nil {
 		return nil, resolvedInventoryHelmSource{}, "", fmt.Errorf("marshal inventory-only stack environment: %w", err)
 	}
@@ -667,20 +650,9 @@ func prepareResolvedInventoryEnvironment(copiedRepoRoot string) ([]string, resol
 			return nil, resolvedInventoryHelmSource{}, "", fmt.Errorf("write %s inventory-only stack environment: %w", stack, err)
 		}
 	}
-	secretsPath := filepath.Join(copiedRepoRoot, "deploy", "stacks", "self-managed", "secrets", "inventory-secrets.yaml")
-	if err := os.MkdirAll(filepath.Dir(secretsPath), 0o755); err != nil {
-		return nil, resolvedInventoryHelmSource{}, "", fmt.Errorf("create inventory-only stack secrets directory: %w", err)
-	}
-	if err := os.WriteFile(secretsPath, []byte("{}\n"), 0o600); err != nil {
-		return nil, resolvedInventoryHelmSource{}, "", fmt.Errorf("write inventory-only stack secrets: %w", err)
-	}
-	registrationDir := filepath.Join(copiedRepoRoot, "deploy", "stacks", "nvcf-compute-plane", "inventory-registration")
-	if err := os.MkdirAll(registrationDir, 0o755); err != nil {
+	renderEnv, err := writeStackRenderInputs(copiedRepoRoot, "inventory")
+	if err != nil {
 		return nil, resolvedInventoryHelmSource{}, "", err
-	}
-	registration := []byte("clusterName: inventory\nclusterID: 00000000-0000-0000-0000-000000000001\nclusterGroupID: 00000000-0000-0000-0000-000000000002\nncaID: inventory\nregion: inventory\nselfManaged:\n  identitySource: psat\n  icmsServiceURL: http://icms.example.invalid:8080\n  revalServiceURL: http://reval.example.invalid:8080\n  natsURL: nats://nats.example.invalid:4222\n")
-	if err := os.WriteFile(filepath.Join(registrationDir, "inventory-register-values.yaml"), registration, 0o600); err != nil {
-		return nil, resolvedInventoryHelmSource{}, "", fmt.Errorf("write inventory-only registration values: %w", err)
 	}
 	helmRoot := filepath.Join(copiedRepoRoot, ".helm")
 	for _, path := range []string{filepath.Join(helmRoot, "cache"), filepath.Join(helmRoot, "config"), filepath.Join(helmRoot, "data")} {
@@ -689,16 +661,65 @@ func prepareResolvedInventoryEnvironment(copiedRepoRoot string) ([]string, resol
 		}
 	}
 	env := append([]string{}, os.Environ()...)
-	env = setResolvedInventoryEnvironment(env, map[string]string{
-		"CLUSTER_NAME":     "inventory",
-		"HELMFILE_ENV":     "inventory",
-		"HELM_CACHE_HOME":  filepath.Join(helmRoot, "cache"),
-		"HELM_CONFIG_HOME": filepath.Join(helmRoot, "config"),
-		"HELM_DATA_HOME":   filepath.Join(helmRoot, "data"),
-		"NCA_ID":           "inventory",
-		"OUTPUT_DIR":       registrationDir,
-	})
+	renderEnv["HELM_CACHE_HOME"] = filepath.Join(helmRoot, "cache")
+	renderEnv["HELM_CONFIG_HOME"] = filepath.Join(helmRoot, "config")
+	renderEnv["HELM_DATA_HOME"] = filepath.Join(helmRoot, "data")
+	env = setResolvedInventoryEnvironment(env, renderEnv)
 	return env, renderSource, ngcAPIKey, nil
+}
+
+// stackRenderValues are the state values every released stack requires that
+// no base.yaml supplies, because an operator always sets them. name labels the
+// placeholders, such as "inventory".
+func stackRenderValues(name string) map[string]any {
+	return map[string]any{
+		"global": map[string]any{
+			"domain": name + ".example.invalid",
+		},
+		"ingress": map[string]any{
+			"gatewayApi": map[string]any{
+				"controllerNamespace": "gateway-system",
+				"gateways": map[string]any{
+					"grpc": map[string]any{
+						"name":      name + "-grpc",
+						"namespace": "gateway-system",
+					},
+					"shared": map[string]any{
+						"name":      name + "-shared",
+						"namespace": "gateway-system",
+					},
+				},
+			},
+		},
+	}
+}
+
+// writeStackRenderInputs writes the files a released stack state reads
+// outside its values, the self-managed secrets and the compute-plane cluster
+// registration, for HELMFILE_ENV and CLUSTER_NAME set to name. It returns the
+// environment variables the states require.
+func writeStackRenderInputs(copiedRepoRoot, name string) (map[string]string, error) {
+	secretsPath := filepath.Join(copiedRepoRoot, "deploy", "stacks", "self-managed", "secrets", name+"-secrets.yaml")
+	if err := os.MkdirAll(filepath.Dir(secretsPath), 0o755); err != nil {
+		return nil, fmt.Errorf("create %s stack secrets directory: %w", name, err)
+	}
+	if err := os.WriteFile(secretsPath, []byte("{}\n"), 0o600); err != nil {
+		return nil, fmt.Errorf("write %s stack secrets: %w", name, err)
+	}
+	registrationDir := filepath.Join(copiedRepoRoot, "deploy", "stacks", "nvcf-compute-plane", name+"-registration")
+	if err := os.MkdirAll(registrationDir, 0o755); err != nil {
+		return nil, err
+	}
+	registration := []byte("clusterName: " + name + "\nclusterID: 00000000-0000-0000-0000-000000000001\nclusterGroupID: 00000000-0000-0000-0000-000000000002\nncaID: " + name + "\nregion: " + name + "\nselfManaged:\n  identitySource: psat\n  icmsServiceURL: http://icms.example.invalid:8080\n  revalServiceURL: http://reval.example.invalid:8080\n  natsURL: nats://nats.example.invalid:4222\n")
+	if err := os.WriteFile(filepath.Join(registrationDir, name+"-register-values.yaml"), registration, 0o600); err != nil {
+		return nil, fmt.Errorf("write %s registration values: %w", name, err)
+	}
+	return map[string]string{
+		"CLUSTER_NAME": name,
+		"HELMFILE_ENV": name,
+		"NCA_ID":       name,
+		"OUTPUT_DIR":   registrationDir,
+	}, nil
 }
 
 func setResolvedInventoryEnvironment(env []string, values map[string]string) []string {
