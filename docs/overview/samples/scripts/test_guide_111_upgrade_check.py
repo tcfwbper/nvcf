@@ -3,6 +3,8 @@
 """Check the NVCF 1.1.1 upgrade guides: pinned versions, required sections and shared logic."""
 
 import re
+import subprocess
+import textwrap
 import unittest
 
 from test_recovery_upgrade_check import DOCS, block_containing
@@ -197,6 +199,77 @@ class UpgradeGuide111Checks(unittest.TestCase):
             self.assertIsNotNone(match, baseline)
             filters[baseline] = match.group(1)
         self.assertEqual(filters["1.0.4"], filters["1.1.0"])
+
+    def test_nats_port_forward_runs_kubectl_directly_in_the_background(self):
+        # A shell function as the background job leaves the kubectl child running after
+        # kill, so the next pod cannot bind the same local port.
+        guides = dict(GUIDES)
+        guides["1.0.1"] = NOTES / "1.0.1-to-1.1.0-upgrade.md"
+        for name, path in guides.items():
+            with self.subTest(guide=name):
+                match = re.search(r"for pod in \$NATS_PODS; do\n\s*\(\n(.*?)forward_pid=\$!", path.read_text(), re.DOTALL)
+                self.assertIsNotNone(match)
+                self.assertIn("kubectl", match.group(1))
+                self.assertNotRegex(match.group(1), r"(?m)^\s*kc\b")
+
+    def test_receipt_image_default_is_not_the_previous_release_default(self):
+        previous = re.search(r"alpine/k8s:(\d+\.\d+\.\d+)`", (NOTES / "1.0.1-to-1.1.0-upgrade.md").read_text())
+        self.assertIsNotNone(previous)
+        match = re.search(
+            r"verify the receipt image from the rendered Job\. Its default\s+is `docker\.io/alpine/k8s:(\d+\.\d+\.\d+)`",
+            self.text("1.0.4"))
+        self.assertIsNotNone(match)
+        self.assertNotEqual(match.group(1), previous.group(1))
+        catalog = (DOCS / "version-catalog/main.yaml").read_text()
+        self.assertRegex(catalog, r"upstream_repository: docker\.io/alpine/k8s\n\s+version: " + re.escape(match.group(1)))
+
+    def redact_helper(self, baseline):
+        match = re.search(r"redact_diff\(\) \{.*?\n\}", self.text(baseline), re.DOTALL)
+        self.assertIsNotNone(match, baseline)
+        return match.group(0)
+
+    def test_dependency_diffs_redact_credential_values(self):
+        # --suppress-secrets hides Secret data only; the OpenBao migration Job carries credentials as env values.
+        for baseline in GUIDES:
+            with self.subTest(baseline=baseline):
+                self.redact_helper(baseline)
+                text = re.sub(r"\\\n\s*", " ", self.text(baseline))
+                diffs = [line for line in text.splitlines()
+                         if "control_helmfile" in line and "01-dependencies.yaml.gotmpl" in line and re.search(r"\bdiff\b", line)]
+                self.assertGreaterEqual(len(diffs), 1)
+                for line in diffs:
+                    self.assertTrue(line.rstrip().endswith("| redact_diff"), line)
+        text = re.sub(r"\\\n\s*", " ", self.text("1.1.0"))
+        openbao = [line for line in text.splitlines() if "name=openbao-server" in line and " diff " in line]
+        self.assertEqual(2, len(openbao))
+        for line in openbao:
+            self.assertTrue(line.rstrip().endswith("| redact_diff"), line)
+        self.assertIn("declare -f kc control_helmfile redact_diff", self.text("1.0.4"))
+
+    def test_redact_diff_hides_credential_values_and_keeps_other_lines(self):
+        self.assertEqual(self.redact_helper("1.0.4"), self.redact_helper("1.1.0"))
+        sample = textwrap.dedent("""\
+            +           - name: DEFAULT_CASSANDRA_PASSWORD
+            +             value: hunter2
+            -           - name: NVCF_API_SIDECARS_IMAGE_PULL_SECRET
+            -             value: "YWJjOnN1cGVyc2VjcmV0"
+                        - name: ROTATED_ADMIN_TOKEN
+            -             value: oldtoken1
+            +             value: newtoken2
+                        - name: ADDONS_LLM_ENABLED
+                          value: "false"
+            """)
+        out = subprocess.run(["bash", "-c", self.redact_helper("1.1.0") + "\nredact_diff"],
+                             input=sample, capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("hunter2", out)
+        self.assertNotIn("YWJjOn", out)
+        # A rotated credential shows an unchanged name line, then a removed and an added value line.
+        self.assertNotIn("oldtoken1", out)
+        self.assertNotIn("newtoken2", out)
+        self.assertEqual(4, out.count("value: [REDACTED]"))
+        self.assertIn("- name: DEFAULT_CASSANDRA_PASSWORD", out)
+        self.assertIn('value: "false"', out)
+        self.assertEqual(len(sample.splitlines()), len(out.splitlines()))
 
     def test_guides_list_the_new_settings(self):
         for baseline in GUIDES:

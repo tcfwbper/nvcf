@@ -82,6 +82,7 @@ while IFS= read -r image; do
         automountServiceAccountToken: false, restartPolicy: "Never", activeDeadlineSeconds: 120,
         securityContext: {runAsNonRoot: true, seccompProfile: {type: "RuntimeDefault"}},
         containers: [{name: "check", image: $image, imagePullPolicy: "Always", args: ["--help"],
+          resources: {requests: {cpu: "100m", memory: "128Mi"}, limits: {cpu: "100m", memory: "128Mi"}},
           securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}
     ' | kt create -f - -o jsonpath='{.metadata.name}')
   printf 'Checking %s with pod %s\n' "$image" "$pod"
@@ -90,6 +91,10 @@ while IFS= read -r image; do
   kt delete "pod/$pod"
 done <<< "$TASK_IMAGES"
 ```
+
+Task namespaces can enforce a ResourceQuota that requires CPU and memory
+requests and limits on every container, so the probe sets small values. Raise
+them if the namespace quota or LimitRange needs larger ones.
 
 The probe uses `--help` because these images have no shell. Record the cluster,
 node and image digests. On failure, inspect `kt describe "pod/$pod"`, correct

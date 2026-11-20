@@ -125,6 +125,27 @@ kubectl() {
             for path, contents in before.items():
                 self.assertEqual(path.read_bytes(), contents)
 
+    def test_task_image_probe_sets_requests_and_limits_for_quota_namespaces(self):
+        # A namespace ResourceQuota that requires requests and limits rejects a container without them.
+        with tempfile.TemporaryDirectory() as directory:
+            captured = Path(directory) / "pod.json"
+            stub = r'''
+kubectl() {
+  case " $* " in
+    *" create "*) cat > "$CAPTURE_POD"; printf 'task-image-check-abc' ;;
+  esac
+}
+'''
+            command = block_containing(RECOVERY, "task-image-check-")
+            env = {**os.environ, "CAPTURE_POD": str(captured), "TASK_IMAGES": "registry.example/task-worker:1"}
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", stub + command],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            container = json.loads(captured.read_text())["spec"]["containers"][0]
+            for kind in ("requests", "limits"):
+                for resource in ("cpu", "memory"):
+                    self.assertTrue(container["resources"][kind][resource], f"{kind}.{resource}")
+
     def run_compute_capture(self, root, cluster, status=0):
         env = {**os.environ, "RECOVERY_RECORD": str(root), "CAPTURE_STATUS": str(status),
                "CAPTURE_CLUSTER": cluster,
