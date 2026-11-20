@@ -38,6 +38,25 @@ type Client interface {
 	Capabilities() Capabilities
 }
 
+// LogSafeReceipts is the optional hook a backend implements when the ids
+// its Submit returns are safe to write to logs: opaque job ids that carry no
+// credential, configuration, path or user data. The core then logs a
+// batch's id on its submit and confirm lines. A backend whose ids may carry
+// such data, such as an object key built from a configured prefix, does
+// not implement it, and its ids are never logged.
+type LogSafeReceipts interface {
+	LogSafeReceipts() bool
+}
+
+// LoggedReceipt returns id when client declares its ids safe to log, and
+// "" otherwise.
+func LoggedReceipt(client Client, id string) string {
+	if safe, ok := client.(LogSafeReceipts); ok && safe.LogSafeReceipts() {
+		return id
+	}
+	return ""
+}
+
 // Classifier is the optional error classification hook. A backend implements
 // it when it knows more about its errors than ClassifyDefault does, such as
 // which remote states mean the data may already have landed. It returns the

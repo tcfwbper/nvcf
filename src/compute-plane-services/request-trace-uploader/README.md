@@ -187,9 +187,13 @@ from `NVCF_FUNCTION_ID` and `NVCF_FUNCTION_VERSION_ID`, or from
 `nvcf.function.id` and `nvcf.function.version.id` in
 `OTEL_RESOURCE_ATTRIBUTES`, and `pod` and `cluster` from `k8s.pod.name` and
 `k8s.cluster.name` there. Lines name segments and batches by their local
-number or short id. They never carry credentials, record payloads, NCA ids,
-request ids, remote job ids or local file paths; a backend fault is logged by its
-class, scope and reason.
+number or short id. When the backend declares its ids safe to log
+(`backend.LogSafeReceipts`), the submit and confirm lines also carry `job`,
+the id the backend returned for the batch's job, so a batch can be
+followed into the backend. `objectstore` does not: its ids are object
+keys built from configuration. Lines never carry credentials, record payloads, NCA ids,
+request ids or local file paths; a backend fault is logged by its class,
+scope and reason.
 
 The same records also go to the collector over OTLP when its endpoint is
 set, with the shared resource instead of the identity fields. The resource

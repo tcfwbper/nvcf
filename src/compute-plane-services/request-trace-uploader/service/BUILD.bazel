@@ -59,6 +59,7 @@ go_test(
         "faults_e2e_test.go",
         "fingerprint_internal_test.go",
         "health_e2e_test.go",
+        "jobid_log_e2e_test.go",
         "leftovers_e2e_test.go",
         "loadenv_test.go",
         "metrics_hook_e2e_test.go",

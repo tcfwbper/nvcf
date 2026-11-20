@@ -180,7 +180,8 @@ func (u *Uploader) confirmed(b journal.Batch, now time.Time) {
 		u.metrics.Observe(telemetry.ConfirmLatency, now.Sub(b.SubmittedAt).Seconds(), nil)
 	}
 	u.observeExportLatency(b)
-	slog.Info("request trace batch confirmed", "batch", shortID(b.ID), "segments", len(b.Members))
+	args := append([]any{"batch", shortID(b.ID)}, jobArgs(u.client, jobID(b))...)
+	slog.Info("request trace batch confirmed", append(args, "segments", len(b.Members))...)
 }
 
 // observeExportLatency records, for each member this batch finished, the
@@ -236,4 +237,24 @@ func (u *Uploader) saveUnsavedReceipts(now time.Time) {
 		delete(u.unsaved, id)
 		u.stateMu.Unlock()
 	}
+}
+
+// jobID is the backend's id for the batch's job, for log lines that let an
+// operator follow a batch into the backend. It is empty when no receipt is
+// recorded.
+func jobID(b journal.Batch) string {
+	if b.Receipt == nil {
+		return ""
+	}
+	return b.Receipt.ID
+}
+
+// jobArgs is the job attribute of a log line: the batch's job id when the
+// backend declares its ids safe to log, and nothing otherwise, so the key is
+// absent rather than empty.
+func jobArgs(client backend.Client, id string) []any {
+	if logged := backend.LoggedReceipt(client, id); logged != "" {
+		return []any{"job", logged}
+	}
+	return nil
 }

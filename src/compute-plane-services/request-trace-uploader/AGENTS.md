@@ -51,8 +51,11 @@ after changing Go imports or Bazel metadata.
   `OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT` is set; a failed export never
   blocks an upload or readiness. Logs are JSON lines on stderr either way.
 - Do not log request payloads, credentials, paths, NCA ids, request ids, or
-  remote upload IDs. Log backend faults by class, scope and reason, not by
-  their error text. Spans carry the same bounded fields and never record
+  remote upload IDs. One exception: the submitted and confirmed lines carry
+  `job`, the batch's job id, only for a backend that implements
+  `backend.LogSafeReceipts` because its ids are opaque; log it through
+  `backend.LoggedReceipt` and nowhere else. Log backend faults by class,
+  scope and reason, not by their error text. Spans carry the same bounded fields and never record
   error text.
 - A backend that calls its destination over HTTP takes the core's
   transport through `telemetry.TransportReceiver`, so each call is a child

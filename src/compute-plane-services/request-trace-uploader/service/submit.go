@@ -275,7 +275,8 @@ func (u *Uploader) submit(ctx context.Context, b batch.Batch, resend bool) error
 		if err != nil {
 			slog.Warn("create returned a job id and an error; the job is polled", "batch", shortID(b.ID), "fault", faultText(backend.Classify(u.client, err)))
 		}
-		slog.Info("submitted request trace batch", "batch", shortID(b.ID), "segments", len(b.Members), "bytes", b.Bytes)
+		args := append([]any{"batch", shortID(b.ID)}, jobArgs(u.client, receipt)...)
+		slog.Info("submitted request trace batch", append(args, "segments", len(b.Members), "bytes", b.Bytes)...)
 		return nil
 	}
 	if err == nil {
