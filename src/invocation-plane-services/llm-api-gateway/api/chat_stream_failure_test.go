@@ -18,12 +18,14 @@ limitations under the License.
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,45 +53,111 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 	const siblingFinished = partial +
 		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"company-name/model-name","choices":[{"index":1,"delta":{"role":"assistant","content":"HEADS"},"finish_reason":"stop"}]}` + "\n\n"
 	// vLLM and LiteLLM report a failure after the 200 as an error event, then send [DONE].
-	// vLLM's error object has a numeric code, which the OpenAI error schema does not allow.
+	errorEvent := func(member string) string {
+		return `data: {"error":` + member + "}\n\n" + "data: [DONE]\n\n"
+	}
 	upstreamError := func(member string) string {
-		return partial + `data: {"error":` + member + "}\n\n" + "data: [DONE]\n\n"
+		return partial + errorEvent(member)
 	}
 	const vllmError = `{"message":"engine failed","type":"InternalServerError","param":null,"code":500}`
+	// Dynamo 1.6.0+ and vLLM put the status of a request they reject after the 200 into code.
+	rejected := func(code string) string {
+		return `{"message":"bad input","type":"invalid_request_error","param":"image","code":` + code + `}`
+	}
 	// OpenRouter puts the error next to choices, with finish_reason "error".
 	const errorWithChoices = partial +
 		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"company-name/model-name","error":{"code":502,"message":"engine failed"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}` + "\n\n" +
 		"data: [DONE]\n\n"
 
-	tests := []struct {
+	type testCase struct {
 		name         string
 		stream       bool
 		upstreamBody string
 		// dropMidway aborts the upstream connection, which is what the gateway
 		// sees once the tunnel propagates the Pylon reset.
 		dropMidway bool
-		// streamMessage is the message of the streaming error event; empty means msgUpstreamStreamIncomplete.
-		streamMessage string
-	}{
+		// wantStatus is the client status of a unary request, or the status that
+		// logs and metrics record for a stream; 0 means 502.
+		wantStatus int
+		// wantMessage and wantType are the error fields; empty means
+		// msgUpstreamStreamIncomplete and server_error.
+		wantMessage string
+		wantType    string
+		// wantParam is the error param as raw JSON; empty means null.
+		wantParam string
+		// wantCode is the error code as raw JSON; empty means null.
+		wantCode string
+	}
+	tests := []testCase{
 		{name: "stream clean end after output", stream: true, upstreamBody: partial},
 		{name: "stream clean end before output", stream: true},
 		{name: "stream clean end n=2 one choice finished", stream: true, upstreamBody: siblingFinished},
 		{name: "stream connection drops after output", stream: true, upstreamBody: partial, dropMidway: true},
 		{
-			name: "stream upstream error event after output", stream: true,
-			upstreamBody: upstreamError(vllmError), streamMessage: "engine failed",
+			name: "stream upstream error event after output", stream: true, upstreamBody: upstreamError(vllmError),
+			wantMessage: "engine failed", wantType: "InternalServerError", wantCode: `"500"`,
 		},
 		{
 			name: "stream upstream error string after output", stream: true,
-			upstreamBody: upstreamError(`"engine failed"`), streamMessage: "engine failed",
+			upstreamBody: upstreamError(`"engine failed"`), wantMessage: "engine failed",
 		},
-		{name: "stream upstream error event without message", stream: true, upstreamBody: upstreamError(`{"code":500}`)},
-		{name: "stream upstream error with choices", stream: true, upstreamBody: errorWithChoices, streamMessage: "engine failed"},
+		{
+			name: "stream upstream error event without message", stream: true,
+			upstreamBody: upstreamError(`{"code":500}`), wantCode: `"500"`,
+		},
+		{
+			name: "stream upstream error with choices", stream: true, upstreamBody: errorWithChoices,
+			wantMessage: "engine failed", wantCode: `"502"`,
+		},
+		{
+			name: "stream upstream 4xx error event", stream: true, upstreamBody: errorEvent(rejected("400")),
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: `"400"`,
+		},
+		{
+			name:   "stream upstream 4xx error event with string code",
+			stream: true, upstreamBody: errorEvent(rejected(`"400"`)),
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: `"400"`,
+		},
+		{
+			name:   "stream upstream 4xx error event without type",
+			stream: true, upstreamBody: errorEvent(`{"message":"bad input","code":400}`),
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input", wantType: "invalid_request_error",
+			wantCode: `"400"`,
+		},
 		{name: "unary clean end after output", upstreamBody: partial},
 		{name: "unary clean end n=2 one choice finished", upstreamBody: siblingFinished},
 		{name: "unary connection drops after output", upstreamBody: partial, dropMidway: true},
 		{name: "unary upstream error event after output", upstreamBody: upstreamError(vllmError)},
 		{name: "unary upstream error with choices", upstreamBody: errorWithChoices},
+		// The client went away, so 499 is not the client's error to receive.
+		{name: "unary upstream 499 error event", upstreamBody: errorEvent(rejected("499"))},
+		{
+			name:         "unary upstream error event with text code",
+			upstreamBody: errorEvent(rejected(`"context_length_exceeded"`)),
+		},
+		{name: "unary upstream error event without code", upstreamBody: errorEvent(`{"message":"bad input"}`)},
+		{name: "unary upstream error string", upstreamBody: errorEvent(`"engine failed"`)},
+		{
+			name: "unary upstream 4xx error event after output", upstreamBody: upstreamError(rejected("400")),
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: "400",
+		},
+		{
+			name: "unary upstream 4xx error event with string code", upstreamBody: errorEvent(rejected(`"400"`)),
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: `"400"`,
+		},
+	}
+	// A 4xx error event reaches a unary client with that status and the backend's error object.
+	for _, status := range []int{400, 401, 403, 404, 413, 415, 422, 429} {
+		code := strconv.Itoa(status)
+		tests = append(tests, testCase{
+			name: "unary upstream " + code + " error event", upstreamBody: errorEvent(rejected(code)),
+			wantStatus: status, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: code,
+		})
 	}
 
 	for _, tt := range tests {
@@ -117,34 +185,37 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 			clientBody := `{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hi"}],"stream":` + streamJSON + `}`
 			rec := servePassthroughRequest(t, e, "/v1/chat/completions", clientBody)
 			body := rec.Body.String()
-			require.NotContains(t, body, "InternalServerError", "the upstream error event is not relayed as is")
 
-			if !tt.stream {
-				require.Equal(t, http.StatusBadGateway, rec.Code, body)
-				var errBody openAIErrorResponse
-				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errBody), body)
-				require.Equal(t, "server_error", errBody.Error.Type)
-				require.Equal(t, msgUpstreamStreamIncomplete, errBody.Error.Message)
-				return
+			wantStatus := cmp.Or(tt.wantStatus, http.StatusBadGateway)
+			var errorBody struct {
+				Error struct {
+					Message string          `json:"message"`
+					Type    string          `json:"type"`
+					Param   json.RawMessage `json:"param"`
+					Code    json.RawMessage `json:"code"`
+				} `json:"error"`
 			}
-			// The client keeps its 200; logs, metrics and traces record a 502.
-			require.Equal(t, http.StatusOK, rec.Code)
-			var httpErr *echo.HTTPError
-			require.ErrorAs(t, *handlerErr, &httpErr)
-			require.Equal(t, http.StatusBadGateway, httpErr.Code)
+			if tt.stream {
+				// The client keeps its 200; logs, metrics and traces record wantStatus.
+				require.Equal(t, http.StatusOK, rec.Code)
+				var httpErr *echo.HTTPError
+				require.ErrorAs(t, *handlerErr, &httpErr)
+				require.Equal(t, wantStatus, httpErr.Code)
 
-			require.NotContains(t, body, "data: [DONE]", "a truncated stream must not end like a finished one")
-			events := strings.Split(strings.TrimSuffix(body, "\n\n"), "\n\n")
-			last, isData := strings.CutPrefix(events[len(events)-1], "data: ")
-			require.True(t, isData, body)
-			var event openAIErrorResponse
-			require.NoError(t, json.Unmarshal([]byte(last), &event), "last event must be an error event: %q", body)
-			require.Equal(t, "server_error", event.Error.Type)
-			wantMessage := tt.streamMessage
-			if wantMessage == "" {
-				wantMessage = msgUpstreamStreamIncomplete
+				require.NotContains(t, body, "data: [DONE]", "a truncated stream must not end like a finished one")
+				events := strings.Split(strings.TrimSuffix(body, "\n\n"), "\n\n")
+				last, isData := strings.CutPrefix(events[len(events)-1], "data: ")
+				require.True(t, isData, body)
+				require.NoError(t, json.Unmarshal([]byte(last), &errorBody),
+					"last event must be an error event: %q", body)
+			} else {
+				require.Equal(t, wantStatus, rec.Code, body)
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errorBody), body)
 			}
-			require.Equal(t, wantMessage, event.Error.Message)
+			require.Equal(t, cmp.Or(tt.wantMessage, msgUpstreamStreamIncomplete), errorBody.Error.Message)
+			require.Equal(t, cmp.Or(tt.wantType, "server_error"), errorBody.Error.Type)
+			require.JSONEq(t, cmp.Or(tt.wantParam, "null"), cmp.Or(string(errorBody.Error.Param), "null"))
+			require.JSONEq(t, cmp.Or(tt.wantCode, "null"), cmp.Or(string(errorBody.Error.Code), "null"))
 		})
 	}
 }

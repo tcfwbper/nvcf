@@ -18,6 +18,7 @@ limitations under the License.
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -239,19 +240,26 @@ func (h *OpenAIChatHandlers) streamChatCompletionWithSender(
 }
 
 // failChatCompletionStream ends a stream whose upstream failed after the 200: an error
-// event instead of [DONE] makes OpenAI SDKs raise, and the 502 marks the request failed.
-// An upstream error event keeps its message but takes the gateway's error shape.
+// event instead of [DONE] makes OpenAI SDKs raise, and the returned status marks the
+// request failed: the 4xx of an upstream event that rejects the request, else 502.
+// An upstream error event keeps its fields but takes the gateway's error shape.
 func failChatCompletionStream(c *GatewayContext, cause error) error {
-	failure := echo.NewHTTPError(http.StatusBadGateway, msgUpstreamStreamIncomplete)
-	message := msgUpstreamStreamIncomplete
+	status := http.StatusBadGateway
+	event := openAIError{Message: msgUpstreamStreamIncomplete, Type: openAIErrorType(status)}
 	var upstreamErr *provider.UpstreamStreamError
-	if errors.As(cause, &upstreamErr) && upstreamErr.Message != "" {
-		message = upstreamErr.Message
+	if errors.As(cause, &upstreamErr) {
+		if isUpstreamClientError(upstreamErr.Status) {
+			status = upstreamErr.Status
+		}
+		event = openAIError{
+			Message: cmp.Or(upstreamErr.Message, msgUpstreamStreamIncomplete),
+			Type:    cmp.Or(ptr.Deref(upstreamErr.Type), openAIErrorType(status)),
+			Param:   upstreamErr.Param,
+			Code:    upstreamErr.Code,
+		}
 	}
-	payload, err := json.Marshal(openAIErrorResponse{Error: openAIError{
-		Message: message,
-		Type:    openAIErrorType(http.StatusBadGateway),
-	}})
+	failure := echo.NewHTTPError(status, msgUpstreamStreamIncomplete)
+	payload, err := json.Marshal(openAIErrorResponse{Error: event})
 	if err != nil {
 		return failure.SetInternal(errors.Join(cause, err))
 	}

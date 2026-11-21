@@ -31,10 +31,22 @@ func providerHTTPError(err error) error {
 	if errors.As(err, &httpErr) {
 		return httpErr
 	}
+	// A backend that rejects the request after the 200 puts the status in its
+	// error event; the client gets it as if the backend had answered with it.
+	var streamErr *provider.UpstreamStreamError
+	if errors.As(err, &streamErr) && isUpstreamClientError(streamErr.Status) {
+		return provider.NewUpstreamHTTPError(streamErr.Status, nil, streamErr.Body)
+	}
 	if errors.Is(err, provider.ErrStreamIncomplete) {
 		return echo.NewHTTPError(http.StatusBadGateway, msgUpstreamStreamIncomplete).SetInternal(err)
 	}
 
 	// Transport errors carry internal addresses; keep them for the request log only.
 	return echo.NewHTTPError(http.StatusBadGateway, "upstream request failed").SetInternal(err)
+}
+
+// isUpstreamClientError reports whether an upstream error event's status is a
+// client error to pass on. 499 means the client went away.
+func isUpstreamClientError(status int) bool {
+	return status >= http.StatusBadRequest && status < statusClientClosedRequest
 }

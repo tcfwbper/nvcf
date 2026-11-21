@@ -1011,7 +1011,69 @@ func upstreamStreamError(payload string) *UpstreamStreamError {
 	if len(event.Error) == 0 || bytes.Equal(event.Error, []byte("null")) {
 		return nil
 	}
-	return &UpstreamStreamError{Message: UpstreamErrorMessage([]byte(payload))}
+	upstreamErr := &UpstreamStreamError{Message: UpstreamErrorMessage([]byte(payload))}
+	var fields struct {
+		Type  json.RawMessage `json:"type"`
+		Param json.RawMessage `json:"param"`
+		Code  json.RawMessage `json:"code"`
+	}
+	if json.Unmarshal(event.Error, &fields) == nil {
+		upstreamErr.Type = jsonString(fields.Type)
+		upstreamErr.Param = jsonString(fields.Param)
+		upstreamErr.Code = jsonString(fields.Code)
+		if upstreamErr.Code == nil && len(fields.Code) > 0 && bytes.IndexFunc(fields.Code, isNotDigit) < 0 {
+			code := truncateMessage(string(fields.Code))
+			upstreamErr.Code = &code
+		}
+		if upstreamErr.Code != nil {
+			if status, err := strconv.Atoi(*upstreamErr.Code); err == nil && status >= 100 && status <= 599 {
+				upstreamErr.Status = status
+			}
+		}
+	}
+	upstreamErr.Body = streamErrorBody(event.Error, upstreamErr)
+	return upstreamErr
+}
+
+// streamErrorBody returns {"error":...} with the event's error object. Like an
+// oversized 4xx head body, an object over MaxUpstreamErrorBodyBytes is not
+// relayed: its capped message and fields are, or nothing without a message.
+func streamErrorBody(errorObject json.RawMessage, upstreamErr *UpstreamStreamError) []byte {
+	wrap := func(object []byte) []byte {
+		return append(append([]byte(`{"error":`), object...), '}')
+	}
+	if body := wrap(errorObject); len(body) <= MaxUpstreamErrorBodyBytes {
+		return body
+	}
+	if upstreamErr.Message == "" {
+		return nil
+	}
+	// Each field is capped at maxUpstreamErrorMessageBytes, so this stays under the limit.
+	capped, err := json.Marshal(struct {
+		Message string  `json:"message"`
+		Type    *string `json:"type,omitempty"`
+		Param   *string `json:"param,omitempty"`
+		Code    *string `json:"code,omitempty"`
+	}{upstreamErr.Message, upstreamErr.Type, upstreamErr.Param, upstreamErr.Code})
+	if err != nil {
+		return nil
+	}
+	return wrap(capped)
+}
+
+// jsonString returns the value of a JSON string, capped like an upstream error
+// message, or nil for null and any other value.
+func jsonString(raw json.RawMessage) *string {
+	var value *string
+	if json.Unmarshal(raw, &value) != nil || value == nil {
+		return nil
+	}
+	capped := truncateMessage(*value)
+	return &capped
+}
+
+func isNotDigit(r rune) bool {
+	return r < '0' || r > '9'
 }
 
 func (p *StargateProvider) readStream(

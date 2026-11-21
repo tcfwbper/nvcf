@@ -544,6 +544,80 @@ func TestResponsesUnaryReturns502WhenUpstreamStreamFails(t *testing.T) {
 	}
 }
 
+// A unary client gets an HTTP status for a failed response whose error code
+// names its class; the OpenAI SDK raises nothing for a 200 failed response.
+func TestResponsesUnaryMapsFailedResponseToStatus(t *testing.T) {
+	t.Parallel()
+
+	failedResponse := func(errorMember string) string {
+		return `{"id":"resp_1","object":"response","status":"failed","output":[],"error":` + errorMember + `}`
+	}
+	tests := []struct {
+		name        string
+		errorMember string
+		// wantStatus 200 means the failed response is returned unchanged.
+		wantStatus int
+		wantType   string
+	}{
+		{
+			name: "invalid prompt", errorMember: `{"code":"invalid_prompt","message":"upstream message"}`,
+			wantStatus: http.StatusBadRequest, wantType: "invalid_request_error",
+		},
+		{
+			name: "rate limit exceeded", errorMember: `{"code":"rate_limit_exceeded","message":"upstream message"}`,
+			wantStatus: http.StatusTooManyRequests, wantType: "rate_limit_error",
+		},
+		{
+			name: "server error", errorMember: `{"code":"server_error","message":"upstream message"}`,
+			wantStatus: http.StatusBadGateway, wantType: "server_error",
+		},
+		{
+			name: "other code", errorMember: `{"code":"vector_store_timeout","message":"upstream message"}`,
+			wantStatus: http.StatusOK,
+		},
+		{name: "no error object", errorMember: `null`, wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			response := failedResponse(tt.errorMember)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set(echo.HeaderContentType, "text/event-stream")
+				_, _ = io.WriteString(w, "event: response.failed\n"+
+					`data: {"type":"response.failed","sequence_number":0,"response":`+response+"}\n\n")
+			}))
+			t.Cleanup(upstream.Close)
+			e := newPassthroughAPI(t, upstream.URL)
+			handlerErr := captureHandlerError(e)
+
+			clientBody := `{"model":"fn-alpha/company-name/model-name","input":"hi","stream":false}`
+			rec := servePassthroughRequest(t, e, "/v1/responses", clientBody)
+			body := rec.Body.String()
+
+			require.Equal(t, tt.wantStatus, rec.Code, body)
+			if tt.wantStatus == http.StatusOK {
+				require.JSONEq(t, response, body)
+				return
+			}
+			var httpErr *echo.HTTPError
+			require.ErrorAs(t, *handlerErr, &httpErr, "logs and metrics must record the status")
+			require.Equal(t, tt.wantStatus, httpErr.Code)
+			var errBody openAIErrorResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errBody), body)
+			require.Equal(t, "upstream message", errBody.Error.Message)
+			require.Equal(t, tt.wantType, errBody.Error.Type)
+			var upstreamError struct {
+				Code string `json:"code"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(tt.errorMember), &upstreamError))
+			require.Equal(t, &upstreamError.Code, errBody.Error.Code)
+		})
+	}
+}
+
 func TestResponsesStreamKeepsTerminalStreamWhenConnectionDropsAfterIt(t *testing.T) {
 	t.Parallel()
 

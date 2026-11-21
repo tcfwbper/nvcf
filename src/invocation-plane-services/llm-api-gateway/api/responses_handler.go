@@ -20,6 +20,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -434,7 +435,47 @@ func (h *ResponsesHandlers) aggregateNativeResponsesStream(
 	h.recordNativeResponsesProviderTime(c, start, false)
 	h.finalizeNativeResponsesUsage(c, request, terminalResponse, false)
 	setMultiTurnSessionResponseHeader(c)
+	if failure := failedResponseHTTPError(terminalResponse.body); failure != nil {
+		return failure
+	}
 	return c.JSONBlob(http.StatusOK, terminalResponse.body)
+}
+
+// failedResponseStatus maps the Responses error codes whose class is clear to
+// the HTTP status a non-streaming request gets. The event carries no status,
+// and other codes keep the failed response with 200.
+var failedResponseStatus = map[string]int{
+	"invalid_prompt":      http.StatusBadRequest,
+	"rate_limit_exceeded": http.StatusTooManyRequests,
+	"server_error":        http.StatusBadGateway,
+}
+
+// failedResponseHTTPError returns the error for a failed terminal response
+// whose code is in failedResponseStatus, or nil. The OpenAI SDK raises nothing
+// for a failed response with 200, so a client could take it for an empty answer.
+func failedResponseHTTPError(body json.RawMessage) error {
+	var response struct {
+		Status string `json:"status"`
+		Error  *struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &response) != nil || response.Status != "failed" || response.Error == nil {
+		return nil
+	}
+	status, ok := failedResponseStatus[response.Error.Code]
+	if !ok {
+		return nil
+	}
+	errorBody, err := json.Marshal(openAIErrorResponse{Error: openAIError{
+		Message: cmp.Or(provider.UpstreamErrorMessage(body), http.StatusText(status)),
+		Type:    openAIErrorType(status),
+		Code:    &response.Error.Code,
+	}})
+	if err != nil {
+		return echo.NewHTTPError(status, http.StatusText(status)).SetInternal(err)
+	}
+	return provider.NewUpstreamHTTPError(status, nil, errorBody)
 }
 
 // nativeResponsesTerminal is the response object carried by a terminal

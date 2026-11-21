@@ -40,6 +40,15 @@ var ErrStreamIncomplete = errors.New("upstream stream incomplete")
 type UpstreamStreamError struct {
 	// Message is the upstream error message; empty when the event has no string message.
 	Message string
+	// Type, Param and Code are the event's error fields, nil when absent. Code
+	// is text: engines send the HTTP status as a number, OpenAI a string.
+	Type  *string
+	Param *string
+	Code  *string
+	// Status is the HTTP status that Code carries, or 0.
+	Status int
+	// Body is {"error":...} with the event's error object unchanged.
+	Body []byte
 }
 
 func (e *UpstreamStreamError) Error() string {
