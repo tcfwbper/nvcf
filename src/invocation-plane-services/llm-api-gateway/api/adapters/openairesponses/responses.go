@@ -25,6 +25,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
@@ -279,6 +280,12 @@ func (r *CreateRequest) Validate() error {
 		return &UnmarshalError{
 			Field: "model",
 			Msg:   "is required",
+		}
+	}
+	if r.MaxOutputTokens != nil && (*r.MaxOutputTokens < 0 || *r.MaxOutputTokens > math.MaxUint32) {
+		return &UnmarshalError{
+			Field: "max_output_tokens",
+			Msg:   fmt.Sprintf("must be an integer from 0 to %d", uint32(math.MaxUint32)),
 		}
 	}
 	if len(r.Input.Items) == 0 && !r.hasStoredContext() {

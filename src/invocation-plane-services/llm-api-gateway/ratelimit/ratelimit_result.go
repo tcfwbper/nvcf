@@ -42,6 +42,12 @@ func (rlr *RateLimitResult) Allowed() bool {
 	return rlr.Requested <= rlr.CurrentValue
 }
 
+// ExceedsLimit reports a request larger than the whole bucket, which no wait
+// can admit.
+func (rlr *RateLimitResult) ExceedsLimit() bool {
+	return rlr.RateLimit.Limit > 0 && rlr.Requested > rlr.RateLimit.Limit
+}
+
 func (rlr *RateLimitResult) Revert() {
 	rlr.reverted = true
 }

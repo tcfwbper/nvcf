@@ -116,6 +116,7 @@ go_test(
         "model_uris_test.go",
         "openai_routes_test.go",
         "overload_test.go",
+        "oversized_rate_limit_test.go",
         "passthrough_test.go",
         "priority_guard_test.go",
         "provider_error_test.go",

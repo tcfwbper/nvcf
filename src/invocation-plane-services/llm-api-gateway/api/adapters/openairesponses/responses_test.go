@@ -189,6 +189,26 @@ func TestCreateRequest_Validate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "negative max_output_tokens",
+			request: CreateRequest{
+				Model:           "gpt-4",
+				Input:           Input{Items: []InputItem{newAdapterTextItem("Hello")}},
+				MaxOutputTokens: ptr.To(-5),
+			},
+			wantErr: true,
+			errMsg:  "`max_output_tokens`: must be an integer from 0 to 4294967295",
+		},
+		{
+			name: "max_output_tokens above 32 bits",
+			request: CreateRequest{
+				Model:           "gpt-4",
+				Input:           Input{Items: []InputItem{newAdapterTextItem("Hello")}},
+				MaxOutputTokens: ptr.To(1 << 32),
+			},
+			wantErr: true,
+			errMsg:  "`max_output_tokens`: must be an integer from 0 to 4294967295",
+		},
 	}
 
 	for _, tt := range tests {
