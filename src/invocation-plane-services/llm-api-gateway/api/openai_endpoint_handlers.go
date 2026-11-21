@@ -157,14 +157,12 @@ var (
 
 func (h *OpenAIProxyHandlers) Embeddings(ec echo.Context) error {
 	c := must.As[*GatewayContext](ec)
-	reqCtx, err := h.handlers.requireFunctionRequestContext(c)
+	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
 		return err
 	}
-
-	rawBody, err := captureRequestBody(c.Request())
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	if err := requireJSONBody(c.Request(), rawBody); err != nil {
+		return err
 	}
 	if err := rejectAmbiguousMembers(rawBody, models.CreateEmbeddingRequest{}); err != nil {
 		return err
@@ -172,7 +170,11 @@ func (h *OpenAIProxyHandlers) Embeddings(ec echo.Context) error {
 
 	var request models.CreateEmbeddingRequest
 	if err := c.Bind(&request); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return requestDecodeError(err)
+	}
+	reqCtx, err := h.handlers.requireFunctionRequestContext(c)
+	if err != nil {
+		return err
 	}
 
 	requestModel, err := h.validateEmbeddingRequest(c, reqCtx, &request)
@@ -200,19 +202,21 @@ func (h *OpenAIProxyHandlers) Embeddings(ec echo.Context) error {
 
 func (h *OpenAIProxyHandlers) Reranking(ec echo.Context) error {
 	c := must.As[*GatewayContext](ec)
-	reqCtx, err := h.handlers.requireFunctionRequestContext(c)
+	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
 		return err
 	}
-
-	rawBody, err := captureRequestBody(c.Request())
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	if err := requireJSONBody(c.Request(), rawBody); err != nil {
+		return err
 	}
 
 	var request models.RerankingRequest
 	if err := c.Bind(&request); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return requestDecodeError(err)
+	}
+	reqCtx, err := h.handlers.requireFunctionRequestContext(c)
+	if err != nil {
+		return err
 	}
 
 	requestModel, err := h.validateRerankingRequest(reqCtx, &request)
@@ -242,19 +246,21 @@ func (h *OpenAIProxyHandlers) Reranking(ec echo.Context) error {
 
 func (h *OpenAIProxyHandlers) TextToSpeech(ec echo.Context) error {
 	c := must.As[*GatewayContext](ec)
-	reqCtx, err := h.handlers.requireFunctionRequestContext(c)
+	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
 		return err
 	}
-
-	rawBody, err := captureRequestBody(c.Request())
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	if err := requireJSONBody(c.Request(), rawBody); err != nil {
+		return err
 	}
 
 	var request models.TextToSpeechRequest
 	if err := c.Bind(&request); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return requestDecodeError(err)
+	}
+	reqCtx, err := h.handlers.requireFunctionRequestContext(c)
+	if err != nil {
+		return err
 	}
 
 	requestModel, err := h.validateTextToSpeechRequest(reqCtx, &request)
@@ -626,7 +632,7 @@ func captureRequestBody(req *http.Request) ([]byte, error) {
 
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read request body: %w", err)
+		return nil, requestBodyReadError(err)
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	req.ContentLength = int64(len(body))

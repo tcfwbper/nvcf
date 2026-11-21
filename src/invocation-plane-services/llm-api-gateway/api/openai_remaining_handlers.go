@@ -20,6 +20,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -63,7 +64,7 @@ func (h *OpenAIProxyHandlers) handleAudioToTextProxy(ec echo.Context, translatio
 
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
 
 	form, err := c.MultipartForm()
@@ -176,7 +177,7 @@ func (h *OpenAIProxyHandlers) SpeechToSpeech(ec echo.Context) error {
 
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
 
 	form, err := c.MultipartForm()
@@ -298,17 +299,17 @@ func parseSpeechToSpeechRequest(form *multipart.Form) (*speechToSpeechRequest, e
 
 	if value := form.Value["stt"]; len(value) == 1 && value[0] != "" {
 		if err := json.Unmarshal([]byte(value[0]), &params.STT); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal stt params: %w", err)
+			return nil, errors.New(jsonDecodeMessage(err, "`stt` field", "stt."))
 		}
 	}
 	if value := form.Value["llm"]; len(value) == 1 && value[0] != "" {
 		if err := json.Unmarshal([]byte(value[0]), &params.LLM); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal llm params: %w", err)
+			return nil, errors.New(jsonDecodeMessage(err, "`llm` field", "llm."))
 		}
 	}
 	if value := form.Value["tts"]; len(value) == 1 && value[0] != "" {
 		if err := json.Unmarshal([]byte(value[0]), &params.TTS); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal tts params: %w", err)
+			return nil, errors.New(jsonDecodeMessage(err, "`tts` field", "tts."))
 		}
 	}
 

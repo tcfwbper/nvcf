@@ -62,7 +62,10 @@ func (h *OpenAIChatHandlers) CreateChatCompletion(ec echo.Context) error {
 
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
+	}
+	if err := requireJSONBody(c.Request(), rawBody); err != nil {
+		return err
 	}
 	if err := rejectAmbiguousMembers(rawBody, models.ChatCompletionRequest{}); err != nil {
 		return err
@@ -70,7 +73,7 @@ func (h *OpenAIChatHandlers) CreateChatCompletion(ec echo.Context) error {
 
 	var request models.ChatCompletionRequest
 	if err := c.Bind(&request); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return requestDecodeError(err)
 	}
 
 	return h.handleChatCompletionRequest(c, &request, rawBody, nil, nil)

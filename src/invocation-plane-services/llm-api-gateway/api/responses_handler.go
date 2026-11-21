@@ -68,7 +68,10 @@ func (h *ResponsesHandlers) CreateResponse(ec echo.Context) error {
 
 	body, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
+	}
+	if err := requireJSONBody(c.Request(), body); err != nil {
+		return err
 	}
 	if err := rejectAmbiguousMembers(body, openairesponses.CreateRequest{}); err != nil {
 		return err
@@ -76,7 +79,7 @@ func (h *ResponsesHandlers) CreateResponse(ec echo.Context) error {
 
 	var request openairesponses.CreateRequest
 	if err := c.Bind(&request); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return requestDecodeError(err)
 	}
 
 	if err := request.Validate(); err != nil {

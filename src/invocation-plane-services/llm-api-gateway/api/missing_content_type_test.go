@@ -5,6 +5,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -211,7 +212,13 @@ func TestJSONRoutesStillRejectNonJSONContentType(t *testing.T) {
 
 			rec := serveWithContentType(t, e, tt.path, "text/plain", tt.body)
 
-			require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusUnsupportedMediaType, rec.Code, rec.Body.String())
+			require.Contains(t, rec.Body.String(), "Content-Type must be application/json")
+			if tt.path == messagesEndpointPath {
+				var body anthropicErrorResponse
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+				require.Equal(t, "invalid_request_error", body.Error.Type)
+			}
 			require.Empty(t, upstream.requests, "request must not reach upstream")
 		})
 	}

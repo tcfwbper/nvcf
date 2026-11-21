@@ -38,7 +38,10 @@ func (h *OpenAIProxyHandlers) serveDecisionRoute(ec echo.Context, endpointPath s
 	c := must.As[*GatewayContext](ec)
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
+	}
+	if err := requireJSONContentType(c.Request()); err != nil {
+		return err
 	}
 	// Parse before requiring the function context: a body that is not JSON
 	// has no routing key, and the client should hear invalid JSON, not a
@@ -88,7 +91,7 @@ func (h *OpenAIProxyHandlers) serveDecisionRoute(ec echo.Context, endpointPath s
 // errors are marked so System One reports invalid_json rather than
 // invalid_request.
 func decisionBodyError(err error) error {
-	httpErr := echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	httpErr := echo.NewHTTPError(http.StatusBadRequest, requestDecodeMessage(err))
 	var typeErr *json.UnmarshalTypeError
 	if !errors.As(err, &typeErr) {
 		httpErr.SetInternal(fmt.Errorf("%w: %w", errInvalidJSON, err))

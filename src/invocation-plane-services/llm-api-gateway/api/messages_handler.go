@@ -47,14 +47,17 @@ func (h *MessagesHandlers) ServeMessages(ec echo.Context) error {
 	c := must.As[*GatewayContext](ec)
 	body, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
+	}
+	if err := requireJSONBody(c.Request(), body); err != nil {
+		return err
 	}
 	if err := rejectAmbiguousMembers(body, messagesRequest{}); err != nil {
 		return err
 	}
 	var request messagesRequest
 	if err := json.Unmarshal(body, &request); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return requestDecodeError(err)
 	}
 	if err := validateMessagesFieldNames(body); err != nil {
 		return err

@@ -203,7 +203,8 @@ func openAIErrorType(status int) string {
 
 func anthropicErrorType(status int) string {
 	switch status {
-	case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusUnprocessableEntity:
+	case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusRequestTimeout,
+		http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
 		return "invalid_request_error"
 	case http.StatusUnauthorized:
 		return "authentication_error"
