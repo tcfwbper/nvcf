@@ -20,17 +20,28 @@ fixture repository, one chart per rule.
 `TestChartImageCoverage` checks every tracked `Chart.yaml`. A chart either
 declares `thirdPartyImages` or `ownedImages` in its `values.yaml` and passes
 the chart image checks, or carries an entry in `chart-image-exclusions.yaml`.
-Charts do not choose an image source. For an indexed chart the test requires:
+The test first classifies each chart. A chart is stack-deployed when a
+released stack (one with `release-inventory.yaml`) declares a release of it,
+enabled or not, resolved as the stack image source check resolves releases.
+Every other chart is standalone. Classification runs `helmfile build`, so the
+chart test needs `helmfile` as well as `helm`. Use the `HELMFILE_VERSION`
+pinned in `.github/workflows/build-test.yml`. Findings name the class, such as
+`deploy/helm/x (standalone)`. For an indexed chart the test requires:
 
-- Every indexed image `registry` and `repository` in the chart `values.yaml` is
-  written as `""`, and a `repository` never contains a registry host. Tag and
-  digest may be prefilled.
+- Stack-deployed: every indexed image `registry` and `repository` in the chart
+  `values.yaml` is written as `""`, and a render with only the defaults fails
+  with an error that names an indexed `registry` or `repository` path.
+- Standalone: every indexed `registry` and `repository` holds a non-empty
+  default, so a plain `helm install` works. The defaults render is not
+  checked.
+- A `repository` never contains a registry host. Tag and digest may be
+  prefilled. The alternate source fields in `imageValueExceptions` stay empty
+  in both classes, so each image has one source.
 - The chart's own templates contain no literal registry host in an image
   reference and no `default` with a literal registry or repository.
-- A render with only the defaults fails with an error that names an indexed
-  `registry` or `repository` path. Emptying any indexed `registry` or
-  `repository` fails with an error that names its values path. Wrappers add
-  this guard for images that an upstream subchart renders.
+- Emptying any indexed `registry` or `repository` fails with an error that
+  names its values path. Wrappers add this guard for images that an upstream
+  subchart renders.
 - Every CI values scenario in `tools/ci/helm-chart-values.yaml` supplies
   `registry` and `repository` for every indexed image. Each scenario renders
   only indexed images, and ordinary overrides layered on it reach every image.
@@ -38,6 +49,13 @@ Charts do not choose an image source. For an indexed chart the test requires:
 The test downloads remote dependencies into test-owned directories. It does
 not create a cluster or verify registry publication. Keep the chart probe and
 override helpers test-only; installation uses native Helm values.
+
+A chart that only an unreleased development stack deploys is listed as
+`dev-only`. The entry fails when a released stack deploys the chart. Where the
+chart lives is not checked. CI cannot build a `dev-only` stack, so whether one
+deploys the chart is not verified. Never list a chart that users install
+directly as `dev-only`; it must pass the standalone checks instead. Review
+enforces this.
 
 A chart that declares an image index cannot be listed as `test-fixture` or
 `no-runtime-image`, so do not commit an indexed fixture chart. Build it in a
