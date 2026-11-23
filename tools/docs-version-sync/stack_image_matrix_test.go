@@ -12,12 +12,13 @@ import (
 func TestStackImageExclusionValidation(t *testing.T) {
 	tracked := trackedStacks{
 		files: map[string][]string{
-			"deploy/stacks/released": {"deploy/stacks/released/helmfile.d/01.yaml.gotmpl", "deploy/stacks/released/" + stackInventoryFile},
+			"deploy/stacks/released": {"deploy/stacks/released/helmfile.d/01.yaml.gotmpl"},
 			"deploy/stacks/dev":      {"deploy/stacks/dev/helmfile.yaml.gotmpl"},
 		},
 		stacks: []string{"deploy/stacks/dev", "deploy/stacks/released"},
 	}
 	stacks := map[string]bool{"deploy/stacks/dev": true, "deploy/stacks/released": true}
+	useStackReleaseStates(t, map[string][]string{"deploy/stacks/released/helmfile.d/01.yaml.gotmpl": nil})
 	for _, test := range []struct {
 		name, stack string
 		entry       imageExclusion
@@ -28,7 +29,7 @@ func TestStackImageExclusionValidation(t *testing.T) {
 		{"unknown reason", "deploy/stacks/dev", imageExclusion{Reason: "skip"}, "unknown reason"},
 		{"stale stack", "deploy/stacks/gone", imageExclusion{Reason: reasonPendingFix}, "no tracked Helmfile stack"},
 		{"issue on dev-only", "deploy/stacks/dev", imageExclusion{Reason: reasonDevOnly, Issue: "x"}, "issue is allowed only"},
-		{"dev-only with inventory", "deploy/stacks/released", imageExclusion{Reason: reasonDevOnly}, "so it is released"},
+		{"dev-only with release states", "deploy/stacks/released", imageExclusion{Reason: reasonDevOnly}, "so it is released"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateStackImageExclusion(test.stack, test.entry, tracked, stacks)

@@ -17,12 +17,36 @@ import (
 const (
 	stackImageExclusionsFile = "stack-image-exclusions.yaml"
 	stacksRoot               = "deploy/stacks"
-	stackInventoryFile       = "release-inventory.yaml"
 	stackBaseValuesFile      = "environments/base.yaml"
 )
 
+// stackReleaseStates maps each Helmfile state the release inventory renders
+// to its overrides. On this maintenance branch the release tooling keeps its
+// states in resolvedInventoryStates, not in a per-stack release-inventory.yaml,
+// so the gate reads them there. A stack with a state here is released.
+var stackReleaseStates = releaseInventoryStates()
+
+func releaseInventoryStates() map[string][]string {
+	states := make(map[string][]string, len(resolvedInventoryStates))
+	for _, state := range resolvedInventoryStates {
+		states[state.path] = append(append([]string{}, state.baseOverrides...), state.fullOverrides...)
+	}
+	return states
+}
+
+// releasedStack reports whether the release inventory renders a state of the
+// stack.
+func releasedStack(stack string) bool {
+	for state := range stackReleaseStates {
+		if strings.HasPrefix(state, stack+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // reasonDevOnly marks an unreleased development stack. It is skipped, and it
-// is eligible only while the stack has no release-inventory.yaml: a stack
+// is eligible only while the release inventory renders none of its states: a stack
 // that starts releasing must supply its image sources from base.yaml. For
 // example, stargate-dev reads one environment per region and supplies real
 // images from a protected values file outside the repository.
@@ -36,7 +60,7 @@ const (
 	// pending-fix stack is expected to produce.
 	findingImageSource = "image source"
 	// findingStackConfig: the stack cannot be checked as configured, such as
-	// a released stack without a release inventory, a state the inventory
+	// a released stack without release inventory states, a state the inventory
 	// does not render, or an included Helmfile outside deploy/stacks.
 	findingStackConfig = "stack configuration"
 )
@@ -70,6 +94,12 @@ var stackExtraStates = map[string][]string{
 // chart fails the run.
 var untrackedStackCharts = map[string]string{
 	"helm-nvcf-state-metrics": "chart source is not tracked in this repository",
+	// On this maintenance branch the observability stack installs these
+	// third-party charts from the NVCF chart repository, not from their public
+	// repositories.
+	"opentelemetry-operator":   "third-party chart installed from the NVCF chart repository on this branch",
+	"prometheus-operator-crds": "third-party chart installed from the NVCF chart repository on this branch",
+	"victoria-metrics-single":  "third-party chart installed from the NVCF chart repository on this branch",
 }
 
 const skippedUntrackedChart = "untracked chart"
@@ -137,8 +167,8 @@ func (t trackedStacks) hasFile(stack, name string) bool {
 //   - reason "skip": not in the enum, so nothing says how the stack is handled.
 //   - a directory that is not a tracked stack: the entry is stale.
 //   - issue on a dev-only entry: only pending work has a tracking issue.
-//   - dev-only for a stack with release-inventory.yaml: a released stack must
-//     be checked.
+//   - dev-only for a stack with release inventory states: a released stack
+//     must be checked.
 func validateStackImageExclusion(stack string, entry imageExclusion, tracked trackedStacks, stacks map[string]bool) error {
 	if !stackImageReasons[entry.Reason] {
 		return fmt.Errorf("unknown reason %q; use one of %s", entry.Reason, strings.Join(sortedKeys(stackImageReasons), ", "))
@@ -149,8 +179,8 @@ func validateStackImageExclusion(stack string, entry imageExclusion, tracked tra
 	if entry.Issue != "" && entry.Reason != reasonPendingFix {
 		return fmt.Errorf("issue is allowed only on %s entries", reasonPendingFix)
 	}
-	if entry.Reason == reasonDevOnly && tracked.hasFile(stack, stackInventoryFile) {
-		return fmt.Errorf("stack has %s, so it is released; remove the %s entry so the stack is checked", stackInventoryFile, reasonDevOnly)
+	if entry.Reason == reasonDevOnly && releasedStack(stack) {
+		return fmt.Errorf("stack has states in resolvedInventoryStates, so it is released; remove the %s entry so the stack is checked", reasonDevOnly)
 	}
 	return nil
 }
@@ -170,20 +200,17 @@ type stackRenderState struct {
 // release-time workaround for older published charts and would hide what the
 // stack itself supplies. Remove this note if renderValues goes away.
 func stackRenderStates(repoRoot, stack string, tracked trackedStacks, check *stackCheck) []stackRenderState {
-	if !tracked.hasFile(stack, stackInventoryFile) {
-		check.fail(findingStackConfig, "", "", "", "released stack has no "+stackInventoryFile,
+	if !releasedStack(stack) {
+		check.fail(findingStackConfig, "", "", "", "released stack has no release inventory states",
 			"a release inventory that lists the states the stack deploys",
-			"add "+stackInventoryFile+", or list the stack as "+reasonDevOnly+" in "+stackImageExclusionsFile)
-		return nil
-	}
-	config, err := loadResolvedInventoryConfig(repoRoot, filepath.Join(repoRoot, stack, stackInventoryFile))
-	if err != nil {
-		check.fail(findingStackConfig, "", "", "", err.Error(), "a valid "+stackInventoryFile, "correct "+stack+"/"+stackInventoryFile)
+			"add its states to resolvedInventoryStates, or list the stack as "+reasonDevOnly+" in "+stackImageExclusionsFile)
 		return nil
 	}
 	listed := make(map[string][]string)
-	for _, state := range config.States {
-		listed[state.Path] = append(append([]string{}, state.BaseOverrides...), state.FullOverrides...)
+	for state, overrides := range stackReleaseStates {
+		if strings.HasPrefix(state, stack+"/") {
+			listed[state] = overrides
+		}
 	}
 	for state, overrides := range stackExtraStates {
 		if strings.HasPrefix(state, stack+"/") {
@@ -195,7 +222,7 @@ func stackRenderStates(repoRoot, stack string, tracked trackedStacks, check *sta
 		overrides, ok := listed[state]
 		if !ok {
 			check.fail(findingStackConfig, "", "", state, "state is not rendered by the image source check",
-				"every state listed in "+stackInventoryFile, "list the state in "+stack+"/"+stackInventoryFile)
+				"every state listed in resolvedInventoryStates", "add the state to resolvedInventoryStates")
 			continue
 		}
 		states = append(states, stackRenderState{Path: state, Overrides: overrides})

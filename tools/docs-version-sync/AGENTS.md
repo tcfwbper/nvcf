@@ -50,7 +50,7 @@ Request. Image value shapes that differ from `registry`/`repository`/`tag`/
 
 `TestStackImageSources` checks every Helmfile stack under `deploy/stacks/`. A
 stack passes or carries an entry in `stack-image-exclusions.yaml`
-(`pending-fix`, or `dev-only` for a stack without `release-inventory.yaml`).
+(`pending-fix`, or `dev-only` for a stack with no release states).
 `TestStackImageSourcesReportsEachFailure` runs the same evaluation on a fixture
 repository, one stack per rule. For a stack the test requires:
 
@@ -65,12 +65,15 @@ repository, one stack per rule. For a stack the test requires:
   string or a `repository` with a registry host fails. A `tag` or `digest` set in `base.yaml` reaches a
   rendered image.
 
-The test renders each state that `release-inventory.yaml` lists, plus
+The test renders each state that `resolvedInventoryStates` in
+`resolved_inventory_publish.go` lists (this maintenance branch keeps release
+states there, not in a per-stack `release-inventory.yaml`), plus
 `stackExtraStates`, with a layered `probe` environment that sets a sentinel for
 every image value in `base.yaml`. Stack charts render from the tracked chart at
 HEAD; third-party charts are pulled from their public repositories. A chart
 whose source is not tracked is skipped only when listed in
-`untrackedStackCharts`. When a pending-fix stack is fixed, remove its entry in
+`untrackedStackCharts`. On this branch that includes the observability
+third-party charts, which install from the NVCF chart repository. When a pending-fix stack is fixed, remove its entry in
 the same Pull Request.
 
 ## Indirect images
