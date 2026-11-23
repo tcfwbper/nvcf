@@ -1320,3 +1320,30 @@ func TestModelVolumeController_NeverCapturesFromARestorePlaceholder(t *testing.T
 		t.Fatal("the primary was completed from a restore placeholder")
 	}
 }
+
+// A failed model download on an agent with no cache volume marks the
+// failure through a mount-holder on the model volume's own claim. The
+// holder path read the cache provisioner, which is nil there, and every
+// agent that saw the failed Job crashed. The holder here never runs (no
+// kubelet), so the call must come back with an error, not a panic, and
+// must have tried to mount the model volume's claim.
+func TestModelVolumeController_MarkFailedWithoutCacheVolume(t *testing.T) {
+	kc := fake.NewSimpleClientset()
+	p := &modelvolume.Provisioner{Kube: kc, Cfg: modelvolume.Config{Mode: modelvolume.ModeRWX, StorageClass: "fs", Size: resource.MustParse("4Ti")}}
+	sysNS := p.Cfg.SystemNamespace()
+	claim := p.Cfg.ClaimName(mvURI)
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claim, Namespace: sysNS, UID: "u1"}}
+	if _, err := kc.CoreV1().PersistentVolumeClaims(sysNS).Create(context.Background(), pvc, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c := &ModelVolumeController{Kube: kc, Provisioner: p, NodeName: "node-a", Log: logrus.New()}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := c.markFailedThroughHolder(ctx, mvURI, sysNS, claim, "download failed")
+	if err == nil {
+		t.Fatal("holder never runs here: want an error")
+	}
+	if !strings.Contains(err.Error(), "collect holder not running") {
+		t.Fatalf("want the holder wait to fail, got %v", err)
+	}
+}

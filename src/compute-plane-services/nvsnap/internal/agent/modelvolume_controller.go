@@ -490,7 +490,7 @@ func (c *ModelVolumeController) jobRanHere(ctx context.Context, job *batchv1.Job
 func (c *ModelVolumeController) markFailedThroughHolder(ctx context.Context, uri, sysNS, claim, reason string) error {
 	attach := c.collectAttach
 	if attach == nil {
-		attach = c.holderAttach
+		attach = c.holderAttach(c.Provisioner)
 	}
 	dst, release, err := attach(ctx, uri, sysNS, claim)
 	if err != nil {
@@ -1128,7 +1128,7 @@ func (c *ModelVolumeController) collectSet(ctx context.Context, uri, sysNS, clai
 	}
 	attach := c.collectAttach
 	if attach == nil {
-		attach = c.holderAttach
+		attach = c.holderAttach(c.Cache)
 	}
 	dst, release, err := attach(ctx, uri, sysNS, claim)
 	if err != nil {
@@ -1169,10 +1169,19 @@ func (c *ModelVolumeController) collectSet(ctx context.Context, uri, sysNS, clai
 	return c.Cache.ClearFailure(ctx, uri)
 }
 
-// holderAttach attaches the set claim through a mount-holder on this node
-// and waits for the detach on release, so the volume can be attached
-// read-only elsewhere afterwards.
-func (c *ModelVolumeController) holderAttach(ctx context.Context, uri, sysNS, claim string) (string, func(context.Context) error, error) {
+// holderAttach returns an attach that mounts a claim of p through a
+// mount-holder on this node and waits for the detach on release, so the
+// volume can be attached read-only elsewhere afterwards. p is the
+// provisioner that owns the claim: c.Provisioner for a model volume,
+// c.Cache for a compile-cache set. c.Cache is nil on an agent with no
+// cache volume, and a failed model download goes through here.
+func (c *ModelVolumeController) holderAttach(p *modelvolume.Provisioner) func(context.Context, string, string, string) (string, func(context.Context) error, error) {
+	return func(ctx context.Context, uri, sysNS, claim string) (string, func(context.Context) error, error) {
+		return c.holderAttachWith(ctx, p, uri, sysNS, claim)
+	}
+}
+
+func (c *ModelVolumeController) holderAttachWith(ctx context.Context, p *modelvolume.Provisioner, uri, sysNS, claim string) (string, func(context.Context) error, error) {
 	pvc, err := c.Kube.CoreV1().PersistentVolumeClaims(sysNS).Get(ctx, claim, metav1.GetOptions{})
 	if err != nil {
 		return "", nil, fmt.Errorf("get claim %s/%s: %w", sysNS, claim, err)
@@ -1181,7 +1190,7 @@ func (c *ModelVolumeController) holderAttach(ctx context.Context, uri, sysNS, cl
 	if entry == nil {
 		entry = logrus.NewEntry(logrus.New())
 	}
-	name := "nvsnap-cache-collect-" + modelvolume.Key(uri) + strings.TrimPrefix(claim, c.Cache.Cfg.ClaimName(uri)) + "-" + shortNode(c.NodeName)
+	name := "nvsnap-cache-collect-" + modelvolume.Key(uri) + strings.TrimPrefix(claim, p.Cfg.ClaimName(uri)) + "-" + shortNode(c.NodeName)
 	h := checkpointstore.NewMountHolder(c.Kube, entry, sysNS, name, c.NodeName, claim, pvc.UID, c.HolderImage, c.HostFSRoot, c.HolderPullSecrets)
 	if err := h.Create(ctx); err != nil {
 		return "", nil, fmt.Errorf("create collect holder: %w", err)
@@ -1192,7 +1201,7 @@ func (c *ModelVolumeController) holderAttach(ctx context.Context, uri, sysNS, cl
 		}
 		deadline := time.Now().Add(stagingDetachTimeout)
 		for {
-			detached, err := c.Cache.Detached(rctx, pvc.Spec.VolumeName)
+			detached, err := p.Detached(rctx, pvc.Spec.VolumeName)
 			if err != nil || detached || time.Now().After(deadline) {
 				return err
 			}
