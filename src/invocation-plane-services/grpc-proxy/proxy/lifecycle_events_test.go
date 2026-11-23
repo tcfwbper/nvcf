@@ -403,6 +403,12 @@ func newWatchingDirector(t *testing.T, publisher *eventledger.Publisher) (*Strea
 // leave.
 func attachThenLeave(t *testing.T, director *StreamDirector) *worker.WorkerConnection {
 	t.Helper()
+	return attachThenClose(t, director, "")
+}
+
+// attachThenClose is attachThenLeave, with origin as the side that closed first.
+func attachThenClose(t *testing.T, director *StreamDirector, origin string) *worker.WorkerConnection {
+	t.Helper()
 	client, _ := net.Pipe()
 	tracking := worker.NewConnectionTrackingConn(client)
 	wc, err := director.getAndInitWorkerConnection(t.Context(), tracking, "client-auth", testFunctionId, "", nil)
@@ -410,8 +416,36 @@ func attachThenLeave(t *testing.T, director *StreamDirector) *worker.WorkerConne
 	info := director.workerAuth.Get(testWorkerToken).Value()
 	workerLink, _ := net.Pipe()
 	require.NoError(t, director.RegisterWorker(t.Context(), testWorkerToken, info, workerLink))
+	if origin != "" {
+		wc.SetCloseOrigin(origin)
+	}
 	require.NoError(t, tracking.Close())
 	return wc
+}
+
+func TestSessionEndWatchedWhenTheWorkerLeavesFirst(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	wc := attachThenClose(t, director, metrics.CloseReasonWorkerClosed)
+
+	require.Eventually(t, func() bool { return invoker.lookups.Load() > 0 }, 5*time.Second, time.Millisecond)
+	invoker.resumable.Store(false)
+	require.Eventually(t, func() bool {
+		return len(ofType(received(), eventTypeSessionEnded)) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	publisher.Close()
+
+	closed := single(t, received(), eventTypeAttachmentClosed)
+	assert.Equal(t, metrics.CloseReasonWorkerClosed, closed["data"].(map[string]any)["cause"])
+	assert.Equal(t, wc.RequestId.String(), single(t, received(), eventTypeSessionEnded)["resourceid"])
+}
+
+func TestSessionEndNotWatchedAfterShutdown(t *testing.T) {
+	publisher, _ := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	attachThenClose(t, director, metrics.CloseReasonShutdown)
+	assert.Never(t, func() bool { return invoker.lookups.Load() > 0 }, 100*time.Millisecond, 5*time.Millisecond)
+	publisher.Close()
 }
 
 func TestSessionEndedOnceTheSessionCannotBeRejoined(t *testing.T) {

@@ -339,7 +339,9 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 
 		if event, ok := attachmentEndEvent(wc, reasonStr, closedAt, heldFor, closeInfo.Code); ok && director != nil {
 			director.eventLedger.Publish(ctx, event)
-			if reasonStr == metrics.CloseReasonClientClosed {
+			// Either side can leave first. The registration says if the
+			// session is over.
+			if reasonStr == metrics.CloseReasonClientClosed || reasonStr == metrics.CloseReasonWorkerClosed {
 				director.watchSessionEnd(wc)
 			}
 		}
