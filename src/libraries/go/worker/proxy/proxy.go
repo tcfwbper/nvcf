@@ -205,7 +205,18 @@ func (p *HttpProxy) Proxy(ctx context.Context, work *pb.WorkerInvokeFunctionRequ
 	// start looking for reconnects asap, but we don't want to block on ack of first publish as
 	// that could penalise users not using reconnects. may need to revisit if the registration
 	// doesn't make it in time.
-	go p.keepaliveReconnectRegistration(ctx, work, trackingRegion)
+	registrationDone := make(chan struct{})
+	go func() {
+		defer close(registrationDone)
+		p.keepaliveReconnectRegistration(ctx, work, trackingRegion)
+	}()
+	// Remove the registration before returning: the proxy treats a missing
+	// registration as the end of the session, and our caller may close NATS
+	// right after we return.
+	defer func() {
+		cancel()
+		<-registrationDone
+	}()
 
 	clientConn, err := getClientConnFromProxy(ctx, work, p.h3)
 	if err != nil {
@@ -265,9 +276,16 @@ func (p *HttpProxy) Proxy(ctx context.Context, work *pb.WorkerInvokeFunctionRequ
 			}
 			var work pb.WorkerInvokeFunctionRequest
 			err = proto.Unmarshal(msg.Data, &work)
+			if err == nil && work.StatefulConfig == nil {
+				err = errors.New("no stateful config")
+			}
 			if err != nil {
 				zap.L().Warn("malformed stateful session reconnect message", zap.String("req id", work.RequestId), zap.Error(err))
 				continue
+			}
+			// Let a proxy that asks for an answer know a worker is still here.
+			if msg.Reply != "" {
+				_ = msg.Respond(nil)
 			}
 			wg.Add(1)
 			go func() {
@@ -315,19 +333,29 @@ func (p *HttpProxy) keepaliveReconnectRegistration(ctx context.Context, work *pb
 			if err != nil {
 				return err
 			}
-			_, err = p.js.Publish(ctx, subject, body)
+			// Not cancelled with ctx: a publish that was already sent must be
+			// acked before the purge below, or the server can store it after.
+			pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_, err = p.js.Publish(pubCtx, subject, body)
 			return err
 		}, backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(0)), ctx))
 		utils.SleepWithContext(ctx, 20*time.Minute)
 	}
-	go func() {
+	p.removeReconnectRegistration(streamName, subject, work.RequestId)
+}
+
+func (p *HttpProxy) removeReconnectRegistration(streamName, subject, requestId string) {
+	err := backoff.Retry(func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		err := PurgeFromStream(ctx, p.nc, streamName, jetstream.WithPurgeSubject(subject))
-		if err != nil {
-			zap.L().Warn("failed to purge stateful session reconnect registration", zap.Error(err))
-		}
-	}()
+		return PurgeFromStream(ctx, p.nc, streamName, jetstream.WithPurgeSubject(subject))
+	}, backoff.WithMaxRetries(backoff.NewConstantBackOff(time.Second), 2))
+	if err != nil {
+		zap.L().Warn("failed to remove stateful session reconnect registration", zap.String("req id", requestId), zap.Error(err))
+		return
+	}
+	zap.L().Info("removed stateful session reconnect registration", zap.String("req id", requestId))
 }
 
 // PurgeFromStream manually purges from a stream without having to first look up the stream
@@ -343,8 +371,20 @@ func PurgeFromStream(ctx context.Context, nc *nats.Conn, name string, opts ...je
 		return err
 	}
 	purgeSubject := jetstream.DefaultAPIPrefix + "STREAM.PURGE." + name
-	_, err = nc.RequestWithContext(ctx, purgeSubject, req)
-	return err
+	msg, err := nc.RequestWithContext(ctx, purgeSubject, req)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Error *jetstream.APIError `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return fmt.Errorf("decoding stream purge response: %w", err)
+	}
+	if resp.Error != nil {
+		return resp.Error
+	}
+	return nil
 }
 
 func getClientConnFromProxy(ctx context.Context, work *pb.WorkerInvokeFunctionRequest, h3 *h3ConnectionCache) (net.Conn, error) {

@@ -64,6 +64,7 @@ go_test(
         "h3_rotate_test.go",
         "proxy_e2e_test.go",
         "proxy_extra_test.go",
+        "proxy_purge_test.go",
         "proxy_test.go",
         "proxy_tls_test.go",
     ],
