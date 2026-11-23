@@ -17,7 +17,7 @@
 #                Helmfile outside deploy/stacks still fails CI. Once the stack
 #                passes, CI fails until this entry is removed.
 #   dev-only     An unreleased development stack, skipped. Allowed only while
-#                the stack has no release-inventory.yaml.
+#                resolvedInventoryStates lists none of its states.
 #
 # issue (optional, pending-fix only): a free-form note, such as a tracking
 # link. It is not validated. This file is public, so keep private tracker IDs
@@ -27,8 +27,3 @@
 deploy/stacks/nvcf-compute-plane: {reason: pending-fix}
 deploy/stacks/observability: {reason: pending-fix}
 deploy/stacks/self-managed: {reason: pending-fix}
-
-# dev-only
-# stargate-dev reads one environment per region and takes real images from a
-# protected values file outside the repository.
-deploy/stacks/stargate-dev: {reason: dev-only}

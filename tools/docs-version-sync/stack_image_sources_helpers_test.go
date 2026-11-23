@@ -464,7 +464,13 @@ func checkRenderedRelease(release renderedRelease, sentinels probeSentinels, fin
 	}
 	images, err := extractResolvedImages(release.Snapshot.Manifest)
 	if err != nil {
-		findings.record(release.Stack, failureKey(release.Name, "images"), imageGateFinding{Category: findingRenderError,
+		category := findingRenderError
+		// An image rendered without a repository takes none from base.yaml,
+		// as when the stack supplies no source to a chart without a guard.
+		if strings.Contains(err.Error(), "has no repository") {
+			category = findingImageSource
+		}
+		findings.record(release.Stack, failureKey(release.Name, "images"), imageGateFinding{Category: category,
 			Release: release.Name, Problem: err.Error(), Expected: "resolvable rendered images", Fix: fixStackSource})
 		return nil
 	}

@@ -6,9 +6,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestStackImageSources requires every Helmfile stack to take each image
@@ -91,13 +94,51 @@ func fixtureRelease(name, chart, image string) string {
 		"    values:\n      - image:\n          " + image
 }
 
+// fixtureInventoryFile declares the release states of a fixture stack. This
+// maintenance branch keeps release states in resolvedInventoryStates, so
+// fixtureReleaseStates reads these files in its place.
+const fixtureInventoryFile = "release-inventory.yaml"
+
+// useStackReleaseStates replaces the release inventory states for one test.
+func useStackReleaseStates(t *testing.T, states map[string][]string) {
+	t.Helper()
+	previous := stackReleaseStates
+	stackReleaseStates = states
+	t.Cleanup(func() { stackReleaseStates = previous })
+}
+
+// fixtureReleaseStates collects the states every fixture inventory lists.
+func fixtureReleaseStates(t *testing.T, files map[string]string) map[string][]string {
+	t.Helper()
+	states := make(map[string][]string)
+	for name, content := range files {
+		if path.Base(name) != fixtureInventoryFile {
+			continue
+		}
+		var inventory struct {
+			States []struct {
+				Path          string   `yaml:"path"`
+				BaseOverrides []string `yaml:"baseOverrides"`
+				FullOverrides []string `yaml:"fullOverrides"`
+			} `yaml:"states"`
+		}
+		if err := yaml.Unmarshal([]byte(content), &inventory); err != nil {
+			t.Fatalf("parse fixture inventory %s: %v", name, err)
+		}
+		for _, state := range inventory.States {
+			states[state.Path] = append(append([]string{}, state.BaseOverrides...), state.FullOverrides...)
+		}
+	}
+	return states
+}
+
 // fixtureStack returns the files of a released stack with one state.
 func fixtureStack(name, base, state string) map[string]string {
 	dir := "deploy/stacks/" + name + "/"
 	return map[string]string{
 		dir + "environments/base.yaml":    base,
 		dir + "helmfile.d/01.yaml.gotmpl": fixtureStateHeader + state,
-		dir + stackInventoryFile:          "schemaVersion: 1\nstates:\n  - {plane: control-plane, path: " + dir + "helmfile.d/01.yaml.gotmpl}\npublishedChartRepository: https://charts.example.invalid\n",
+		dir + fixtureInventoryFile:        "schemaVersion: 1\nstates:\n  - {plane: control-plane, path: " + dir + "helmfile.d/01.yaml.gotmpl}\npublishedChartRepository: https://charts.example.invalid\n",
 	}
 }
 
@@ -174,6 +215,9 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		fixtureStack("not-installed", fixtureBase, sourced+"  - name: skipped\n    namespace: skipped\n    chart: nvcf/helm-broken\n    version: 0.1.0\n    installed: false\n"),
 		// The release renders an extra image only in its own namespace.
 		fixtureStack("namespace-workload", fixtureBase, fixtureRelease("workers", "helm-workers", fixtureSourcedValues)),
+		// The stack sets no source and the chart has no guard, so the image
+		// renders without a repository.
+		fixtureStack("no-repository", fixtureBase, fixtureRelease("app", "helm-defaulted", "{registry: \"\", repository: \"\", tag: v1}\n")),
 		// The index names the values path of a prefilled image.
 		fixtureStack("indexed-default", "app: {}\n", fixtureRelease("app", "helm-indexed", "{}\n")),
 		// Parent and included stack both declare global.image with a tag;
@@ -227,19 +271,15 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		files[name] = content
 	}
 	files["deploy/stacks/unlisted-state/helmfile.d/02.yaml.gotmpl"] = fixtureStateHeader + "releases: []\n"
-	// stale-state lists a state that is not tracked; bad-inventory has an
-	// inventory the release tooling rejects.
+	// stale-state lists a state that is not tracked.
 	for name, content := range fixtureStack("stale-state", fixtureBase, sourced) {
 		files[name] = content
 	}
-	files["deploy/stacks/stale-state/"+stackInventoryFile] = "schemaVersion: 1\nstates:\n" +
+	files["deploy/stacks/stale-state/"+fixtureInventoryFile] = "schemaVersion: 1\nstates:\n" +
 		"  - {plane: control-plane, path: deploy/stacks/stale-state/helmfile.d/01.yaml.gotmpl}\n" +
 		"  - {plane: control-plane, path: deploy/stacks/stale-state/helmfile.d/09.yaml.gotmpl}\n" +
 		"publishedChartRepository: https://charts.example.invalid\n"
-	for name, content := range fixtureStack("bad-inventory", fixtureBase, sourced) {
-		files[name] = content
-	}
-	files["deploy/stacks/bad-inventory/"+stackInventoryFile] = "schemaVersion: 2\n"
+	useStackReleaseStates(t, fixtureReleaseStates(t, files))
 	root := writeChartFixtureTree(t, files)
 	for _, args := range [][]string{{"init", "-q"}, {"add", "."}} {
 		if _, err := imageCatalogCommand("git", append([]string{"-C", root}, args...)...); err != nil {
@@ -277,16 +317,16 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		"deploy/stacks/parent-of-dev":        {findingImageSource, "image does not take its registry and repository from base.yaml through included stack deploy/stacks/dev-child"},
 		"deploy/stacks/digest-swallowed":     {findingImageSource, "app.image.digest: digest set in base.yaml does not reach its rendered image"},
 		"deploy/stacks/stale-state":          {findingStackConfig, "helmfile.d/09.yaml.gotmpl: listed state is not a tracked Helmfile state"},
-		"deploy/stacks/bad-inventory":        {findingStackConfig, "schemaVersion is 2"},
-		"deploy/stacks/pending-no-base":      {findingStackConfig, "released stack has no release-inventory.yaml"},
+		"deploy/stacks/pending-no-base":      {findingStackConfig, "released stack has no release inventory states"},
 		"deploy/stacks/set-override":         {findingImageSource, "image does not take its registry and repository from base.yaml"},
 		"deploy/stacks/namespace-workload":   {findingImageSource, "docker.io/team/worker:v1"},
+		"deploy/stacks/no-repository":        {findingImageSource, `image reference "/:v1" has no repository`},
 		"deploy/stacks/indexed-default":      {findingImageSource, "server.image: image does not take its registry and repository"},
 		"deploy/stacks/pending-passing":      {findingPendingFixed, "stack now passes image sources"},
 		"deploy/stacks/pending-render":       {findingRenderError, "unrelated template error"},
 		"deploy/stacks/dev-released":         {findingInvalidEntry, "so it is released"},
 		"deploy/stacks/gone":                 {findingInvalidEntry, "no tracked Helmfile stack"},
-		"deploy/stacks/no-inventory":         {findingStackConfig, "released stack has no release-inventory.yaml"},
+		"deploy/stacks/no-inventory":         {findingStackConfig, "released stack has no release inventory states"},
 		"deploy/stacks/unlisted-state":       {findingStackConfig, "helmfile.d/02.yaml.gotmpl: state is not rendered"},
 	}
 	for stack, expectation := range want {
