@@ -38,8 +38,58 @@ func TestChartSourcesRequireEmptyWrittenFields(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			check := &chartCheck{chart: "c"}
+			check := &chartCheck{chart: "c", class: classStackDeployed}
 			check.checkChartSources(values, catalog)
+			if test.problem == "" {
+				if len(check.findings) != 0 {
+					t.Fatalf("unexpected findings %+v", check.findings)
+				}
+				return
+			}
+			if len(check.findings) != 1 || check.findings[0].ValuesPath != test.path ||
+				check.findings[0].Category != findingCoverage || !strings.Contains(check.findings[0].Problem, test.problem) {
+				t.Fatalf("findings %+v, want one at %s containing %q", check.findings, test.path, test.problem)
+			}
+		})
+	}
+}
+
+// TestStandaloneChartSourcesRequirePrefilledFields covers the static source
+// rules for a chart no released stack deploys: its values.yaml is the
+// outermost configuration, so registry and repository must hold a working
+// default, while the exception rows' alternate source fields stay empty so
+// each image keeps one source.
+func TestStandaloneChartSourcesRequirePrefilledFields(t *testing.T) {
+	for _, test := range []struct {
+		name, values, path, problem string
+	}{
+		{"prefilled registry and repository", "ownedImages: {server: server.image}\nserver:\n  image: {registry: r.example, repository: team/server, tag: v1}\n", "", ""},
+		{"empty registry", "ownedImages: {server: server.image}\nserver:\n  image: {registry: \"\", repository: team/server}\n", "server.image.registry", "standalone chart leaves image source empty"},
+		{"repository not written", "ownedImages: {server: server.image}\nserver:\n  image: {registry: r.example}\n", "server.image.repository", "standalone chart leaves image source empty"},
+		{"repository with a host", "ownedImages: {server: server.image}\nserver:\n  image: {registry: r.example, repository: docker.io/team/server}\n", "server.image.repository", "contains registry host docker.io"},
+		// fullImageName would replace registry and repository, so a mirror
+		// override of registry would silently have no effect.
+		{"nats fullImageName prefilled", "thirdPartyImages: {box: nats.box.image}\nnats:\n  global: {image: {registry: \"\"}}\n  box:\n    image: {registry: r.example, repository: box, fullImageName: r.example/box:1}\n", "nats.box.image.fullImageName", "prefilled"},
+		{"nats global registry prefilled", "thirdPartyImages: {box: nats.box.image}\nnats:\n  global: {image: {registry: r.example}}\n  box:\n    image: {registry: r.example, repository: box, fullImageName: \"\"}\n", "nats.global.image.registry", `prefilled image source "r.example"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var values map[string]any
+			if err := yaml.Unmarshal([]byte(test.values), &values); err != nil {
+				t.Fatal(err)
+			}
+			catalog, err := readImageIndex(values, map[string]string{"nats": "nats"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check := &chartCheck{chart: "c", class: classStandalone}
+			check.checkChartSources(values, catalog)
+			// No stack supplies a standalone chart's source, so no fix may
+			// point the owner at one.
+			for _, finding := range check.findings {
+				if finding.Fix == fixImplicitSource {
+					t.Errorf("standalone fix points at a stack: %q", finding.Fix)
+				}
+			}
 			if test.problem == "" {
 				if len(check.findings) != 0 {
 					t.Fatalf("unexpected findings %+v", check.findings)
@@ -62,7 +112,7 @@ func TestChartSourcesRejectMissingIndexPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	check := &chartCheck{chart: "c"}
+	check := &chartCheck{chart: "c", class: classStackDeployed}
 	check.checkChartSources(values, catalog)
 	findings, expected := chartImageGate.pendingFixOutcome(check.chart, check.findings, imageExclusion{Reason: reasonPendingFix}, findingCoverage)
 	if expected != "" || len(findings) != 1 || findings[0].Category != findingInvalidEntry {

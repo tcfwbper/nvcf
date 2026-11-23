@@ -308,6 +308,30 @@ func findBuiltRelease(documents []builtState, release helmfileRelease) (*builtSt
 // dependencies in the same CI job. A network failure surfaces as a render
 // error and fails the run.
 func (w *stackWorkspace) resolveChart(document builtState, chart, version string) (string, bool, error) {
+	location, err := w.locateChart(document, chart)
+	if err != nil {
+		return "", false, err
+	}
+	if location.Tracked != "" {
+		directory, err := prepareImageChart(filepath.Join(w.repoRoot, location.Tracked), w.workspace())
+		return directory, true, err
+	}
+	pulled, err := pullChart(*location.Repository, location.Name, version, w.workspace())
+	return pulled, false, err
+}
+
+// chartLocation is where a release's chart comes from: a tracked chart
+// directory, or a third-party chart in Repository.
+type chartLocation struct {
+	// Tracked is the chart directory relative to the repository root.
+	Tracked    string
+	Repository *helmfileRepository
+	Name       string
+}
+
+// locateChart finds a release's chart without preparing or pulling it. A
+// chart listed in untrackedStackCharts returns an untrackedChartError.
+func (w *stackWorkspace) locateChart(document builtState, chart string) (chartLocation, error) {
 	if strings.HasPrefix(chart, ".") || filepath.IsAbs(chart) {
 		absolute := chart
 		if !filepath.IsAbs(chart) {
@@ -315,14 +339,13 @@ func (w *stackWorkspace) resolveChart(document builtState, chart, version string
 		}
 		relative, err := filepath.Rel(w.copyRoot, absolute)
 		if err != nil || strings.HasPrefix(relative, "..") {
-			return "", false, fmt.Errorf("chart %s is outside the repository", chart)
+			return chartLocation{}, fmt.Errorf("chart %s is outside the repository", chart)
 		}
-		directory, err := prepareImageChart(filepath.Join(w.repoRoot, relative), w.workspace())
-		return directory, true, err
+		return chartLocation{Tracked: filepath.ToSlash(relative)}, nil
 	}
 	alias, name, found := strings.Cut(chart, "/")
 	if !found {
-		return "", false, fmt.Errorf("chart %s names no repository", chart)
+		return chartLocation{}, fmt.Errorf("chart %s names no repository", chart)
 	}
 	var repository *helmfileRepository
 	for index := range document.Repositories {
@@ -331,23 +354,21 @@ func (w *stackWorkspace) resolveChart(document builtState, chart, version string
 		}
 	}
 	if repository == nil {
-		return "", false, fmt.Errorf("chart %s uses undeclared repository %s", chart, alias)
+		return chartLocation{}, fmt.Errorf("chart %s uses undeclared repository %s", chart, alias)
 	}
 	if repository.URL == probeChartRepositoryURL {
 		directory, ok := w.charts[name]
 		switch {
 		case !ok && untrackedStackCharts[name] != "":
-			return "", false, untrackedChartError(name)
+			return chartLocation{}, untrackedChartError(name)
 		case !ok:
-			return "", false, fmt.Errorf("chart %s matches no tracked Chart.yaml name", chart)
+			return chartLocation{}, fmt.Errorf("chart %s matches no tracked Chart.yaml name", chart)
 		case directory == "":
-			return "", false, fmt.Errorf("chart %s matches several tracked Chart.yaml names", chart)
+			return chartLocation{}, fmt.Errorf("chart %s matches several tracked Chart.yaml names", chart)
 		}
-		prepared, err := prepareImageChart(filepath.Join(w.repoRoot, directory), w.workspace())
-		return prepared, true, err
+		return chartLocation{Tracked: directory}, nil
 	}
-	pulled, err := pullChart(*repository, name, version, w.workspace())
-	return pulled, false, err
+	return chartLocation{Repository: repository, Name: name}, nil
 }
 
 // untrackedChartError names a chart listed in untrackedStackCharts.

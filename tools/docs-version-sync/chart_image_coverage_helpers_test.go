@@ -27,7 +27,7 @@ const (
 	findingCoverage = "coverage"
 )
 
-var findingCategories = []string{findingUncovered, findingPendingFixed, findingInvalidEntry, findingRenderError, findingScenario, findingCoverage}
+var findingCategories = []string{findingUncovered, findingPendingFixed, findingInvalidEntry, findingRenderError, findingStackConfig, findingScenario, findingCoverage}
 
 // chartImageGate names the chart coverage matrix in its report and its
 // pending-fix messages.

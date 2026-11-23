@@ -41,7 +41,9 @@ func TestChartImageExclusionValidation(t *testing.T) {
 		"orphan/charts/sub/Chart.yaml":   fixtureChart,
 		"plain/Chart.yaml":               fixtureChart,
 	})
-	charts := map[string]bool{"parent": true, "parent/charts/sub": true, "parent/charts/loose": true, "orphan/charts/sub": true, "plain": true}
+	charts := map[string]bool{"parent": true, "parent/charts/sub": true, "parent/charts/loose": true, "orphan/charts/sub": true, "plain": true,
+		"tools/dev": true, "tools/shared": true}
+	stacks := chartStacks{deployedBy: map[string][]string{"tools/shared": {"deploy/stacks/a", "deploy/stacks/b"}}}
 	issue := "https://github.com/dsx-ai-factory/nvcf/issues/3185"
 	for _, test := range []struct {
 		name    string
@@ -65,9 +67,15 @@ func TestChartImageExclusionValidation(t *testing.T) {
 		{name: "subchart not declared as a dependency", chart: "parent/charts/loose", entry: imageExclusion{Reason: reasonVendoredSubchart}},
 		{name: "charts directory without a parent chart", chart: "orphan/charts/sub", entry: imageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart; check as a standalone chart"},
 		{name: "standalone chart as subchart", chart: "plain", entry: imageExclusion{Reason: reasonVendoredSubchart}, want: "not a subchart"},
+		// dev-only does not depend on where the chart lives.
+		{name: "dev-only chart no released stack deploys", chart: "tools/dev", entry: imageExclusion{Reason: reasonDevOnly}},
+		{name: "indexed dev-only chart", chart: "tools/dev", entry: imageExclusion{Reason: reasonDevOnly}, indexed: true},
+		{name: "dev-only chart released stacks deploy", chart: "tools/shared", entry: imageExclusion{Reason: reasonDevOnly},
+			want: "chart is deployed by released stacks deploy/stacks/a, deploy/stacks/b"},
+		{name: "issue on dev-only", chart: "tools/dev", entry: imageExclusion{Reason: reasonDevOnly, Issue: issue}, want: "issue is allowed only on pending-fix"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateChartImageExclusion(root, test.chart, test.entry, charts, test.indexed)
+			err := validateChartImageExclusion(root, test.chart, test.entry, charts, test.indexed, stacks)
 			if test.want == "" {
 				if err != nil {
 					t.Fatalf("rejected valid entry: %v", err)

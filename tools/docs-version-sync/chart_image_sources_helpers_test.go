@@ -16,17 +16,30 @@ import (
 
 const fixImplicitSource = "remove the source from the chart; the stack base.yaml or a values file supplies it"
 
-// checkChartSources requires every image source field in the chart's own
-// values.yaml to be written as an empty string: registry and repository of
-// each indexed image, plus the source fields its image value exception adds.
-// Omitting a field is not enough, because a subchart default then supplies
-// the source (the vendored cert-manager chart defaults imageRegistry to
-// quay.io); an empty string overrides it.
+// implicitSourceFix is the fix for an implicit source: a stack-deployed chart
+// takes its source from the stack, a standalone chart from its own prefilled
+// registry and repository values.
+func (c *chartCheck) implicitSourceFix() string {
+	if c.class == classStandalone {
+		return "remove the source from the chart; the prefilled registry and repository in values.yaml supply it"
+	}
+	return fixImplicitSource
+}
+
+// checkChartSources checks every image source field in the chart's own
+// values.yaml: registry and repository of each indexed image, plus the
+// source fields its image value exception adds. A stack-deployed chart writes
+// each as an empty string; omitting a field is not enough, because a
+// subchart default then supplies the source (the vendored cert-manager chart
+// defaults imageRegistry to quay.io), and an empty string overrides it. A
+// standalone chart prefills registry and repository and still leaves the
+// exception fields empty. checkSourceField holds the per-class examples.
 //
-//	{registry: "", repository: "", tag: v1}       passes
-//	{registry: docker.io, repository: "", ...}    fails: prefilled source
-//	{registry: "", repository: docker.io/x, ...}  fails: registry host in repository
-//	{repository: "", tag: v1}                     fails: registry not written
+//	stack-deployed {registry: "", repository: "", tag: v1}       passes
+//	stack-deployed {registry: docker.io, repository: "", ...}    fails: prefilled source
+//	stack-deployed {repository: "", tag: v1}                     fails: registry not written
+//	standalone     {registry: nvcr.io, repository: team/x, ...}  passes
+//	either         {registry: "", repository: docker.io/x, ...}  fails: registry host in repository
 func (c *chartCheck) checkChartSources(values map[string]any, catalog []catalogImage) {
 	chartFields := make(map[string]bool)
 	for _, image := range catalog {
@@ -37,8 +50,11 @@ func (c *chartCheck) checkChartSources(values map[string]any, catalog []catalogI
 				"write the image object, with empty registry and repository, at the indexed path")
 			continue
 		}
-		for _, field := range append(append([]string{}, imageSourceFields...), image.Exception.imageSourceFields...) {
-			c.checkSourceField(image.ID, image.Path+"."+field, node, field)
+		for _, field := range imageSourceFields {
+			c.checkSourceField(image.ID, image.Path+"."+field, node, field, c.class == classStandalone)
+		}
+		for _, field := range image.Exception.imageSourceFields {
+			c.checkSourceField(image.ID, image.Path+"."+field, node, field, false)
 		}
 		root, _, _ := strings.Cut(image.Path, ".")
 		for _, field := range image.Exception.chartSourceFields {
@@ -49,23 +65,41 @@ func (c *chartCheck) checkChartSources(values map[string]any, catalog []catalogI
 		separator := strings.LastIndex(path, ".")
 		// A missing parent is a nil map: the field reads as not written.
 		parent, _ := imageCatalogValue(values, path[:separator])
-		c.checkSourceField("", path, parent, path[separator+1:])
+		c.checkSourceField("", path, parent, path[separator+1:], false)
 	}
 }
 
-func (c *chartCheck) checkSourceField(id, path string, node map[string]any, field string) {
+// checkSourceField checks one source field of the chart's own values.yaml.
+// With prefill, the field must hold a working default, as a standalone
+// chart's registry and repository do; otherwise it must be written empty so
+// the stack supplies it. Either way a repository never carries a host.
+//
+//	stack-deployed  registry: ""         passes
+//	stack-deployed  registry: nvcr.io    fails: the stack's base.yaml supplies it
+//	standalone      registry: nvcr.io    passes
+//	standalone      registry: ""         fails: a plain helm install has no source
+//	either          repository: docker.io/team/x   fails: host belongs in registry
+func (c *chartCheck) checkSourceField(id, path string, node map[string]any, field string, prefill bool) {
 	value, written := node[field].(string)
 	host, hasHost := imageReferenceHost(value)
 	switch {
+	case field == "repository" && hasHost:
+		expected, fix := `""`, c.implicitSourceFix()
+		if prefill {
+			expected, fix = "a repository without a registry host", "move the registry host into the sibling registry value"
+		}
+		c.fail(findingCoverage, id, path, fmt.Sprintf("repository %q contains registry host %s", value, host), expected, fix)
+	case prefill && value == "":
+		c.fail(findingCoverage, id, path, "standalone chart leaves image source empty; a plain helm install has no source",
+			"a non-empty default", fmt.Sprintf("prefill %s in values.yaml with the default image source", path))
+	case prefill:
+		// A prefilled standalone source is the working default.
 	case !written:
 		c.fail(findingCoverage, id, path, "image source field not written; a subchart or template default can supply it",
 			`""`, fmt.Sprintf(`write %s: "" in values.yaml`, path))
 	case value == "":
-	case field == "repository" && hasHost:
-		c.fail(findingCoverage, id, path, fmt.Sprintf("repository %q contains registry host %s", value, host),
-			`""`, fixImplicitSource)
 	default:
-		c.fail(findingCoverage, id, path, fmt.Sprintf("prefilled image source %q", value), `""`, fixImplicitSource)
+		c.fail(findingCoverage, id, path, fmt.Sprintf("prefilled image source %q", value), `""`, c.implicitSourceFix())
 	}
 }
 
@@ -123,7 +157,7 @@ func (c *chartCheck) checkTemplateSources(chart string) {
 		relative, _ := filepath.Rel(chart, file)
 		for _, source := range implicitTemplateSources(string(raw)) {
 			c.fail(findingCoverage, "", fmt.Sprintf("%s:%d", relative, source.line), source.problem,
-				"no implicit image source in chart templates", fixImplicitSource)
+				"no implicit image source in chart templates", c.implicitSourceFix())
 		}
 	}
 }
