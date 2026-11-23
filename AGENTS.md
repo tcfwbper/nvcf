@@ -353,7 +353,7 @@ update, file a follow-up issue.
 ## LLM stack compatibility
 
 For independently deployed LLM stack components, maintain compatibility with
-stable releases published within the previous 90 days, measured from their
+stable releases published within the previous 60 days, measured from their
 UTC publication timestamps. Keep supporting older
 versions still deployed or needed for rollback. Retire a version only after
 its support window ends and deployment inventory confirms migration and the
@@ -373,11 +373,15 @@ do not regenerate them from the candidate to make a failing check pass.
 
 On the default branch, path-selected CI checks Stargate schemas against every
 supported Stargate release. All branches check against their target base.
-Behavioral tests use frozen released stats with current transports. Gateway
-server and client schema copies are checked against the target base only.
-Historical gateway releases, other components, historical binaries, relay
-combinations, and consumer downgrades need separate qualification. Extend the
-owning component's release matrix when changing one of those contracts.
+Frozen fixtures from the oldest supported release cover Stargate and Pylon
+registration, discovery, tunnel frames, tunnel headers, and command-line
+options. A weekly and path-selected workflow runs released Stargate and Pylon
+binaries with the candidate in both directions, including Stargate rollback,
+and reports releases about to leave the window. Gateway server and client
+schema copies are checked against the target base only. Historical gateway
+releases, other components, and relay combinations need separate
+qualification. Extend the owning component's release matrix when changing one
+of those contracts.
 
 ## Tests
 

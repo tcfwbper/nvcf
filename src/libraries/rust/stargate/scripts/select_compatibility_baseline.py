@@ -9,7 +9,10 @@ import re
 import sys
 
 
-SUPPORT_DAYS = 90
+SUPPORT_DAYS = 60
+# Releases leaving the window within this many days are reported so deployment
+# inventory can be checked before coverage drops.
+EXPIRY_NOTICE_DAYS = 14
 RELEASE_TAG = re.compile(r"src/libraries/rust/stargate/v[0-9]+\.[0-9]+\.[0-9]+")
 
 
@@ -30,9 +33,19 @@ def select_release(releases, retained, now):
             raise ValueError(f"retained release has no published stable release metadata: {tag}")
     supported = [entry for tag, entry in stable.items() if entry[0] >= cutoff or tag in retained]
     if not supported:
-        raise ValueError("no stable release in the 90-day window or retained release list")
+        raise ValueError(f"no stable release in the {SUPPORT_DAYS}-day window or retained release list")
     supported.sort(key=lambda entry: (entry[0], entry[1]["tag_name"]))
     published, release = supported[0]
+    notice = now + datetime.timedelta(days=EXPIRY_NOTICE_DAYS)
+    expiring = []
+    for entry_published, entry in supported:
+        leaves_at = entry_published + datetime.timedelta(days=SUPPORT_DAYS)
+        if entry["tag_name"] not in retained and leaves_at <= notice:
+            expiring.append({
+                "tag": entry["tag_name"],
+                "published_at": entry_published.isoformat(),
+                "leaves_window_at": leaves_at.isoformat(),
+            })
     return {
         "tag": release["tag_name"],
         "supported_tags": [entry[1]["tag_name"] for entry in supported],
@@ -40,6 +53,8 @@ def select_release(releases, retained, now):
         "support_days": SUPPORT_DAYS,
         "as_of": now.isoformat(),
         "cutoff": cutoff.isoformat(),
+        "expiry_notice_days": EXPIRY_NOTICE_DAYS,
+        "expiring": expiring,
     }
 
 

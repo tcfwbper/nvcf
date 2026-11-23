@@ -32,6 +32,8 @@ rust_library(
 
 rust_test(
     name = "stargate-protocol_test",
+    # The released-contract test reads the current Cap'n Proto schema.
+    compile_data = ["quic.capnp"],
     crate = ":stargate-protocol",
     deps = [
         "//src/libraries/rust/stargate/crates/stargate-tls:stargate-tls",

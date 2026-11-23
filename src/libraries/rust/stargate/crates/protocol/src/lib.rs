@@ -27,6 +27,9 @@ pub mod tunnel_contract;
 pub mod webtransport;
 pub mod webtransport_http;
 
+#[cfg(test)]
+mod released_contract_fixtures;
+
 pub use protocol::{
     HandshakeAck, HandshakeRequest, StreamStopCode, read_handshake, read_handshake_ack,
     write_handshake, write_handshake_ack,

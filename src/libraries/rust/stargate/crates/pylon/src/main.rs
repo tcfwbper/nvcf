@@ -203,6 +203,25 @@ struct Args {
         value_name = "CODES"
     )]
     pylon_retryable_upstream_status_codes: String,
+    /// Deprecated and ignored. Released launch specifications may still pass
+    /// it; Pylon now marks the listed statuses retryable without an upstream
+    /// header.
+    #[arg(
+        long,
+        hide = true,
+        action = clap::ArgAction::Set,
+        env = "PYLON_REQUIRE_UPSTREAM_RETRY_HEADER",
+        value_name = "BOOL"
+    )]
+    pylon_require_upstream_retry_header: Option<bool>,
+    /// Deprecated and ignored, like --pylon-require-upstream-retry-header.
+    #[arg(
+        long,
+        hide = true,
+        env = "PYLON_UPSTREAM_RETRY_HEADER",
+        value_name = "HEADER"
+    )]
+    pylon_upstream_retry_header: Option<String>,
     /// Convert upstream Retry-After responses into x-stargate-retry-after-ms
     #[arg(
         long,
@@ -363,6 +382,146 @@ mod tests {
         ];
         args.extend_from_slice(extra);
         <Args as clap::Parser>::try_parse_from(args)
+    }
+
+    // Long options and environment variables listed by `pylon --help` in
+    // v0.19.2 (d12dd96dfbefb63c7c405baa0d1feba4e14f397b), the oldest supported
+    // release. Released launch specifications may pass any of them. Do not
+    // regenerate from the candidate; retire entries only after the release
+    // leaves the support window and no retained release needs them.
+    const V0_19_2_LONG_OPTIONS: &[&str] = &[
+        "active-canary-interval-ms",
+        "auth-token",
+        "auth-token-file",
+        "backend-connectivity",
+        "bringup-calibration-timeout-ms",
+        "bringup-canary-timeout-ms",
+        "calibration-max-concurrency",
+        "calibration-prompt-units",
+        "calibration-requests",
+        "canary-max-generation-threshold",
+        "cluster-id",
+        "collect-quality-metrics",
+        "collect-quality-metrics-min-tokens",
+        "disable-bringup",
+        "do-calibration",
+        "engine-stats-stream",
+        "engine-stats-stream-path",
+        "force-chat-completions-include-usage",
+        "grpc-tls-ca-cert-path",
+        "inference-server-id",
+        "initial-input-tps",
+        "kv-cache-stats-path",
+        "max-engine-concurrency",
+        "metrics-host",
+        "metrics-port",
+        "min-update-interval-ms",
+        "model-discovery-poll-interval-ms",
+        "model-discovery-provider",
+        "model-discovery-request-timeout-ms",
+        "model-name",
+        "otel-endpoint",
+        "otel-service-name",
+        "output-token-calibration",
+        "pylon-local-connect-failures-retryable",
+        "pylon-priority-ceiling",
+        "pylon-propagate-retry-after",
+        "pylon-queue-mismatch-min-delta-ms",
+        "pylon-queue-mismatch-retry-after-ms",
+        "pylon-queue-mismatch-retry-enabled",
+        "pylon-queue-mismatch-tolerance-factor",
+        "pylon-require-upstream-retry-header",
+        "pylon-retryable-upstream-status-codes",
+        "pylon-upstream-backend",
+        "pylon-upstream-retry-header",
+        "quality-median-logprob-threshold-max",
+        "quality-output-compression-threshold-max",
+        "quality-output-degeneracy-threshold-min",
+        "quality-output-repetition-1gram-threshold-min",
+        "quality-output-repetition-2gram-threshold-min",
+        "quality-output-repetition-3gram-threshold-min",
+        "quality-output-tokens-threshold-min",
+        "quic-insecure",
+        "quic-listen-addr",
+        "stargate-address",
+        "tls-cert-path",
+        "tls-key-path",
+        "tunnel-protocol",
+        "upstream-health-path",
+        "upstream-health-wait-ms",
+        "upstream-http-base-url",
+    ];
+    const V0_19_2_ENV_VARS: &[&str] = &[
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_SERVICE_NAME",
+        "PYLON_LOCAL_CONNECT_FAILURES_RETRYABLE",
+        "PYLON_PRIORITY_CEILING",
+        "PYLON_PROPAGATE_RETRY_AFTER",
+        "PYLON_QUEUE_MISMATCH_MIN_DELTA_MS",
+        "PYLON_QUEUE_MISMATCH_RETRY_AFTER_MS",
+        "PYLON_QUEUE_MISMATCH_RETRY_ENABLED",
+        "PYLON_QUEUE_MISMATCH_TOLERANCE_FACTOR",
+        "PYLON_REQUIRE_UPSTREAM_RETRY_HEADER",
+        "PYLON_RETRYABLE_UPSTREAM_STATUS_CODES",
+        "PYLON_UPSTREAM_BACKEND",
+        "PYLON_UPSTREAM_RETRY_HEADER",
+        "STARGATE_AUTH_TOKEN",
+        "STARGATE_AUTH_TOKEN_FILE",
+        "STARGATE_GRPC_TLS_CA_CERT_PATH",
+        "STARGATE_QUIC_INSECURE",
+        "STARGATE_TLS_CERT_PATH",
+        "STARGATE_TLS_KEY_PATH",
+    ];
+
+    #[test]
+    fn released_cli_options_remain_accepted() {
+        let mut command = <Args as clap::CommandFactory>::command();
+        // Building adds the generated --help and --version options.
+        command.build();
+        let mut options = std::collections::BTreeSet::new();
+        let mut env_vars = std::collections::BTreeSet::new();
+        for arg in command.get_arguments() {
+            options.extend(arg.get_long());
+            options.extend(arg.get_all_aliases().into_iter().flatten());
+            if let Some(name) = arg.get_env() {
+                env_vars.insert(name.to_string_lossy().into_owned());
+            }
+        }
+        let missing_options: Vec<_> = V0_19_2_LONG_OPTIONS
+            .iter()
+            .filter(|option| !options.contains(**option))
+            .collect();
+        assert!(
+            missing_options.is_empty(),
+            "released pylon options are no longer accepted: {missing_options:?}; \
+             keep them as hidden deprecated options"
+        );
+        let missing_env_vars: Vec<_> = V0_19_2_ENV_VARS
+            .iter()
+            .filter(|name| !env_vars.contains(**name))
+            .collect();
+        assert!(
+            missing_env_vars.is_empty(),
+            "released pylon environment variables are no longer read: {missing_env_vars:?}"
+        );
+    }
+
+    #[test]
+    fn deprecated_retry_header_options_parse_and_are_reported() {
+        assert!(super::startup::deprecated_options(&parse_args("")).is_empty());
+        let args = parse_argv(&[
+            "--pylon-require-upstream-retry-header",
+            "false",
+            "--pylon-upstream-retry-header",
+            "x-retry",
+        ]);
+        assert_eq!(
+            super::startup::deprecated_options(&args),
+            [
+                "--pylon-require-upstream-retry-header",
+                "--pylon-upstream-retry-header"
+            ]
+        );
     }
 
     #[test]

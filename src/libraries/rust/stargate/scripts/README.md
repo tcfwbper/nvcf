@@ -74,12 +74,14 @@ against every supported stable Stargate release, including backports and the
 oldest release. Maintenance branches keep target-base checks without comparing
 their older schemas against fields introduced in newer releases. Releases are
 selected by UTC publication date from the upstream GitHub release inventory.
-The rolling support window is 90 days. Older versions
+The rolling support window is 60 days. Older versions
 still deployed or needed for rollback must remain in
 `compatibility_retained_releases.json`; remove them only after verified migration
 and closure of the rollback window. Missing inventory or retained-release
 metadata fails CI. The selected tag, publication date, and cutoff appear in the
 job log, along with the full supported tag list.
+`scripts/check_supported_release_schemas.sh` selects the releases and runs these
+checks for both the Bazel workflow and the release compatibility workflow.
 
 `cargo test --locked -p stargate --test compatibility -- --test-threads=1`
 decodes released stats values, then re-encodes them with the current client for
@@ -94,10 +96,66 @@ Cluster aggregation treats missing or invalid backend maxima as absent. This
 also covers current Pylons that have not established a maximum.
 
 This checks released stats values with current registration envelopes and
-transports. It does not send an untouched historical registration frame or run
-historical Pylon/Stargate binaries. Restoring an older backend is a producer
-replacement scenario; consumer downgrade, relay compatibility, and production
-rolling upgrades require separate qualification.
+transports. Restoring an older backend is a producer replacement scenario.
+
+## Released Contract Fixtures
+
+Frozen fixtures from the oldest supported release (v0.19.2) run as unit tests:
+
+```bash
+cargo test --locked -p stargate-proto -p stargate-protocol --lib released
+cargo test --locked -p pylon -p stargate --bins released_cli
+```
+
+- `crates/proto/src/released_wire_fixtures.rs`: a Pylon registration, a
+  registration ACK, and a `WatchStargates` response. Each must decode with
+  every value intact and re-encode to the released bytes.
+- `crates/protocol/src/released_contract_fixtures.rs`: reverse tunnel
+  handshakes and raw QUIC header, body, and trailer frames must decode.
+  Released `quic.capnp` fields must keep their struct, name, ordinal, and type.
+  Released tunnel header names, retry reasons, and paths must stay defined, and
+  the required tunnel request headers must not change.
+- `released_cli_options_remain_accepted` in each binary: every released
+  command-line option and environment variable must still be accepted. Keep a
+  removed option as a hidden option that logs a deprecation warning.
+
+Do not regenerate fixtures from the candidate. Generate a newer release's
+fixtures by building that tag and encoding the same values; keep the older
+fixtures until that release leaves the window and no retained release needs it.
+
+## Release Compatibility Workflow
+
+`.github/workflows/stargate-release-compatibility.yml` runs weekly, on manual
+dispatch, and on pull requests to `main` that change the protobuf or tunnel
+schemas, the Stargate or Pylon command line, the retained-release list, or this
+tooling. It:
+
+1. Checks schemas against every supported release and writes the selection to
+   the job summary. Releases leaving the window within 14 days appear as
+   warnings. Add any that are still deployed or needed for rollback to
+   `compatibility_retained_releases.json`.
+2. Selects the release matrix with `scripts/select_matrix_releases.py`: the
+   first supported release for each distinct `stargate.proto`, `quic.capnp`,
+   and `tunnel_contract.rs` combination, plus the newest supported release.
+   Backports with their own contract are included.
+3. Builds each selected release from its own tag with
+   `scripts/build_release_binaries.sh`, cached by release commit, and runs
+   `scripts/release_matrix_e2e.sh` against candidate binaries.
+
+The matrix script starts one released and one candidate Pylon behind mock-dynamo
+backends over reverse raw QUIC tunnels. For power-of-n and the Pulsar default,
+it runs released Stargate, upgrades to candidate Stargate, then rolls back to
+released Stargate. Each phase requires both Pylons to serve completed streaming
+responses. The same launch options start both Pylon versions.
+
+```bash
+scripts/build_release_binaries.sh src/libraries/rust/stargate/vX.Y.Z /tmp/release-bin
+scripts/release_matrix_e2e.sh --candidate /tmp/candidate-bin --release /tmp/release-bin
+```
+
+The matrix does not cover the `http3` or WebTransport tunnel transports, direct
+backend connectivity, worker authentication, router relays, or production
+rolling upgrades.
 
 ## Last-Cluster End-to-End Check
 

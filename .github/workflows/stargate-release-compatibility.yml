@@ -1,0 +1,191 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Runs released Stargate and Pylon binaries against the candidate in both
+# directions, and reports supported releases that are about to leave the
+# compatibility window. See src/libraries/rust/stargate/scripts/README.md.
+name: Stargate release compatibility
+
+on:
+  schedule:
+    # Weekly, so the matrix runs and aging-out releases are reported even when
+    # no Stargate change is open.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - src/libraries/rust/stargate/crates/proto/proto/**
+      - src/libraries/rust/stargate/crates/protocol/**
+      - src/libraries/rust/stargate/crates/pylon/src/main.rs
+      - src/libraries/rust/stargate/crates/stargate/src/main.rs
+      - src/libraries/rust/stargate/compatibility_retained_releases.json
+      - src/libraries/rust/stargate/scripts/build_release_binaries.sh
+      - src/libraries/rust/stargate/scripts/check_supported_release_schemas.sh
+      - src/libraries/rust/stargate/scripts/release_matrix_e2e.sh
+      - src/libraries/rust/stargate/scripts/select_compatibility_baseline.py
+      - src/libraries/rust/stargate/scripts/select_matrix_releases.py
+      - .github/workflows/stargate-release-compatibility.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stargate-release-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RELEASE_REPO: dsx-ai-factory/nvcf
+  STARGATE_DIR: src/libraries/rust/stargate
+
+jobs:
+  select:
+    name: Select supported releases
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.matrix.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Buf (pinned, checksum-verified)
+        env:
+          BUF_VERSION: "1.75.0"
+          BUF_SHA256: "fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/buf-bin"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/buf-bin/buf" \
+            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+          echo "$BUF_SHA256  $RUNNER_TEMP/buf-bin/buf" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/buf-bin/buf"
+          echo "$RUNNER_TEMP/buf-bin" >> "$GITHUB_PATH"
+
+      - name: Check schemas against supported releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s "$STARGATE_DIR/scripts" -p 'test_select_*.py'
+          bash "$STARGATE_DIR/scripts/check_supported_release_schemas.sh" \
+            "$RELEASE_REPO" "$RUNNER_TEMP/baseline.json"
+
+      - name: Select release matrix and report expiring releases
+        id: matrix
+        run: |
+          set -euo pipefail
+          baseline="$RUNNER_TEMP/baseline.json"
+          python3 "$STARGATE_DIR/scripts/select_matrix_releases.py" < "$baseline" > "$RUNNER_TEMP/matrix.txt"
+          echo "tags=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$RUNNER_TEMP/matrix.txt")" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Stargate and Pylon compatibility window"
+            jq -r '"Window: \(.support_days) days. Cutoff: \(.cutoff). Supported releases: \(.supported_tags | length). Oldest: \(.tag)."' "$baseline"
+            echo
+            echo "Release matrix:"
+            sed 's/^/- /' "$RUNNER_TEMP/matrix.txt"
+            echo
+            if jq -e '.expiring | length > 0' "$baseline" > /dev/null; then
+              jq -r '"Releases leaving the window within \(.expiry_notice_days) days. Add any still deployed or needed for rollback to compatibility_retained_releases.json:"' "$baseline"
+              jq -r '.expiring[] | "- \(.tag) leaves at \(.leaves_window_at)"' "$baseline"
+            else
+              echo "No supported release leaves the window within the notice period."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.expiring[] | "::warning title=Stargate release leaving compatibility window::\(.tag) leaves at \(.leaves_window_at). Confirm deployment inventory or retain it."' "$baseline"
+
+  candidate:
+    name: Build candidate binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install code generators
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto protobuf-compiler
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: stargate-cargo-${{ runner.os }}-${{ hashFiles('src/libraries/rust/stargate/Cargo.lock') }}
+
+      - name: Build
+        working-directory: ${{ env.STARGATE_DIR }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p stargate -p pylon -p mock-dynamo --bins
+          mkdir -p "$RUNNER_TEMP/candidate"
+          cp target/release/stargate target/release/pylon target/release/mock-dynamo "$RUNNER_TEMP/candidate/"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stargate-candidate-binaries
+          path: ${{ runner.temp }}/candidate
+          retention-days: 3
+
+  release-matrix:
+    name: Release matrix (${{ matrix.tag }})
+    needs: [select, candidate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.select.outputs.tags) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release
+        id: release
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force "https://github.com/$RELEASE_REPO.git" "refs/tags/$TAG:refs/tags/$TAG"
+          echo "commit=$(git rev-parse "refs/tags/$TAG^{commit}")" >> "$GITHUB_OUTPUT"
+          echo "label=${TAG##*/}" >> "$GITHUB_OUTPUT"
+
+      # Released binaries never change, so cache them by release commit.
+      - name: Restore released binaries
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/release
+          key: stargate-release-bin-${{ runner.os }}-${{ steps.release.outputs.commit }}
+
+      - name: Install code generators
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto protobuf-compiler
+
+      - name: Build released binaries
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          TAG: ${{ matrix.tag }}
+        run: bash "$STARGATE_DIR/scripts/build_release_binaries.sh" "$TAG" "$RUNNER_TEMP/release"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stargate-candidate-binaries
+          path: ${{ runner.temp }}/candidate
+
+      - name: Run released and candidate binaries together
+        env:
+          MATRIX_WORK_DIR: ${{ runner.temp }}/matrix-logs
+          LABEL: ${{ steps.release.outputs.label }}
+        run: |
+          set -euo pipefail
+          chmod +x "$RUNNER_TEMP"/candidate/* "$RUNNER_TEMP"/release/stargate "$RUNNER_TEMP"/release/pylon
+          bash "$STARGATE_DIR/scripts/release_matrix_e2e.sh" \
+            --candidate "$RUNNER_TEMP/candidate" --release "$RUNNER_TEMP/release" --label "$LABEL"
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stargate-release-matrix-logs-${{ steps.release.outputs.label }}
+          path: ${{ runner.temp }}/matrix-logs
+          retention-days: 7

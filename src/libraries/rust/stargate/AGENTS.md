@@ -33,19 +33,24 @@ For documentation changes, check whitespace and link targets.
 
 ## Compatibility contract
 
-Support every stable release published in the past 90 days, using UTC release
+Support every stable release published in the past 60 days, using UTC release
 publication timestamps. For relevant changes targeting the default branch, CI
 checks schemas against every supported release from the upstream GitHub release
 inventory, including later backports and the oldest by publication date. Add
 older versions still deployed or needed for rollback to `compatibility_retained_releases.json` before
 they age out. Entries do not expire automatically; remove one only after verified
 migration and closure of its rollback window. Missing release metadata fails CI.
+The weekly release compatibility workflow lists releases leaving the window
+within 14 days; check deployment inventory for each before it ages out.
 
 Stargate, Pylon, registration relays, and gateways upgrade independently.
 Preserve registration, discovery, tunnel, HTTP, stats, and configuration
 contracts in both upgrade and rollback directions. Do not add exceptions to
 the protobuf breaking-change check. Deprecate fields and RPCs while keeping
 them functional; use a separately versioned protocol for incompatible changes.
+Keep released command-line options and environment variables accepted. When
+an option stops having an effect, keep it as a hidden option that logs a
+deprecation warning.
 
 An additive protobuf change can still break routing. Missing new telemetry
 must retain the existing policy's behavior. Gate new requirements behind an
@@ -57,8 +62,20 @@ Run these from this directory, with Buf installed:
 ```sh
 scripts/check_buf_breaking.sh origin/main
 python3 -m unittest discover -s scripts -p 'test_check_buf_breaking.py'
-python3 -m unittest discover -s scripts -p 'test_select_compatibility_baseline.py'
+python3 -m unittest discover -s scripts -p 'test_select_*.py'
 cargo test --locked -p stargate --test compatibility -- --test-threads=1
+cargo test --locked -p stargate-proto -p stargate-protocol --lib released
+cargo test --locked -p pylon -p stargate --bins released_cli
+```
+
+To run released binaries against the candidate, build both and run the matrix:
+
+```sh
+scripts/build_release_binaries.sh src/libraries/rust/stargate/vX.Y.Z /tmp/release-bin
+cargo build --locked --release -p stargate -p pylon -p mock-dynamo --bins
+mkdir -p /tmp/candidate-bin
+cp target/release/{stargate,pylon,mock-dynamo} /tmp/candidate-bin/
+scripts/release_matrix_e2e.sh --candidate /tmp/candidate-bin --release /tmp/release-bin
 ```
 
 For maintenance work, use that maintenance branch instead of `origin/main`.
@@ -74,10 +91,12 @@ unrelated docs and Java changes do not contact release services. Extend the
 compatibility test when changing a contract. Cover old-only, new-only, and mixed backends, absent optional stats,
 and streaming completion. Require both backends to serve in the mixed state.
 The test decodes released stats and re-encodes registrations with the current
-client. Backend replacement exercises a return to older stats on the current
-Stargate; historical binaries, relays, and consumer rollback need separate
-tests. Preserve released fixtures. Document the supported policy modes,
-upgrade order, and how existing function launch
+client. Released registration and discovery frames must decode and re-encode
+unchanged. Released tunnel frames must decode, and released tunnel schema
+fields, tunnel strings, and command-line options must stay defined. The release
+matrix runs released and candidate binaries together and rolls Stargate back;
+relays need separate tests. Preserve released fixtures. Document the supported
+policy modes, upgrade order, and how existing function launch
 specifications and running Pylons receive an image update. An agent or chart
 upgrade alone does not prove that running function Pylons changed.
 

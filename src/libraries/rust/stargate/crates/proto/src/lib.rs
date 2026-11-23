@@ -90,6 +90,9 @@ pub mod pb {
 }
 
 #[cfg(test)]
+mod released_wire_fixtures;
+
+#[cfg(test)]
 mod tests {
     use crate::pb::{StargateInfo, WatchStargatesResponse};
     use prost::Message;

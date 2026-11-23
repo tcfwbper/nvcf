@@ -49,6 +49,19 @@ const DEFAULT_FALLBACK_CALIBRATION_TIMEOUT_MS: u64 = 5_000;
 const INFERENCE_READY_TIMEOUT_ENV: &str = "INFERENCE_READY_TIMEOUT";
 const DEFAULT_READINESS_HEALTH_STATUS: u16 = 200;
 
+/// Options that released Pylons accepted and current Pylons ignore. They stay
+/// accepted so existing launch specifications keep starting.
+pub(crate) fn deprecated_options(args: &Args) -> Vec<&'static str> {
+    let mut options = Vec::new();
+    if args.pylon_require_upstream_retry_header.is_some() {
+        options.push("--pylon-require-upstream-retry-header");
+    }
+    if args.pylon_upstream_retry_header.is_some() {
+        options.push("--pylon-upstream-retry-header");
+    }
+    options
+}
+
 pub(super) async fn run(args: Args) -> Result<()> {
     let plan = PylonStartupPlan::from_args(&args)?;
     let _telemetry_guard = stargate_telemetry::init_telemetry(
@@ -62,6 +75,12 @@ pub(super) async fn run(args: Args) -> Result<()> {
             value = %value,
             default = ?DEFAULT_STARTUP_HEALTH_WAIT,
             "ignoring invalid {INFERENCE_READY_TIMEOUT_ENV}; using the default upstream health wait"
+        );
+    }
+    for option in deprecated_options(&args) {
+        warn!(
+            option,
+            "ignoring deprecated Pylon option kept for released launch specifications"
         );
     }
     if let Some(protocol) = &plan.unchecked_readiness_protocol {

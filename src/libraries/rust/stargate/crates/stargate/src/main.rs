@@ -489,6 +489,120 @@ mod tests {
     };
     use super::*;
 
+    // Long options and environment variables listed by `stargate --help` in
+    // v0.19.2 (d12dd96dfbefb63c7c405baa0d1feba4e14f397b), the oldest supported
+    // release. Released launch specifications may pass any of them. Do not
+    // regenerate from the candidate; retire entries only after the release
+    // leaves the support window and no retained release needs them.
+    const V0_19_2_LONG_OPTIONS: &[&str] = &[
+        "advertise-addr",
+        "advertised-hostname-template",
+        "allow-insecure-remote-watch-http",
+        "backend-connectivity",
+        "direct-quic-connections",
+        "disable-dns-discovery",
+        "dns-poll-ms",
+        "dns-resolver-ttl-ms",
+        "enable-dev-peer-forwarding",
+        "grpc-pylon-dial-addr",
+        "http-listen-addr",
+        "lb-config-path",
+        "listen-addr",
+        "metrics-port",
+        "metrics-prefix",
+        "model-discovery-listen-addr",
+        "oauth2-provider-host",
+        "otel-endpoint",
+        "otel-service-name",
+        "pod-name",
+        "pod-namespace",
+        "proxy-max-connect-retries",
+        "proxy-max-replay-body-bytes",
+        "proxy-max-request-retries",
+        "proxy-require-pylon-retry-signal",
+        "proxy-retry-budget-header",
+        "quic-connect-timeout-ms",
+        "quic-insecure",
+        "quic-request-timeout-ms",
+        "readiness-stabilization-sample-interval-ms",
+        "readiness-stabilization-window",
+        "readiness-warmup-ms",
+        "registration-update-idle-timeout-ms",
+        "registration-update-max-idle-timeout-ms",
+        "remote-stargate-url",
+        "reverse-tunnel-connect-timeout-ms",
+        "reverse-tunnel-listen-addr",
+        "reverse-tunnel-pylon-dial-addr",
+        "secrets-json-path",
+        "secrets-path",
+        "shutdown-drain-timeout-ms",
+        "stargate-discovery-dns-name",
+        "stargate-id",
+        "tls-cert-path",
+        "tls-key-path",
+        "tunnel-protocol",
+        "version",
+        "watch-heartbeat-ms",
+        "worker-auth-endpoint",
+    ];
+    const V0_19_2_ENV_VARS: &[&str] = &[
+        "OAUTH2_PROVIDER_HOST",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "POD_NAME",
+        "POD_NAMESPACE",
+        "SECRETS_JSON_PATH",
+        "SECRETS_PATH",
+        "STARGATE_ALLOW_INSECURE_REMOTE_WATCH_HTTP",
+        "STARGATE_DIRECT_QUIC_CONNECTIONS",
+        "STARGATE_PROXY_MAX_CONNECT_RETRIES",
+        "STARGATE_PROXY_MAX_REPLAY_BODY_BYTES",
+        "STARGATE_PROXY_MAX_REQUEST_RETRIES",
+        "STARGATE_PROXY_REQUIRE_PYLON_RETRY_SIGNAL",
+        "STARGATE_PROXY_RETRY_BUDGET_HEADER",
+        "STARGATE_QUIC_INSECURE",
+        "STARGATE_READINESS_STABILIZATION_SAMPLE_INTERVAL_MS",
+        "STARGATE_READINESS_STABILIZATION_WINDOW",
+        "STARGATE_READINESS_WARMUP_MS",
+        "STARGATE_REGISTRATION_UPDATE_IDLE_TIMEOUT_MS",
+        "STARGATE_REGISTRATION_UPDATE_MAX_IDLE_TIMEOUT_MS",
+        "STARGATE_REMOTE_WATCH_URLS",
+        "STARGATE_TLS_CERT_PATH",
+        "STARGATE_TLS_KEY_PATH",
+    ];
+
+    #[test]
+    fn released_cli_options_remain_accepted() {
+        let mut command = <Args as clap::CommandFactory>::command();
+        // Building adds the generated --help and --version options.
+        command.build();
+        let mut options = std::collections::BTreeSet::new();
+        let mut env_vars = std::collections::BTreeSet::new();
+        for arg in command.get_arguments() {
+            options.extend(arg.get_long());
+            options.extend(arg.get_all_aliases().into_iter().flatten());
+            if let Some(name) = arg.get_env() {
+                env_vars.insert(name.to_string_lossy().into_owned());
+            }
+        }
+        let missing_options: Vec<_> = V0_19_2_LONG_OPTIONS
+            .iter()
+            .filter(|option| !options.contains(**option))
+            .collect();
+        assert!(
+            missing_options.is_empty(),
+            "released stargate options are no longer accepted: {missing_options:?}; \
+             keep them as hidden deprecated options"
+        );
+        let missing_env_vars: Vec<_> = V0_19_2_ENV_VARS
+            .iter()
+            .filter(|name| !env_vars.contains(**name))
+            .collect();
+        assert!(
+            missing_env_vars.is_empty(),
+            "released stargate environment variables are no longer read: {missing_env_vars:?}"
+        );
+    }
+
     #[derive(Clone)]
     struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
 

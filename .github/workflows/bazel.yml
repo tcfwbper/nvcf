@@ -543,22 +543,8 @@ jobs:
             echo "Maintenance branch: target-base checks passed; full release matrix belongs to the default branch"
             exit 0
           fi
-          gh api --paginate "repos/$CONTRACT_RELEASE_REPO/releases?per_page=100" \
-            --jq '.[] | {tag_name,published_at,draft,prerelease} | @json' \
-            > "$RUNNER_TEMP/stargate-releases.jsonl"
-          python3 src/libraries/rust/stargate/scripts/select_compatibility_baseline.py \
-            < "$RUNNER_TEMP/stargate-releases.jsonl" > "$RUNNER_TEMP/stargate-baseline.json"
-          cat "$RUNNER_TEMP/stargate-baseline.json"
-          jq -er '.supported_tags[]' "$RUNNER_TEMP/stargate-baseline.json" > "$RUNNER_TEMP/stargate-tags.txt"
-          release_refs=()
-          while IFS= read -r tag; do
-            release_refs+=("refs/tags/$tag")
-          done < "$RUNNER_TEMP/stargate-tags.txt"
-          git fetch --no-tags "https://github.com/$CONTRACT_RELEASE_REPO.git" "${release_refs[@]}"
-          # Check every supported tag, including off-main backports.
-          while read -r release_sha _; do
-            bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$release_sha"
-          done < "$(git rev-parse --git-path FETCH_HEAD)"
+          bash src/libraries/rust/stargate/scripts/check_supported_release_schemas.sh \
+            "$CONTRACT_RELEASE_REPO" "$RUNNER_TEMP/stargate-baseline.json"
 
   bazel:
     name: bazel (${{ matrix.subtree.id }})
