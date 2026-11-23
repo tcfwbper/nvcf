@@ -10,9 +10,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/election"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 )
@@ -705,5 +709,67 @@ func TestColdArgv_RejectsBadRecords(t *testing.T) {
 	c.Command = []string{IdleBin}
 	if got := ColdArgv(c, criuCaptureRecord()); got != nil {
 		t.Errorf("placeholder command: got %v", got)
+	}
+}
+
+// A pod captured with a model volume restores with it: the restored
+// process keeps the mounts it was dumped with, so its placeholder gets the
+// model's read-only view at the captured landing, as a group rank's does.
+// Without it CRIU could not recreate the landing's mount ("Can't stat
+// mountpoint") and every such restore started cold.
+func TestCRIURestore_PlaceholderGetsTheModelLanding(t *testing.T) {
+	kc := fake.NewSimpleClientset()
+	m, _ := mvMutatorReader(t, modelvolume.ModeBlock, "", election.RoleFollower, kc)
+	rec := criuCaptureRecord()
+	rec.SourcePodMeta[checkpointstore.CRIUScopeMetaKey] = CRIUNamespaceScope("sr-fn")
+	m.L2Backend = &criuL2Backend{man: rec}
+	m.CheckpointHostRoot = "/var/lib/containers/nvsnap-checkpoints"
+	completeModelPV(t, kc, scoped("sr-fn", ngcFunctionKey))
+	pod := ngcFunctionPod()
+	pod.Annotations = map[string]string{RestoreFromAnnotation: "abc123"}
+	patches, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := applyPatches(t, pod, patches)
+	if got.Annotations[CRIURestoreAnnotation] != "abc123__20261008-101010" {
+		t.Fatalf("not admitted as the restore placeholder: %v", got.Annotations)
+	}
+	landing := false
+	for _, v := range got.Spec.Volumes {
+		if v.Name == "ngc-models" && v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == modelvolume.ReadOnlyClaimName(scoped("sr-fn", ngcFunctionKey)) {
+			landing = true
+		}
+	}
+	if !landing {
+		t.Errorf("placeholder lacks the model's read-only view at the captured landing: %v", got.Spec.Volumes)
+	}
+	for _, c := range got.Spec.InitContainers {
+		if c.Name == injectedDownloadInit || c.Name == modelPrewarmName {
+			t.Errorf("placeholder got the cold-start init %s", c.Name)
+		}
+	}
+	if jobs, _ := kc.BatchV1().Jobs("sr-fn").List(context.Background(), metav1.ListOptions{}); len(jobs.Items) != 0 {
+		t.Errorf("admitting a placeholder created %d download Job(s)", len(jobs.Items))
+	}
+}
+
+// The model the captured pod read is gone: the pod starts cold rather than
+// become a placeholder whose restore cannot recreate the landing.
+func TestCRIURestore_PlaceholderWithoutTheModelStartsCold(t *testing.T) {
+	kc := fake.NewSimpleClientset()
+	m, _ := mvMutatorReader(t, modelvolume.ModeBlock, "", election.RoleFollower, kc)
+	rec := criuCaptureRecord()
+	rec.SourcePodMeta[checkpointstore.CRIUScopeMetaKey] = CRIUNamespaceScope("sr-fn")
+	m.L2Backend = &criuL2Backend{man: rec}
+	m.CheckpointHostRoot = "/var/lib/containers/nvsnap-checkpoints"
+	pod := ngcFunctionPod()
+	pod.Annotations = map[string]string{RestoreFromAnnotation: "abc123"}
+	patches, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := applyPatches(t, pod, patches); got.Annotations[CRIURestoreAnnotation] != "" {
+		t.Errorf("admitted as a placeholder without its model landing: %v", got.Annotations)
 	}
 }

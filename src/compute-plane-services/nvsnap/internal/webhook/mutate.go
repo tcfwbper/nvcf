@@ -718,11 +718,21 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 			plog.WithError(err).Warn("CRIU restore: cannot prepare the pod; cold start")
 			return mergePatchPlan(injectPatches), nil
 		}
+		// The restored process keeps the mounts it was dumped with, so the
+		// placeholder gets the model landing the captured pod had, as a
+		// group rank's does (criuGroupRestorePatches); without it CRIU
+		// cannot recreate the landing's mount and the restore fails. The
+		// model gone: start cold rather than fail the restore.
+		vp, err := m.placeholderModelPatches(ctx, pod)
+		if err != nil {
+			plog.WithError(err).Warn("CRIU restore: the captured pod's model landing is not available; cold start")
+			return mergePatchPlan(injectPatches), nil
+		}
 		plog.WithField("checkpoint", id).Info("CRIU restore: pod admitted as the restore placeholder")
 		cp = append(cp, m.processConfigPatches(pod)...)
 		// Not injectPatches: a gpushare restore mounts the checkpoint's
 		// chunk store, not the pod's own empty one.
-		return mergePatchPlan(withPIDReserve(pod, cp)), nil
+		return mergePatchPlan(withPIDReserve(pod, append(cp, vp...))), nil
 	}
 
 	// Resolve the manifest so the L2 dispatch can branch on the capture
