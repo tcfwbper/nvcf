@@ -7,6 +7,13 @@
 # or ownedImages in its values.yaml) and pass the chart image checks, or be
 # listed here. Keys are chart directories relative to the repository root.
 #
+# The checks depend on the chart class. A chart is stack-deployed when a
+# released stack (one with release-inventory.yaml) declares a release of it;
+# the stack's base.yaml supplies its image source, so the chart leaves each
+# indexed registry and repository empty. Every other chart is standalone: it
+# is installed directly with Helm, so it prefills a working registry and
+# repository. Findings name the class, such as "deploy/helm/x (standalone)".
+#
 # reason:
 #   pending-fix        Not yet remediated. Expected to fail the chart image
 #                      checks, for example because it still prefills an image
@@ -22,14 +29,23 @@
 #                      by rendering.
 #   vendored-subchart  Lives at <parent>/charts/<name>, where <parent> is
 #                      itself a chart. Skipped.
+#   dev-only           Deployed only by an unreleased development stack, such
+#                      as stargate-dev. Skipped, and may declare an image
+#                      index. The entry fails when a released stack deploys
+#                      the chart, including a dev-only stack that gains
+#                      release-inventory.yaml. CI cannot build a dev-only
+#                      stack (stargate-dev reads a protected values file), so
+#                      whether one deploys the chart is not verified. Never
+#                      use it for a chart users install directly; review
+#                      enforces this.
 #
 # issue (optional, pending-fix only): a free-form note, such as a tracking
 # link. It is not validated. This file is public, so keep private tracker IDs
 # and URLs out of it.
 #
-# A chart with an image index may only be listed as pending-fix. Indirect
-# images (arguments, environment, injected agents) are visible only through
-# the patterns registered in the release inventory scanner. See the
+# A chart with an image index may only be listed as pending-fix or dev-only.
+# Indirect images (arguments, environment, injected agents) are visible only
+# through the patterns registered in the release inventory scanner. See the
 # indirect-image convention in tools/docs-version-sync/AGENTS.md.
 
 # pending-fix
@@ -60,13 +76,13 @@ deploy/helm/vanity-gateway/helm-nvcf-vanity-gateway: {reason: pending-fix}
 deploy/helm/worker-callback-proxy/worker-callback-proxy: {reason: pending-fix}
 deploy/stacks/observability/charts/nvcf-otel-collector: {reason: pending-fix}
 deploy/stacks/self-managed/charts/nvcf-upgrade-receipt: {reason: pending-fix}
-deploy/stacks/stargate-dev/charts/stargate-dev-auth: {reason: pending-fix}
-deploy/stacks/stargate-dev/charts/stargate-dev-mockdc: {reason: pending-fix}
 src/compute-plane-services/nvsnap/deploy/helm/nvsnap: {reason: pending-fix}
-# Listed conservatively; revisit if this turns out to be a sample.
-src/compute-plane-services/nvsnap/deploy/k8s/charts/vllm-workers: {reason: pending-fix}
 src/compute-plane-services/nvstor/deploy/helm/nvstor: {reason: pending-fix}
 src/uis/nvcf-ui/helm: {reason: pending-fix}
+
+# dev-only
+deploy/stacks/stargate-dev/charts/stargate-dev-auth: {reason: dev-only}
+deploy/stacks/stargate-dev/charts/stargate-dev-mockdc: {reason: dev-only}
 
 # vendored-subchart
 deploy/helm/cert-manager/charts/cert-manager: {reason: vendored-subchart}
@@ -92,6 +108,7 @@ src/compute-plane-services/nvca/examples/image-segmentation: {reason: test-fixtu
 src/compute-plane-services/nvca/examples/inference-test: {reason: test-fixture}
 src/compute-plane-services/nvca/test/testdata/helmcharts/badchart-role: {reason: test-fixture}
 src/compute-plane-services/nvca/test/testdata/helmcharts/goodchart: {reason: test-fixture}
+src/compute-plane-services/nvsnap/deploy/k8s/charts/vllm-workers: {reason: test-fixture}
 src/compute-plane-services/nvsnap/tests/criu-matrix/chart: {reason: test-fixture}
 src/control-plane-services/helm-reval/reval/testdata/test-chart: {reason: test-fixture}
 src/control-plane-services/helm-reval/reval/testdata/test-chart-extra-gvks-only: {reason: test-fixture}

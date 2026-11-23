@@ -24,7 +24,10 @@ const (
 
 // chartCheck runs the image checks for one chart against a temporary copy.
 type chartCheck struct {
-	chart     string
+	chart string
+	// class is classStackDeployed or classStandalone; it decides whether the
+	// chart's own values.yaml leaves or supplies the image source.
+	class     string
 	source    string
 	workspace string
 	scenarios []string
@@ -32,7 +35,7 @@ type chartCheck struct {
 }
 
 func (c *chartCheck) fail(category, image, path, problem, expected, fix string) {
-	c.findings = append(c.findings, imageGateFinding{Category: category, Subject: c.chart, Image: image, ValuesPath: path,
+	c.findings = append(c.findings, imageGateFinding{Category: category, Subject: chartSubject(c.chart, c.class), Image: image, ValuesPath: path,
 		Problem: problem, Expected: expected, Fix: fix})
 }
 
@@ -94,7 +97,13 @@ func checkIndexedChart(c *chartCheck) {
 	}
 	c.checkChartSources(values, catalog)
 	c.checkTemplateSources(chart)
-	c.checkDefaultsRejected(chart, catalog)
+	// A standalone chart prefills its sources, so its defaults render. Only
+	// the static prefill check applies: the defaults may still fail on an
+	// unrelated required value, such as a secret, that a direct install
+	// supplies (issue #3652).
+	if c.class != classStandalone {
+		c.checkDefaultsRejected(chart, catalog)
+	}
 	if len(c.scenarios) == 0 {
 		c.fail(findingScenario, "", "", "indexed chart has no CI values scenario",
 			"at least one scenario in "+chartValuesMapFile, fixScenario)

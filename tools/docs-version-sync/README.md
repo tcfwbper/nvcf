@@ -6,13 +6,22 @@ branch-based SemVer docs editions for qualified three-stack combinations.
 
 ## Chart image settings
 
-Charts must not choose where images come from. CI requires each indexed image
-`registry` and `repository` in a chart `values.yaml` to be empty, and the chart
-to fail to render until a values file supplies them. Charts listed as
-pending-fix in `chart-image-exclusions.yaml` still prefill their sources and
-do not comply yet. The self-managed stack `base.yaml` is meant to state the
-default source for every image, and users override it in layered values.
-Tags and digests may stay in the chart; they pin the version, not the source.
+Every image source must be explicit and overridable through values. Where
+the outermost configuration lives depends on the chart class:
+
+- Stack-deployed: a released stack (one with `release-inventory.yaml`)
+  deploys the chart. The stack `base.yaml` states the default source, and
+  users override it in layered values. CI requires each indexed image
+  `registry` and `repository` in the chart `values.yaml` to be empty, and the
+  chart to fail to render until a values file supplies them.
+- Standalone: no released stack deploys the chart, so users install it
+  directly with Helm. The chart `values.yaml` is the outermost configuration,
+  so CI requires each indexed `registry` and `repository` to hold a working
+  default that a plain `helm install` uses.
+
+Charts listed as pending-fix in `chart-image-exclusions.yaml` do not comply
+yet. Tags and digests may stay in the chart; they pin the version, not the
+source.
 
 The `thirdPartyImages` and `ownedImages` maps are a CI index of the image keys.
 They do not duplicate image versions and are not runtime overrides. Change the
@@ -58,9 +67,12 @@ the vendored appVersion. OpenBao and Cassandra take separate `registry`,
 CI runs the chart image checks on every tracked chart. A chart either declares
 an image index and passes, or is listed in `chart-image-exclusions.yaml`. For
 an indexed chart it checks the chart values and templates for an implicit
-image source, requires the defaults render to fail with a guard that names the
-values path, and renders every CI values scenario with ordinary overrides,
-including hooks, init containers, injected agents and the ACME solver argument:
+image source, requires the defaults render of a stack-deployed chart to fail
+with a guard that names the values path, and renders every CI values scenario
+with ordinary overrides, including hooks, init containers, injected agents and
+the ACME solver argument. Each finding names the chart class. Classification
+runs `helmfile build` on the released stacks, so the check needs `helmfile`
+as well as `helm`:
 
 ```sh
 NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestChartImageCoverage$' -count=1
