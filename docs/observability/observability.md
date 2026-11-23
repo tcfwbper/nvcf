@@ -21,6 +21,14 @@ Common operator questions and where to look on this page or in linked references
 
 ## Overview
 
+<Warning>
+Observability is supported on a single cluster, and on the control-plane cluster
+of a split deployment, including the control-plane cluster of a multi-cluster
+AWS deployment. Collecting compute-plane metrics from the GPU clusters in a
+multi-cluster AWS deployment is experimental and has not been qualified. See
+[Example dashboards](./example-dashboards.md) for the supported topologies.
+</Warning>
+
 Self-hosted NVCF control-plane observability enables users to monitor the health and performance of their NVCF deployment. The observability solution is designed to be:
 
 - Cloud-agnostic: Works in any Kubernetes environment (cloud provider, on-premises, or air-gapped)
