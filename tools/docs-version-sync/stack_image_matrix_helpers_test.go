@@ -59,6 +59,9 @@ func newStackImageReport() *imageGateReport {
 // entry when its state moves out of the stack or into the inventory.
 var stackExtraStates = map[string][]string{
 	"deploy/stacks/self-managed/helmfile.d/00-observability-infrastructure.yaml.gotmpl": {"observability.profile=all"},
+	// This maintenance branch deploys the upgrade receipt state but its
+	// release inventory predates listing it.
+	"deploy/stacks/self-managed/helmfile.d/04-upgrade-receipt.yaml.gotmpl": nil,
 }
 
 // untrackedStackCharts lists charts that a stack deploys from its own chart

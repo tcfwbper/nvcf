@@ -27,8 +27,3 @@
 deploy/stacks/nvcf-compute-plane: {reason: pending-fix}
 deploy/stacks/observability: {reason: pending-fix}
 deploy/stacks/self-managed: {reason: pending-fix}
-
-# dev-only
-# stargate-dev reads one environment per region and takes real images from a
-# protected values file outside the repository.
-deploy/stacks/stargate-dev: {reason: dev-only}
