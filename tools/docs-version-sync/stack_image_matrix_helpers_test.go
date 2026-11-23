@@ -61,7 +61,9 @@ const (
 	findingImageSource = "image source"
 	// findingStackConfig: the stack cannot be checked as configured, such as
 	// a released stack without release inventory states, a state the inventory
-	// does not render, or an included Helmfile outside deploy/stacks.
+	// does not render, or an included Helmfile outside deploy/stacks. The
+	// chart gate also reports it for a released stack state whose charts
+	// cannot be resolved, so their classes are unknown.
 	findingStackConfig = "stack configuration"
 )
 

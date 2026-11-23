@@ -17,6 +17,11 @@ var imageSourceFields = []string{"registry", "repository"}
 
 // imageValueException records how one upstream chart's image values differ
 // from the convention. Anything not listed here follows the convention.
+//
+// Its extra source fields stay empty in every chart, standalone charts
+// included: each is an alternate selector that would override or shadow
+// registry and repository, so a prefilled one hides which value takes
+// effect. An image has exactly one source, its registry and repository.
 type imageValueException struct {
 	name string
 	// imageSourceFields are extra fields of the image object that select a

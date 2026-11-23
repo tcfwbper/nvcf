@@ -234,7 +234,7 @@ func TestImageIndexErrorsFailPendingFix(t *testing.T) {
 			if errors.As(err, &keyError) != test.keyError {
 				t.Fatalf("error %v, want key error %v", err, test.keyError)
 			}
-			check := &chartCheck{chart: "c"}
+			check := &chartCheck{chart: "c", class: classStackDeployed}
 			check.catalogFailure(err.Error(), err, "", "")
 			findings, expected := chartImageGate.pendingFixOutcome(check.chart, check.findings, imageExclusion{Reason: reasonPendingFix}, findingCoverage)
 			if expected != "" || len(findings) != 1 || findings[0].Category != findingInvalidEntry {
