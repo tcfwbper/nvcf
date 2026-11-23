@@ -62,7 +62,7 @@ public class AccountInfoController {
     private final GpuUsageService gpuUsageService;
 
     @GetMapping("{ncaId}/gpus")
-    @PreAuthorize("hasAuthority('gpu_listing')")
+    @PreAuthorize("hasAnyAuthority('gpu_listing', 'apikey:gpu_listing')")
     @Operation(summary = "List of registered GPUs authorized for the account",
             description = "Get the list of registered GPUs authorized for the account",
             responses = {
@@ -98,7 +98,7 @@ public class AccountInfoController {
     }
 
     @GetMapping("{ncaId}/regions")
-    @PreAuthorize("hasAuthority('regions_listing')")
+    @PreAuthorize("hasAnyAuthority('regions_listing', 'apikey:regions_listing')")
     @Operation(summary = "List of available regions for the account",
             description = "Get the list of available regions for the account",
             responses = {
@@ -144,7 +144,7 @@ public class AccountInfoController {
     }
 
     @GetMapping("{ncaId}/clusterNames")
-    @PreAuthorize("hasAuthority('clusters_listing')")
+    @PreAuthorize("hasAnyAuthority('clusters_listing', 'apikey:clusters_listing')")
     @Operation(summary = "List of available clusters for the account",
             description = "Get the list of available clusters for the account",
             responses = {
@@ -190,7 +190,7 @@ public class AccountInfoController {
     }
 
     @GetMapping("{ncaId}/attributes")
-    @PreAuthorize("hasAuthority('attributes_listing')")
+    @PreAuthorize("hasAnyAuthority('attributes_listing', 'apikey:attributes_listing')")
     @Operation(summary = "List of available attributes within all the clusters for the account",
             description = "Get the list of available attributes within all the clusters for the account",
             responses = {
@@ -236,7 +236,7 @@ public class AccountInfoController {
     }
 
     @GetMapping("{ncaId}/instanceTypes")
-    @PreAuthorize("hasAuthority('instance_types')")
+    @PreAuthorize("hasAnyAuthority('instance_types', 'apikey:instance_types')")
     @Operation(summary = """
             List of available instance types with clusters, regions, attributes for each
             instance type within all the clusters for the account""",
@@ -291,7 +291,8 @@ public class AccountInfoController {
     }
 
     @GetMapping("{ncaId}/instanceTypes/availability")
-    @PreAuthorize("hasAuthority('spot-gpu-usage') or hasAuthority('gpu-usage')")
+    @PreAuthorize("hasAnyAuthority('spot-gpu-usage', 'gpu-usage', "
+            + "'apikey:spot-gpu-usage', 'apikey:gpu-usage')")
     @Operation(summary = "Get instance type availability information",
             description = "Retrieves information about available instance types and their GPU configurations across different regions and clusters",
             responses = {
@@ -316,7 +317,8 @@ public class AccountInfoController {
 
 
     @GetMapping("{ncaId}/gpu/usage")
-    @PreAuthorize("hasAuthority('spot-gpu-usage') or hasAuthority('gpu-usage')")
+    @PreAuthorize("hasAnyAuthority('spot-gpu-usage', 'gpu-usage', "
+            + "'apikey:spot-gpu-usage', 'apikey:gpu-usage')")
     @Operation(summary = "Get GPU usage information",
             description = "Retrieves information about GPU usage across different regions and clusters for a specific NCA",
             responses = {
@@ -340,7 +342,8 @@ public class AccountInfoController {
     }
 
     @GetMapping("{ncaId}/deployments/{deploymentId}/gpu/usage")
-    @PreAuthorize("hasAuthority('spot-gpu-usage') or hasAuthority('gpu-usage')")
+    @PreAuthorize("hasAnyAuthority('spot-gpu-usage', 'gpu-usage', "
+            + "'apikey:spot-gpu-usage', 'apikey:gpu-usage')")
     @Operation(summary = "Get GPU usage information for a specific deployment",
             description = "Retrieves information about GPU usage across different regions and clusters for a specific deployment within an NCA",
             responses = {

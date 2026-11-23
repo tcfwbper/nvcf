@@ -39,7 +39,7 @@ import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.TestPropertySource;
 
 /**
- * Not redundant with {@code AuthManagerResolverTest}, which calls the factory method directly and
+ * Not redundant with {@code AuthManagerResolverConfigurationTest}, which calls the factory method directly and
  * passes whether or not the {@code @RefreshScope} annotations are present. Removing one would
  * silently restore the defect they exist to prevent, and this is what catches that.
  */

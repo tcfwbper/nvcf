@@ -18,6 +18,9 @@ mkdir -p "$work_dir/bin"
 cat >"$work_dir/bin/bao" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$BAO_CALLS"
+if [[ "$*" == 'read -format=json auth/jwt/role/sis-api' ]]; then
+  printf '%s\n' '{"data":{"token_policies":[]}}'
+fi
 STUB
 chmod +x "$work_dir/bin/bao"
 export PATH="$work_dir/bin:$PATH"

@@ -19,13 +19,17 @@ package com.nvidia.icms.outbound.apikeys;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.github.benmanes.caffeine.cache.Ticker;
 import com.nvidia.icms.errors.IcmsAuthenticationException;
 import com.nvidia.icms.outbound.exception.ApiKeysException;
 import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationResult;
-import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationRequest;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -36,18 +40,14 @@ import org.mockito.junit.jupiter.MockitoExtension;
 class ApiKeysServiceTest {
 
     @Mock
-    private ApiKeysRequestHandler requestHandler;
+    private ApiKeysClient apiKeysClient;
     private ApiKeysService apiKeysService;
+    private final AtomicLong now = new AtomicLong();
+    private final Ticker ticker = now::get;
 
     @BeforeEach
     public void setup() {
-        apiKeysService = new ApiKeysService(requestHandler, "package_name", "policy_name", "apiKey");
-    }
-
-    private ApiKeyValidationRequest getApiKeyValidationRequest() {
-        return ApiKeyValidationRequest.builder()
-                .jsonField("apiKey", "dummy_api_key")
-                .build();
+        apiKeysService = new ApiKeysService(apiKeysClient, ticker);
     }
 
     private ApiKeyValidationResult getPolicyResult() {
@@ -56,7 +56,6 @@ class ApiKeysServiceTest {
                 .ncaId("dummy_nca_id")
                 .ownerId("dummy_owner_id")
                 .policy(ApiKeyValidationResult.Policy.builder()
-                                .aud("dummy_audience")
                                 .product("dummy_product")
                                 .resources(List.of(ApiKeyValidationResult.Resource.builder()
                                                            .id("ea946155-893c-43b6-920d-3f4410534a80")
@@ -69,8 +68,8 @@ class ApiKeysServiceTest {
 
     @Test
     void fetchApiKeyValidationResult_success() {
-        when(requestHandler.getUserAccessDetails("package_name.policy_name",
-                                                 getApiKeyValidationRequest())).thenReturn(getPolicyResult());
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(getPolicyResult());
 
         ApiKeyValidationResult
                 policyResult = apiKeysService.fetchValidationResult("dummy_api_key");
@@ -83,8 +82,8 @@ class ApiKeysServiceTest {
         var dummyPolicy = ApiKeyValidationResult.builder()
                 .allowed(false)
                 .build();
-        when(requestHandler.getUserAccessDetails("package_name.policy_name",
-                                                 getApiKeyValidationRequest())).thenReturn(dummyPolicy);
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(dummyPolicy);
 
         IcmsAuthenticationException exception =
                 assertThrows(IcmsAuthenticationException.class,
@@ -95,14 +94,121 @@ class ApiKeysServiceTest {
 
     @Test
     void fetchApiKeyValidationResult_withError_throwsException() {
-        when(requestHandler.getUserAccessDetails("package_name.policy_name",
-                                                 getApiKeyValidationRequest())).thenThrow(
-                new ApiKeysException("dummy_error"));
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenThrow(new ApiKeysException("dummy_error"));
 
         ApiKeysException exception =
                 assertThrows(ApiKeysException.class,
                              () -> apiKeysService.fetchValidationResult("dummy_api_key"));
 
         assertEquals("dummy_error", exception.getMessage());
+    }
+
+    @Test
+    void cachesEachValidKeyForOneMinute() {
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(getPolicyResult());
+
+        apiKeysService.fetchValidationResult("dummy_api_key");
+        apiKeysService.fetchValidationResult("dummy_api_key");
+        verify(apiKeysClient).fetchApiKeyValidationResult("dummy_api_key");
+
+        now.addAndGet(TimeUnit.MINUTES.toNanos(1));
+        apiKeysService.fetchValidationResult("dummy_api_key");
+        verify(apiKeysClient, times(2)).fetchApiKeyValidationResult("dummy_api_key");
+    }
+
+    @Test
+    void outageUsesOnlySameKeysBackupAfterPrimaryExpires() {
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(getPolicyResult())
+                .thenThrow(new ApiKeysException("API Keys unavailable", true));
+        when(apiKeysClient.fetchApiKeyValidationResult("other_key"))
+                .thenThrow(new ApiKeysException("API Keys unavailable", true));
+
+        apiKeysService.fetchValidationResult("dummy_api_key");
+        now.addAndGet(TimeUnit.MINUTES.toNanos(1));
+
+        assertTrue(apiKeysService.fetchValidationResult("dummy_api_key").isAllowed());
+        verify(apiKeysClient, times(2)).fetchApiKeyValidationResult("dummy_api_key");
+        assertThrows(ApiKeysException.class, () -> apiKeysService.fetchValidationResult("other_key"));
+    }
+
+    @Test
+    void backupExpiresAfterSixtyMinutes() {
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(getPolicyResult())
+                .thenThrow(new ApiKeysException("API Keys unavailable", true));
+
+        apiKeysService.fetchValidationResult("dummy_api_key");
+        now.addAndGet(TimeUnit.MINUTES.toNanos(60));
+
+        assertThrows(ApiKeysException.class, () -> apiKeysService.fetchValidationResult("dummy_api_key"));
+    }
+
+    @Test
+    void authorizationFailuresDoNotUseBackup() {
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(getPolicyResult())
+                .thenThrow(new IcmsAuthenticationException("Key revoked"))
+                .thenThrow(new ApiKeysException("API Keys unavailable", true));
+
+        apiKeysService.fetchValidationResult("dummy_api_key");
+        now.addAndGet(TimeUnit.MINUTES.toNanos(1));
+
+        assertThrows(IcmsAuthenticationException.class,
+                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
+        assertThrows(ApiKeysException.class,
+                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
+        verify(apiKeysClient, times(3)).fetchApiKeyValidationResult("dummy_api_key");
+    }
+
+    @Test
+    void nonRetryableClientFailureDoesNotUseBackup() {
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(getPolicyResult())
+                .thenThrow(new ApiKeysException("Invalid evaluation request"))
+                .thenThrow(new ApiKeysException("API Keys unavailable", true));
+
+        apiKeysService.fetchValidationResult("dummy_api_key");
+        now.addAndGet(TimeUnit.MINUTES.toNanos(1));
+
+        assertThrows(ApiKeysException.class,
+                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
+        assertThrows(ApiKeysException.class,
+                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
+        verify(apiKeysClient, times(3)).fetchApiKeyValidationResult("dummy_api_key");
+    }
+
+    @Test
+    void deniedPolicyEvictsPreviouslyValidBackupBeforeOutage() {
+        var denied = getPolicyResult();
+        denied.setAllowed(false);
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(getPolicyResult())
+                .thenReturn(denied)
+                .thenThrow(new ApiKeysException("API Keys unavailable", true));
+
+        apiKeysService.fetchValidationResult("dummy_api_key");
+        now.addAndGet(TimeUnit.MINUTES.toNanos(1));
+
+        assertThrows(IcmsAuthenticationException.class,
+                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
+        assertThrows(ApiKeysException.class,
+                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
+        verify(apiKeysClient, times(3)).fetchApiKeyValidationResult("dummy_api_key");
+    }
+
+    @Test
+    void invalidResponsesAreNeverCached() {
+        var invalid = getPolicyResult();
+        invalid.setAllowed(false);
+        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
+                .thenReturn(invalid)
+                .thenThrow(new ApiKeysException("API Keys unavailable", true));
+
+        assertThrows(IcmsAuthenticationException.class,
+                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
+        assertThrows(ApiKeysException.class, () -> apiKeysService.fetchValidationResult("dummy_api_key"));
     }
 }

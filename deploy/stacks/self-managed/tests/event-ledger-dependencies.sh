@@ -35,6 +35,10 @@ needs="$(yq ea -r 'select(.releases) | .releases[] | select(.name == "event-ledg
 test "$needs" = "api-keys/api-keys" ||
   fail "Event Ledger must wait for api-keys/api-keys, got $needs"
 
+icms_needs="$(yq ea -r 'select(.releases) | .releases[] | select(.name == "sis") | .needs[]' "$work_dir/state.yaml")"
+test "$icms_needs" = "api-keys/api-keys" ||
+  fail "ICMS must wait for api-keys/api-keys, got $icms_needs"
+
 provider="$(yq ea -r 'select(.releases) | .releases[] | select(.name == "api-keys") | .namespace + "/" + .name' "$work_dir/state.yaml")"
 test "$provider" = "$needs" ||
   fail "API Keys dependency must be declared in the same Helmfile state"

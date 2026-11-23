@@ -27,11 +27,11 @@ job='select(.kind == "Job" and .metadata.name == "addons-lls-migrations") | .spe
 cron='select(.kind == "CronJob" and .metadata.name == "addons-lls-turn-hmac-rotation") | .spec.jobTemplate.spec.template.spec.containers[0]'
 rendered="${work_dir}/rendered.yaml"
 for minor in '' 1.36 1.37; do
-  selector_args=()
   if [[ -n "${minor}" ]]; then
-    selector_args=(--set-string "sis.lls.hmacRotation.kubectlMinor=${minor}")
+    render --set-string "sis.lls.hmacRotation.kubectlMinor=${minor}" >"${rendered}"
+  else
+    render >"${rendered}"
   fi
-  render "${selector_args[@]}" >"${rendered}"
   for container in "${job}" "${cron}"; do
     test "$(yq -r "${container} | .image" "${rendered}")" = "example.com/custom/migrations:${migrations_tag}"
     test "$(yq -r "${container} | .env[] | select(.name == \"NVCF_KUBECTL_MINOR\") | .value" "${rendered}")" = "${minor}"
@@ -41,6 +41,7 @@ for minor in '' 1.36 1.37; do
   done
   test "$(yq -r 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image' "${rendered}")" = "example.com/custom/sis:${sis_tag}"
 done
+test "$(yq -r 'select(.kind == "ConfigMap" and .data."secrets.json.tmpl" != null) | .data."secrets.json.tmpl" | contains("services/api-keys-api/jwt/sign/sis-api")' "${rendered}")" = true
 
 render --set-string sis.lls.hmacRotation.kubectlMinor=1.36 \
   --set sis.lls.hmacRotation.image.registry=mirror.example.com \

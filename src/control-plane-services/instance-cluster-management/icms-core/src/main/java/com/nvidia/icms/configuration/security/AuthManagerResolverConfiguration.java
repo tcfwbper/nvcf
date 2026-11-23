@@ -75,7 +75,7 @@ import org.springframework.util.CollectionUtils;
 
 @Slf4j
 @Configuration(proxyBeanMethods = false)
-public class AuthManagerResolver {
+public class AuthManagerResolverConfiguration {
 
     private static final String INVALID_BEARER_TOKEN = "Invalid bearer token";
 
@@ -99,7 +99,7 @@ public class AuthManagerResolver {
     private final SignatureAlgorithm jwsAlgorithm;
     private final boolean apiKeyAuthEnabled;
 
-    public AuthManagerResolver(
+    public AuthManagerResolverConfiguration(
             ApiKeysService apiKeysService,
             ClusterRepository clusterRepository,
             NvcaConfigurationProperties nvcaConfig,
@@ -149,16 +149,16 @@ public class AuthManagerResolver {
         Map<String, String> trustedIssuerJwkSetUris = buildTrustedIssuerJwkSetUris(
                 issuerUri, jwkSetUri, adminIssuerUri, adminJwkSetUri, trustedIssuerProperties);
         var jwtResolver = jwtResolver(trustedIssuerJwkSetUris);
-        var authenticationManager = apiKeyAuthenticationManager();
         return request -> {
             var authorization = request.getHeader(HttpHeaders.AUTHORIZATION);
+            // Use the API Keys manager for opaque bearer tokens.
             if (hasBearerPrefix(authorization)
                     && authorization.substring("Bearer ".length()).startsWith("nvapi-")) {
                 if (!apiKeyAuthEnabled) {
-                    // Self-hosted NVCF: api-keys are not enabled.
+                    // Reject opaque keys without contacting API Keys when disabled.
                     return null;
                 }
-                return authenticationManager;
+                return apiKeyAuthenticationManager();
             }
 
             // Known static issuer (primary, admin-issuer-proxy, or a configured trusted

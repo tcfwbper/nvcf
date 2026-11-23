@@ -37,7 +37,7 @@ import org.springframework.context.annotation.Configuration;
  * {@code admin-issuer-uri}) are unaffected.</p>
  *
  * <p>Refresh-scoped: entries can be added or removed at runtime, and
- * {@link AuthManagerResolver#authenticationManagerResolver()} is rebuilt from the
+ * {@link AuthManagerResolverConfiguration#authenticationManagerResolver()} is rebuilt from the
  * new value without a restart.</p>
  */
 @RefreshScope

@@ -147,7 +147,7 @@ public class AuthUtils {
             }
             // PSAT / OIDC cluster identity: the audience claim carries the
             // cluster ID as nvcf-icms:{clusterId}. The JWT was already verified
-            // against that cluster's stored JWKS by AuthManagerResolver, so the
+            // against that cluster's stored JWKS by AuthManagerResolverConfiguration, so the
             // audience is trusted here. For legacy NVCA JWT tokens the sub was
             // the cluster ID directly; for PSAT tokens the sub is the K8s
             // ServiceAccount subject (system:serviceaccount:nvca-system:nvca)
@@ -161,6 +161,8 @@ public class AuthUtils {
             }
             // Else get "sub" from JWT token (legacy managed-NVCA flow).
             return getSubFromSecurityContext(authentication);
+        } catch (IcmsAuthenticationException e) {
+            throw e;
         } catch (Exception e) {
             String errMsg = String.format("Failed to get auth details, error: %s", e.getMessage());
             throw new IcmsInternalServerException(errMsg, e);
@@ -228,8 +230,12 @@ public class AuthUtils {
         if (principal.getAttribute(
                 ApiKeyValidationResult.POLICY_RESULT_ATTRIBUTE) instanceof ApiKeyValidationResult policyResult) {
             var policy = policyResult.getPolicy();
+            if (policy == null || policy.getResources() == null) {
+                throw new IcmsAuthenticationException(API_KEY_FAILURE_ERROR);
+            }
             var clusterResource = policy.getResources().stream()
-                    .filter(resource -> API_KEY_RESOURCE_TYPE_CLUSTER.equals(resource.getType()))
+                    .filter(resource -> resource != null
+                            && API_KEY_RESOURCE_TYPE_CLUSTER.equals(resource.getType()))
                     .findFirst();
             return clusterResource.map(ApiKeyValidationResult.Resource::getId)
                     .orElseThrow(() -> {

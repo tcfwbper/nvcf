@@ -55,7 +55,7 @@ import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 
 @ExtendWith(MockitoExtension.class)
-class AuthManagerResolverTest {
+class AuthManagerResolverConfigurationTest {
 
     @Mock
     private ClusterRepository clusterRepository;
@@ -63,7 +63,7 @@ class AuthManagerResolverTest {
     @Mock
     private ApiKeysService apiKeysService;
 
-    private AuthManagerResolver resolver;
+    private AuthManagerResolverConfiguration resolver;
 
     @BeforeEach
     void setUp() {
@@ -71,7 +71,7 @@ class AuthManagerResolverTest {
         // so enable the feature flag for all of them. A separate test exercises the flag-off path.
         NvcaConfigurationProperties nvcaConfig = new NvcaConfigurationProperties();
         nvcaConfig.setOidcClusterIdentityEnabled(true);
-        resolver = new AuthManagerResolver(
+        resolver = new AuthManagerResolverConfiguration(
                 apiKeysService,
                 clusterRepository,
                 nvcaConfig,
@@ -92,7 +92,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String issuer = AuthManagerResolver.extractIssuerFromToken(token);
+        String issuer = AuthManagerResolverConfiguration.extractIssuerFromToken(token);
         assertEquals("https://kubernetes.default.svc", issuer);
     }
 
@@ -102,30 +102,30 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "bEaReR eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String issuer = AuthManagerResolver.extractIssuerFromToken(token);
+        String issuer = AuthManagerResolverConfiguration.extractIssuerFromToken(token);
         assertEquals("https://kubernetes.default.svc", issuer);
     }
 
     @Test
     void extractIssuerFromToken_nullHeader_returnsNull() {
-        assertNull(AuthManagerResolver.extractIssuerFromToken(null));
+        assertNull(AuthManagerResolverConfiguration.extractIssuerFromToken(null));
     }
 
     @Test
     void extractIssuerFromToken_noBearerPrefix_returnsNull() {
-        assertNull(AuthManagerResolver.extractIssuerFromToken("Basic abc123"));
+        assertNull(AuthManagerResolverConfiguration.extractIssuerFromToken("Basic abc123"));
     }
 
     @Test
     void extractIssuerFromToken_malformedToken_returnsNull() {
-        assertNull(AuthManagerResolver.extractIssuerFromToken("Bearer not-a-jwt"));
+        assertNull(AuthManagerResolverConfiguration.extractIssuerFromToken("Bearer not-a-jwt"));
     }
 
     @Test
     void extractIssuerFromToken_rejectsOversizedJWT() {
         String oversizedPayload = "a".repeat(3000);
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + oversizedPayload + ".signature";
-        assertNull(AuthManagerResolver.extractIssuerFromToken(token));
+        assertNull(AuthManagerResolverConfiguration.extractIssuerFromToken(token));
     }
 
     @Test
@@ -134,7 +134,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        assertNull(AuthManagerResolver.extractIssuerFromToken(token));
+        assertNull(AuthManagerResolverConfiguration.extractIssuerFromToken(token));
     }
 
     // --- extractClusterIdFromAudience tests ---
@@ -145,7 +145,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertEquals("abc-123", clusterId);
     }
 
@@ -155,7 +155,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "bEaReR eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertEquals("abc-123", clusterId);
     }
 
@@ -165,7 +165,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertNull(clusterId);
     }
 
@@ -175,7 +175,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertNull(clusterId);
     }
 
@@ -185,7 +185,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertNull(clusterId);
     }
 
@@ -195,7 +195,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertEquals("abc-123", clusterId);
     }
 
@@ -205,7 +205,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertNull(clusterId);
     }
 
@@ -215,7 +215,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertEquals("abc-123", clusterId);
     }
 
@@ -225,7 +225,7 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertNull(clusterId);
     }
 
@@ -235,18 +235,18 @@ class AuthManagerResolverTest {
         String encodedPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes());
         String token = "Bearer eyJhbGciOiJSUzI1NiJ9." + encodedPayload + ".signature";
 
-        String clusterId = AuthManagerResolver.extractClusterIdFromAudience(token);
+        String clusterId = AuthManagerResolverConfiguration.extractClusterIdFromAudience(token);
         assertNull(clusterId);
     }
 
     @Test
     void extractClusterIdFromAudience_nullHeader_returnsNull() {
-        assertNull(AuthManagerResolver.extractClusterIdFromAudience(null));
+        assertNull(AuthManagerResolverConfiguration.extractClusterIdFromAudience(null));
     }
 
     @Test
     void extractClusterIdFromAudience_noBearerPrefix_returnsNull() {
-        assertNull(AuthManagerResolver.extractClusterIdFromAudience("Basic abc123"));
+        assertNull(AuthManagerResolverConfiguration.extractClusterIdFromAudience("Basic abc123"));
     }
 
     // --- lookupClusterById tests ---
@@ -282,7 +282,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaAudienceValidator_rejectsLegacyBareAudience() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaAudienceValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaAudienceValidator();
         Jwt jwt = buildJwtWithAudience(List.of("nvcf-icms"));
         OAuth2TokenValidatorResult result = validator.validate(jwt);
         assertTrue(result.hasErrors(), "Expected bare nvcf-icms audience to be rejected");
@@ -290,7 +290,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaAudienceValidator_rejectsEmptyClusterSuffix() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaAudienceValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaAudienceValidator();
         Jwt jwt = buildJwtWithAudience(List.of("nvcf-icms:"));
         OAuth2TokenValidatorResult result = validator.validate(jwt);
         assertTrue(result.hasErrors(), "Expected empty nvcf-icms: audience suffix to be rejected");
@@ -298,7 +298,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaAudienceValidator_rejectsBlankClusterSuffix() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaAudienceValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaAudienceValidator();
         Jwt jwt = buildJwtWithAudience(List.of("nvcf-icms:   "));
         OAuth2TokenValidatorResult result = validator.validate(jwt);
         assertTrue(result.hasErrors(), "Expected blank nvcf-icms: audience suffix to be rejected");
@@ -306,7 +306,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaAudienceValidator_acceptsNewFormatAudience() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaAudienceValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaAudienceValidator();
         Jwt jwt = buildJwtWithAudience(List.of("nvcf-icms:abc-123"));
         OAuth2TokenValidatorResult result = validator.validate(jwt);
         assertFalse(result.hasErrors(), "Expected new format audience to be accepted");
@@ -314,7 +314,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaAudienceValidator_rejectsUnknownAudience() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaAudienceValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaAudienceValidator();
         Jwt jwt = buildJwtWithAudience(List.of("some-other-service"));
         OAuth2TokenValidatorResult result = validator.validate(jwt);
         assertTrue(result.hasErrors(), "Expected unknown audience to be rejected");
@@ -322,7 +322,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaAudienceValidator_acceptsMixedAudienceWithValidEntry() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaAudienceValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaAudienceValidator();
         Jwt jwt = buildJwtWithAudience(List.of("other", "nvcf-icms:cluster-42"));
         OAuth2TokenValidatorResult result = validator.validate(jwt);
         assertFalse(result.hasErrors(), "Expected mixed audience with valid entry to be accepted");
@@ -330,7 +330,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaAudienceValidator_rejectsMultipleDifferentClusterAudiences() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaAudienceValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaAudienceValidator();
         Jwt jwt = buildJwtWithAudience(List.of("nvcf-icms:cluster-1", "nvcf-icms:cluster-2"));
         OAuth2TokenValidatorResult result = validator.validate(jwt);
         assertTrue(result.hasErrors(), "Expected multiple different nvcf-icms audiences to be rejected");
@@ -361,7 +361,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaSubjectValidator_acceptsPsatNvcaSubject() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject("system:serviceaccount:nvca-system:nvca");
 
         OAuth2TokenValidatorResult result = validator.validate(jwt);
@@ -372,7 +372,7 @@ class AuthManagerResolverTest {
     void nvcaSubjectValidator_acceptsNvcaSAInAnyNamespace() {
         // SA name must be exactly "nvca"; namespace is customer-configurable.
         // Verify the default helm namespace plus a customized one both pass.
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
 
         assertFalse(validator.validate(buildJwtWithSubject("system:serviceaccount:nvca-system:nvca")).hasErrors());
         assertFalse(validator.validate(buildJwtWithSubject("system:serviceaccount:customer-ns:nvca")).hasErrors());
@@ -384,7 +384,7 @@ class AuthManagerResolverTest {
         // Any SA other than `nvca` must be rejected, regardless of namespace.
         // This closes the "any workload in the cluster can impersonate" gap
         // surfaced by the adversarial review.
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
 
         for (String bad : new String[] {
                 "system:serviceaccount:nvca-system:nvca-operator",   // sibling SA
@@ -404,7 +404,7 @@ class AuthManagerResolverTest {
     void nvcaSubjectValidator_rejectsMalformedPsatSubjects() {
         // Subjects that start with system:serviceaccount: but aren't the
         // "<ns>:nvca" shape (missing ns, empty ns, extra ':' segments) must fail.
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
 
         for (String bad : new String[] {
                 "system:serviceaccount:nvca",                   // missing namespace
@@ -420,7 +420,7 @@ class AuthManagerResolverTest {
     @Test
     void nvcaSubjectValidator_rejectsNonServiceAccountPrefix() {
         // Subjects that LOOK like a PSAT SA but don't have the exact prefix must be rejected.
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject("system:user:default:attacker");
 
         OAuth2TokenValidatorResult result = validator.validate(jwt);
@@ -433,7 +433,7 @@ class AuthManagerResolverTest {
     @Test
     void nvcaSubjectValidator_rejectsEmptySubject() {
         // Empty string doesn't match either PSAT or SPIFFE prefix.
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject("");
 
         OAuth2TokenValidatorResult result = validator.validate(jwt);
@@ -442,7 +442,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaSubjectValidator_acceptsSpiffeNvcaSubject() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject(
                 "spiffe://trust-domain.example/tenant/nca-12345/cluster/abc-def-ghi/nvcf/nvca");
 
@@ -452,7 +452,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaSubjectValidator_rejectsWrongSpiffeSubject() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject(
                 "spiffe://trust-domain.example/tenant/nca-12345/cluster/abc-def-ghi/nvcf/other-workload");
 
@@ -465,7 +465,7 @@ class AuthManagerResolverTest {
     void nvcaSubjectValidator_rejectsSpiffeNvcaPrefixAttack() {
         // `/nvcf/nvca-attacker` starts with the expected segment but is a
         // different workload. contains() would accept it; endsWith() must not.
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject(
                 "spiffe://trust-domain.example/tenant/nca-12345/cluster/abc-def-ghi/nvcf/nvca-attacker");
 
@@ -477,7 +477,7 @@ class AuthManagerResolverTest {
     void nvcaSubjectValidator_rejectsSpiffeNvcaTrailingPath() {
         // `/nvcf/nvca/malicious` contains the expected segment but with additional
         // trailing path components. contains() would accept it; endsWith() must not.
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject(
                 "spiffe://trust-domain.example/tenant/nca-12345/cluster/abc-def-ghi/nvcf/nvca/malicious");
 
@@ -487,7 +487,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaSubjectValidator_rejectsNullSubject() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject(null);
 
         OAuth2TokenValidatorResult result = validator.validate(jwt);
@@ -497,7 +497,7 @@ class AuthManagerResolverTest {
 
     @Test
     void nvcaSubjectValidator_rejectsArbitrarySubject() {
-        OAuth2TokenValidator<Jwt> validator = AuthManagerResolver.nvcaSubjectValidator();
+        OAuth2TokenValidator<Jwt> validator = AuthManagerResolverConfiguration.nvcaSubjectValidator();
         Jwt jwt = buildJwtWithSubject("some-random-subject");
 
         OAuth2TokenValidatorResult result = validator.validate(jwt);
@@ -619,7 +619,7 @@ class AuthManagerResolverTest {
         // Given: resolver with admin-issuer set to api.nvcf (mirrors self-managed stack wiring).
         NvcaConfigurationProperties cfg = new NvcaConfigurationProperties();
         cfg.setOidcClusterIdentityEnabled(true);
-        AuthManagerResolver multi = new AuthManagerResolver(
+        AuthManagerResolverConfiguration multi = new AuthManagerResolverConfiguration(
                 apiKeysService, clusterRepository, cfg, "ES256",
                 "http://api.sis.svc.cluster.local",
                 "http://openbao/v1/services/sis-api/jwt/jwks",
@@ -665,7 +665,7 @@ class AuthManagerResolverTest {
         // Given: resolver configured with a trusted-issuers[] entry (admin-issuer left blank).
         NvcaConfigurationProperties cfg = new NvcaConfigurationProperties();
         cfg.setOidcClusterIdentityEnabled(true);
-        AuthManagerResolver multi = new AuthManagerResolver(
+        AuthManagerResolverConfiguration multi = new AuthManagerResolverConfiguration(
                 apiKeysService, clusterRepository, cfg, "ES256",
                 "http://api.sis.svc.cluster.local",
                 "http://openbao/v1/services/sis-api/jwt/jwks",
@@ -695,7 +695,7 @@ class AuthManagerResolverTest {
         // Given: both the legacy admin-issuer-uri and an additional trusted-issuers[] entry.
         NvcaConfigurationProperties cfg = new NvcaConfigurationProperties();
         cfg.setOidcClusterIdentityEnabled(true);
-        AuthManagerResolver multi = new AuthManagerResolver(
+        AuthManagerResolverConfiguration multi = new AuthManagerResolverConfiguration(
                 apiKeysService, clusterRepository, cfg, "ES256",
                 "http://api.sis.svc.cluster.local",
                 "http://openbao/v1/services/sis-api/jwt/jwks",
@@ -731,7 +731,7 @@ class AuthManagerResolverTest {
         // the primary, the (blank) admin, nor any trusted-issuers entry.
         NvcaConfigurationProperties cfg = new NvcaConfigurationProperties();
         cfg.setOidcClusterIdentityEnabled(true);
-        AuthManagerResolver multi = new AuthManagerResolver(
+        AuthManagerResolverConfiguration multi = new AuthManagerResolverConfiguration(
                 apiKeysService, clusterRepository, cfg, "ES256",
                 "http://api.sis.svc.cluster.local",
                 "http://openbao/v1/services/sis-api/jwt/jwks",
@@ -759,7 +759,7 @@ class AuthManagerResolverTest {
     @Test
     void trustedIssuers_entryAddedThenRebuilt_isTrusted() {
         TrustedJwtIssuerProperties props = new TrustedJwtIssuerProperties();
-        AuthManagerResolver multi = buildResolverWithTrustedIssuers(props);
+        AuthManagerResolverConfiguration multi = buildResolverWithTrustedIssuers(props);
 
         HttpServletRequest req = mock(HttpServletRequest.class);
         when(req.getHeader("Authorization"))
@@ -782,7 +782,7 @@ class AuthManagerResolverTest {
         TrustedJwtIssuerProperties props = trustedIssuers(
                 "http://api.external-nvcf.example.com",
                 "http://openbao.external/v1/services/nvcf-api/jwt/jwks");
-        AuthManagerResolver multi = buildResolverWithTrustedIssuers(props);
+        AuthManagerResolverConfiguration multi = buildResolverWithTrustedIssuers(props);
 
         HttpServletRequest req = mock(HttpServletRequest.class);
         when(req.getHeader("Authorization"))
@@ -800,7 +800,7 @@ class AuthManagerResolverTest {
     @Test
     void trustedIssuers_primaryIssuerSurvivesRebuild() {
         TrustedJwtIssuerProperties props = new TrustedJwtIssuerProperties();
-        AuthManagerResolver multi = buildResolverWithTrustedIssuers(props);
+        AuthManagerResolverConfiguration multi = buildResolverWithTrustedIssuers(props);
 
         props.setTrustedIssuers(List.of(trustedIssuerEntry(
                 "http://api.external-nvcf.example.com",
@@ -817,7 +817,7 @@ class AuthManagerResolverTest {
     void trustedIssuers_conflictingJwksOnRebuild_failsLoudly() {
         // Rejected on rebuild exactly as at startup, rather than silently keeping stale trust.
         TrustedJwtIssuerProperties props = new TrustedJwtIssuerProperties();
-        AuthManagerResolver multi = buildResolverWithTrustedIssuers(props);
+        AuthManagerResolverConfiguration multi = buildResolverWithTrustedIssuers(props);
         assertNotNull(multi.authenticationManagerResolver());
 
         props.setTrustedIssuers(List.of(trustedIssuerEntry(
@@ -874,10 +874,10 @@ class AuthManagerResolverTest {
     // --- api-key feature flag tests ---
 
     /** Build a resolver wired like setUp() but with the apiKeyAuthEnabled flag flipped. */
-    private AuthManagerResolver buildResolverWithApiKeysAuth(boolean apiKeyAuthEnabled) {
+    private AuthManagerResolverConfiguration buildResolverWithApiKeysAuth(boolean apiKeyAuthEnabled) {
         NvcaConfigurationProperties cfg = new NvcaConfigurationProperties();
         cfg.setOidcClusterIdentityEnabled(true);
-        return new AuthManagerResolver(
+        return new AuthManagerResolverConfiguration(
                 apiKeysService,
                 clusterRepository,
                 cfg,
@@ -907,9 +907,8 @@ class AuthManagerResolverTest {
 
     @Test
     void authenticationManagerResolver_apiKeyAuthDisabled_returnsNullForNvapi() {
-        // Self-hosted NVCF: ApiKeys disabled for ICMS. Resolver must return null so
-        // BearerTokenAuthenticationFilter produces a clean 401, instead of
-        // dialing ApiKeys service and crashing on missing creds.
+        // When API Keys are disabled, the resolver returns null for a clean 401
+        // without calling API Keys.
         AuthenticationManagerResolver<HttpServletRequest> authResolver =
                 buildResolverWithApiKeysAuth(false).authenticationManagerResolver();
 
@@ -958,10 +957,11 @@ class AuthManagerResolverTest {
     }
 
     /** Resolver over a caller-held properties instance, so the test can mutate it and refresh. */
-    private AuthManagerResolver buildResolverWithTrustedIssuers(TrustedJwtIssuerProperties props) {
+    private AuthManagerResolverConfiguration buildResolverWithTrustedIssuers(
+            TrustedJwtIssuerProperties props) {
         NvcaConfigurationProperties cfg = new NvcaConfigurationProperties();
         cfg.setOidcClusterIdentityEnabled(true);
-        return new AuthManagerResolver(
+        return new AuthManagerResolverConfiguration(
                 apiKeysService, clusterRepository, cfg, "ES256",
                 "http://api.sis.svc.cluster.local",
                 "http://openbao/v1/services/sis-api/jwt/jwks",

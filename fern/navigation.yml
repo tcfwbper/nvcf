@@ -223,6 +223,9 @@ navigation:
     - page: Event Ledger
       path: ../docs/self-managed/event-ledger.md
       slug: event-ledger
+    - page: ICMS API Keys
+      path: ../docs/self-managed/icms-api-keys.md
+      slug: icms-api-keys
     - page: Third-Party Registries
       path: ../docs/self-managed/third-party-registries.md
       slug: third-party-registries

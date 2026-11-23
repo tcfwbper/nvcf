@@ -36,6 +36,7 @@ SERVICE_ACCOUNT_NAME="api-keys-api"
 NVCT_SERVICE_ID="nvidia-cloud-tasks-ncp-service-id-nvcttasks"
 
 EVENT_LEDGER_SERVICE_ID="nvidia-event-ledger-ncp-service-id-ckozoh6f"
+ICMS_SERVICE_ID="icms-api"
 
 #-------------------------------------------
 # Set defaults for secret paths and policies
@@ -67,6 +68,22 @@ enable_secrets_mount "${VAULT_SECRET_BASE_PATH}/jwt" "vault-plugin-secrets-jwt"
 jwt_secret_mount_config=$(generate_jwt_secret_mount_config)
 config_jwt_secret_mount_config "${VAULT_SECRET_BASE_PATH}/jwt" "${jwt_secret_mount_config}"
 
+# Give SIS a token for API-key policy evaluation.
+SIS_SERVICE_ACCOUNT_NAMESPACE="sis"
+SIS_SERVICE_ACCOUNT_NAME="sis-api"
+SCOPES="pdp-evaluate"
+
+jwt_secret_role=$(generate_jwt_secret_role "${SERVICE_ACCOUNT_NAMESPACE}" "${SERVICE_ACCOUNT_NAME}" "${SIS_SERVICE_ACCOUNT_NAME}" "${SCOPES}")
+create_secret_jwt_role "${VAULT_SECRET_BASE_PATH}/jwt" "${SIS_SERVICE_ACCOUNT_NAME}" "${jwt_secret_role}"
+
+policy=$(generate_acl_policy "${VAULT_SECRET_BASE_PATH}/jwt/sign/${SIS_SERVICE_ACCOUNT_NAME}" "create,update,read")
+policy_name="${VAULT_POLICY_BASE_PATH}-jwt-sign-${SIS_SERVICE_ACCOUNT_NAME}-rw"
+write_policy "${policy_name}" "${policy}"
+
+sis_merged_policies=$(merge_jwt_role_policies "${SIS_SERVICE_ACCOUNT_NAME}" "${policy_name}" true)
+sis_jwt_auth_role=$(generate_jwt_auth_role "${SIS_SERVICE_ACCOUNT_NAME}" "${SIS_SERVICE_ACCOUNT_NAMESPACE}" "${sis_merged_policies}")
+create_auth_jwt_role "${SIS_SERVICE_ACCOUNT_NAME}" "${sis_jwt_auth_role}"
+
 
 #-------------------------------------------
 # Provision JWT Auth Role with policies
@@ -86,8 +103,9 @@ DATA_DOMAIN_KEY=$(generate_rand_key 136 base64)
 write_secrets_kv "${VAULT_SECRET_BASE_PATH}/kv" "keys/data-domain-key" "key=$DATA_DOMAIN_KEY"
 
 SVC_VALUE=$(base64_encode '[
-  {"serviceId":"nvidia-cloud-functions-ncp-service-id-aketm","serviceName":"nvcf-api","audienceServiceIds":["nvidia-cloud-functions-ncp-service-id-aketm"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3},
+  {"serviceId":"nvidia-cloud-functions-ncp-service-id-aketm","serviceName":"nvcf-api","audienceServiceIds":["nvidia-cloud-functions-ncp-service-id-aketm","'"${ICMS_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3},
   {"serviceId":"'"${NVCT_SERVICE_ID}"'","serviceName":"nvct-api","audienceServiceIds":["'"${NVCT_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3},
-  {"serviceId":"'"${EVENT_LEDGER_SERVICE_ID}"'","serviceName":"event-ledger","audienceServiceIds":["'"${EVENT_LEDGER_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3}
+  {"serviceId":"'"${EVENT_LEDGER_SERVICE_ID}"'","serviceName":"event-ledger","audienceServiceIds":["'"${EVENT_LEDGER_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3},
+  {"serviceId":"'"${ICMS_SERVICE_ID}"'","serviceName":"icms-api","audienceServiceIds":["'"${ICMS_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3}
 ]')
 write_secrets_kv "${VAULT_SECRET_BASE_PATH}/kv" "registrations/services" "services=$SVC_VALUE" true

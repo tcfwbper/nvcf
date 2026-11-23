@@ -292,7 +292,7 @@ icms:
 
   api-keys:
     url: http://localhost:9097
-    namespace: nvcfsis
+    namespace: icms
     package-name: apikey
     policy-name: allow
 

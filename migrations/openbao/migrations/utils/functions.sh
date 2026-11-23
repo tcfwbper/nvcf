@@ -341,15 +341,30 @@ EOF
 # create the role with them.
 #
 # Usage:
-#   merged=$(merge_jwt_role_policies <role_name> <policies_csv>)
+#   merged=$(merge_jwt_role_policies <role_name> <policies_csv> [require_existing])
 #
 function merge_jwt_role_policies() {
     local role_name=$1
     local new_policies_csv=$2
+    local require_existing=${3:-false}
 
-    local existing
-    existing=$(bao read -format=json "auth/jwt/role/${role_name}" 2>/dev/null \
-        | jq -r '.data.token_policies // [] | join(",")' 2>/dev/null) || existing=""
+    local role_json existing
+    if ! role_json=$(bao read -format=json "auth/jwt/role/${role_name}" 2>&1); then
+        if [[ "${role_json}" == *"No value found"* ]]; then
+            if [[ "${require_existing}" == true ]]; then
+                log_error "JWT auth role '${role_name}' must exist before policies are added" >&2
+                return 1
+            fi
+            echo "${new_policies_csv}"
+            return 0
+        fi
+        log_error "Cannot read JWT auth role '${role_name}': ${role_json}" >&2
+        return 1
+    fi
+    if ! existing=$(jq -er '.data.token_policies | if type == "array" then join(",") else error("missing token_policies") end' <<<"${role_json}"); then
+        log_error "Cannot parse policies for JWT auth role '${role_name}'" >&2
+        return 1
+    fi
 
     if [ -z "${existing}" ]; then
         echo "${new_policies_csv}"

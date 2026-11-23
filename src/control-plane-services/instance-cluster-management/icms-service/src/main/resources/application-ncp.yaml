@@ -44,7 +44,7 @@ spring:
           # register, PUT cluster rotate). Without this second issuer SIS's resolver only
           # routes iss=api.sis service-to-service tokens and rejects admin tokens with 401.
           #
-          # Maps to AuthManagerResolver's admin-issuer-uri / admin-jwk-set-uri constructor
+          # Maps to AuthManagerResolverConfiguration's admin-issuer-uri / admin-jwk-set-uri constructor
           # params; BOTH must be non-blank or the resolver falls back to single-issuer
           # behavior and admin tokens are rejected.
           admin-issuer-uri: http://api.nvcf.svc.cluster.local
@@ -109,6 +109,14 @@ logging:
     org.springframework.web: ERROR
 
 icms:
+  api-keys:
+    url: http://api-keys.api-keys.svc.cluster.local:8080
+    namespace: icms
+    package-name: apikey
+    policy-name: allow
+    request-property-name: apiKey
+    static:
+      token: ${kv.tokens.api-keys}
   telemetry:
     enabled: false
     oauth2:
@@ -167,7 +175,7 @@ icms:
     # Self-hosted uses OIDC/PSAT cluster identity; managed leaves this off.
     oidcClusterIdentityEnabled: true
     api-key:
-      enabled: false  # api-keys not supported for ICMS endpoints in self-hosted NVCF
+      enabled: true
     # NATS auth-callout defaults for NVCA agents. Each publish permission is
     # scoped to the verified PSAT clusterId; static _INBOX replies are subscribe-only.
     natsAuth:

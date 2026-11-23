@@ -60,7 +60,7 @@ public class NvcaConfigurationProperties {
      *   - POST /v1/si/accounts/{ncaId}/clusters ignores jwks/oidcIssuer in the request body
      *   - PUT /v1/nvca/clusters/{id}/jwks returns 404
      *   - POST /v1/nvca/tokens/introspect and /v1/si/oidc/tokens/introspect are not public
-     *   - AuthManagerResolver audience-based branch is disabled; falls back to legacy resolvers
+     *   - AuthManagerResolverConfiguration audience-based branch is disabled; falls back to legacy resolvers
      *
      * Self-hosted deployments set this to true through the ncp profile so nvcf-cli and
      * NVCA can use the OIDC/PSAT flow. Managed NVCF deployments leave this disabled.

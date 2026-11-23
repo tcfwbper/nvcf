@@ -73,6 +73,8 @@ releases:
     {{- end }}
     namespace: sis
     condition: icms.enabled
+    needs:
+      - api-keys/api-keys
     values:
       - ../global.yaml.gotmpl
       - ../secrets/{{ requiredEnv "HELMFILE_ENV" }}-secrets.yaml

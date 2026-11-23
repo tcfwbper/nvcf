@@ -36,4 +36,14 @@ public class StaticClientAuthConfiguration {
 
         private String token;
     }
+
+    @Data
+    @RefreshScope
+    @Configuration
+    @ConditionalOnProperty("icms.api-keys.static.token")
+    @ConfigurationProperties("icms.api-keys.static")
+    public static class StaticClientApiKeysProperties {
+
+        private String token;
+    }
 }

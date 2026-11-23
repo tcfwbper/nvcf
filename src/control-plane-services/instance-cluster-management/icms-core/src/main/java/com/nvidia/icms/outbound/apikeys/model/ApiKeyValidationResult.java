@@ -54,8 +54,8 @@ public class ApiKeyValidationResult {
     private Policy policy;
 
     public boolean isValid() {
-        return allowed && StringUtils.hasText(ncaId) && StringUtils.hasText(ownerId) &&
-                policy != null;
+        return allowed && StringUtils.hasText(ncaId) && StringUtils.hasText(ownerId)
+                && policy != null;
     }
 
     @JsonIgnore
@@ -73,9 +73,6 @@ public class ApiKeyValidationResult {
     @NoArgsConstructor
     @Builder
     public static class Policy {
-
-        @JsonProperty("aud")
-        private String aud;
 
         @JsonProperty("resources")
         @JsonSetter(nulls = Nulls.AS_EMPTY)

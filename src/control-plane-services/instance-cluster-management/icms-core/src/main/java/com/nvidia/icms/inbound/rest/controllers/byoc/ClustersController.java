@@ -49,7 +49,7 @@ public class ClustersController {
     private final ClustersService clustersService;
 
     @GetMapping("{ncaId}/clusterGroups")
-    @PreAuthorize("hasAuthority('cluster_listing')")
+    @PreAuthorize("hasAnyAuthority('cluster_listing', 'apikey:cluster_listing')")
     @Operation(summary = "List of registered clusters and groups within the account",
             description = "Get the list of registered clusters and groups within the account",
             responses = {

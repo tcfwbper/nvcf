@@ -61,7 +61,7 @@ class NcpProfileConfigurationTest {
         assertThat(environment.getProperty("spring.cassandra.local-datacenter")).isEqualTo("ncp");
         assertThat(environment.getProperty("spring.security.oauth2.resourceserver.jwt.issuer-uri"))
                 .isEqualTo("http://api.sis.svc.cluster.local");
-        // AuthManagerResolver enables the second (CLI admin) issuer only when BOTH
+        // AuthManagerResolverConfiguration enables the second (CLI admin) issuer only when BOTH
         // admin-issuer-uri and admin-jwk-set-uri are non-blank; assert the pair so
         // dropping either key fails here.
         assertThat(environment.getProperty("spring.security.oauth2.resourceserver.jwt.admin-issuer-uri"))

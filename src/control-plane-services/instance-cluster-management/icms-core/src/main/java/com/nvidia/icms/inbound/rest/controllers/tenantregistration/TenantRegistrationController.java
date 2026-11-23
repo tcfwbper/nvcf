@@ -57,10 +57,10 @@ public class TenantRegistrationController {
     private final TenantRegistrationService tenantRegistrationService;
 
     @PostMapping("{ncaId}/{tenant}/registrations")
-    @PreAuthorize("hasAuthority('tenant_registration')")
+    @PreAuthorize("hasAnyAuthority('tenant_registration', 'apikey:tenant_registration')")
     @Operation(
             summary = "Register a tenant application",
-            description = "Register a new tenant application (e.g. GDN) with SIS. Returns a unique registration token for use during NVCF function creation. Requires JWT with tenant_registration scope.",
+             description = "Register a new tenant application (e.g. GDN) with SIS. Returns a unique registration token for use during NVCF function creation. Requires tenant_registration scope.",
             requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(
                     content = @Content(
                             mediaType = APPLICATION_JSON_VALUE,
@@ -91,10 +91,10 @@ public class TenantRegistrationController {
     }
 
     @DeleteMapping("{ncaId}/{tenant}/registrations/{registrationId}")
-    @PreAuthorize("hasAuthority('tenant_registration')")
+    @PreAuthorize("hasAnyAuthority('tenant_registration', 'apikey:tenant_registration')")
     @Operation(
             summary = "Delete a tenant registration",
-            description = "Delete a tenant registration token. Only the tenant and ncaId that created the registration can delete it. Requires JWT with tenant_registration scope.",
+             description = "Delete a tenant registration token. Only the tenant and ncaId that created the registration can delete it. Requires tenant_registration scope.",
             responses = {
                     @ApiResponse(
                             responseCode = "204",

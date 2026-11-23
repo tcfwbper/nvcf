@@ -108,7 +108,7 @@ public class NvcaController {
     }
 
     @PutMapping("clusters/{clusterId}/register")
-    @PreAuthorize("hasAuthority('nvca-cluster') or hasAuthority('apikey:nvca-cluster')")
+    @PreAuthorize("hasAnyAuthority('nvca-cluster', 'apikey:nvca-cluster')")
     @Operation(summary = "Cluster Registration",
             description = "API to register a new backend",
             responses = {
@@ -150,7 +150,7 @@ public class NvcaController {
     // A separate route rather than a parameter on registerCluster: an ICMS without this
     // endpoint answers 404 instead of ignoring an unknown parameter and registering.
     @PostMapping("clusters/{clusterId}/register/validate")
-    @PreAuthorize("hasAuthority('nvca-cluster') or hasAuthority('apikey:nvca-cluster')")
+    @PreAuthorize("hasAnyAuthority('nvca-cluster', 'apikey:nvca-cluster')")
     @Operation(summary = "Validate Cluster Registration",
             description = "API to run the checks of cluster registration without applying it. "
                     + "It answers 204 when the same registration request would be accepted, "
@@ -191,7 +191,7 @@ public class NvcaController {
     }
 
     @GetMapping("clusters/{clusterId}/credentials")
-    @PreAuthorize("hasAuthority('nvca-cluster') or hasAuthority('apikey:nvca-cluster')")
+    @PreAuthorize("hasAnyAuthority('nvca-cluster', 'apikey:nvca-cluster')")
     @Operation(summary = "Renew credentials for creation and termination queues",
             description = "Request to renew SQS credentials for creation and termination queues",
             responses = {
@@ -216,7 +216,7 @@ public class NvcaController {
     }
 
     @PostMapping("clusters/{clusterId}/heartbeat")
-    @PreAuthorize("hasAuthority('nvca-cluster') or hasAuthority('apikey:nvca-cluster')")
+    @PreAuthorize("hasAnyAuthority('nvca-cluster', 'apikey:nvca-cluster')")
     @Operation(summary = "Cluster heartbeat",
             description = "API to send heartbeat of backend",
             responses = {
@@ -247,7 +247,8 @@ public class NvcaController {
     }
 
     @PutMapping("clusters/{clusterId}/jwks")
-    @PreAuthorize("hasAuthority('nvca-cluster') or hasAuthority('apikey:nvca-cluster') or hasAuthority('spiffe-authenticated') or hasAuthority('cluster-management')")
+    @PreAuthorize("hasAnyAuthority('nvca-cluster', 'spiffe-authenticated', "
+            + "'cluster-management', 'apikey:nvca-cluster')")
     @Operation(summary = "Update cluster JWKS",
             description = "Push updated JWKS for cert rotation",
             responses = {

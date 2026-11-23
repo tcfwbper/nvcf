@@ -40,6 +40,11 @@ public class ApiKeysException extends AuthenticationException {
         this.retryable = false;
     }
 
+    public ApiKeysException(String message, Throwable throwable, boolean retryable) {
+        super(message, throwable);
+        this.retryable = retryable;
+    }
+
     public boolean isRetryable() {
         return retryable;
     }

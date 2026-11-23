@@ -92,7 +92,7 @@ public class InstanceController {
     private final UnifiedErrorReporter unifiedErrorReporter;
 
     @PostMapping
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Request new instances",
             description = "An asynchronous request to create new instances",
             responses = {
@@ -130,7 +130,7 @@ public class InstanceController {
     }
 
     @GetMapping
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Describe instance requests or describe instances",
             description = "Request to describe instance requests or describe instances based on the action specified",
             responses = {
@@ -219,7 +219,7 @@ public class InstanceController {
     @GetMapping({"/accounts/{ncaId}/deployments/{workloadId}/instances",
             "/accounts/{ncaId}/tasks/{workloadId}/instances",
             "/accounts/{ncaId}/workloads/{workloadId}/instances"})
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Describe instances based on ncaId and deploymentId",
             description = "Request to describe instances based on ncaId and deploymentId",
             responses = {
@@ -290,7 +290,7 @@ public class InstanceController {
     @GetMapping({"/accounts/{ncaId}/deployments/{workloadId}/gpuSpecs/{gpuSpecId}/instances",
             "/accounts/{ncaId}/tasks/{workloadId}/gpuSpecs/{gpuSpecId}/instances",
             "/accounts/{ncaId}/workloads/{workloadId}/gpuSpecs/{gpuSpecId}/instances"})
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Describe instances based on ncaId, deploymentId or taskId and gpuSpecId",
                description = "Request to describe instances based on ncaId, deploymentId or taskId and gpuSpecId",
             responses = {
@@ -363,7 +363,7 @@ public class InstanceController {
 
 
     @DeleteMapping
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Terminate instances",
             description = "Request to terminate instances",
             responses = {
@@ -442,7 +442,7 @@ public class InstanceController {
     }
 
     @DeleteMapping("/accounts/{ncaId}/instances/{instanceId}")
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Terminate instance",
             description = "Request to terminate instance",
             responses = {
@@ -483,7 +483,7 @@ public class InstanceController {
     @DeleteMapping({"/accounts/{ncaId}/deployments/{workloadId}",
             "/accounts/{ncaId}/tasks/{workloadId}",
             "/accounts/{ncaId}/workloads/{workloadId}"})
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Terminate instance deployment",
             description = "Request to terminate instance deployment",
             responses = {
@@ -519,7 +519,7 @@ public class InstanceController {
 
     @DeleteMapping(value = "/accounts/{ncaId}/workloads/{workloadId}/instances",
             params = "InstanceCount")
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Terminate specified number of instances",
             description = "Terminates specified number of instances for the specified workload",
             responses = {
@@ -555,7 +555,7 @@ public class InstanceController {
     @DeleteMapping({"/accounts/{ncaId}/deployments/{workloadId}/gpuSpecs/{gpuSpecId}",
             "/accounts/{ncaId}/tasks/{workloadId}/gpuSpecs/{gpuSpecId}",
             "/accounts/{ncaId}/workloads/{workloadId}/gpuSpecs/{gpuSpecId}"})
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Terminate instance deployment",
             description = "Request to terminate instance deployment",
             responses = {
@@ -595,7 +595,7 @@ public class InstanceController {
     }
 
     @DeleteMapping("/accounts/{ncaId}/workloads/{workloadId}/gpuSpecs/{gpuSpecId}/instances")
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Terminate specified number of instances",
             description = "Terminates specified number of instances for the specified gpu-spec",
             responses = {
@@ -630,7 +630,7 @@ public class InstanceController {
     }
 
     @PutMapping
-    @PreAuthorize("hasAuthority('spot-request') or hasAuthority('instance-request')")
+    @PreAuthorize("hasAnyAuthority('spot-request', 'instance-request', 'apikey:instance-request')")
     @Operation(summary = "Cancel instance requests",
             description = "Request to cancel open instance requests",
             responses = {
@@ -682,7 +682,7 @@ public class InstanceController {
     }
 
     @PostMapping("billing")
-    @PreAuthorize("hasAuthority('billing_override') or hasAuthority('apikey:billing_override')")
+    @PreAuthorize("hasAnyAuthority('billing_override', 'apikey:billing_override')")
     @Operation(summary = "Override the billing nca id of a NVCF function and version",
             description = "Request to override the billing nca id of all instances associated to specified NVCF function and version",
             requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(
@@ -707,8 +707,7 @@ public class InstanceController {
     }
 
     @GetMapping("/clusters/{zoneName}/instances")
-    @PreAuthorize("hasAuthority('cluster-instances') or hasAuthority('nvca-cluster') "
-            + "or hasAuthority('apikey:nvca-cluster')")
+    @PreAuthorize("hasAnyAuthority('cluster-instances', 'nvca-cluster', 'apikey:nvca-cluster')")
     @Operation(summary = "Get instances from zone or cluster",
             description = "Request to get instances from zone or cluster",
             responses = {
@@ -733,7 +732,8 @@ public class InstanceController {
 
     // ADMIN APIs
     @GetMapping("/admin")
-    @PreAuthorize("hasAuthority('admin:spot-request:describe') or hasAuthority('admin:instance-request:describe')")
+    @PreAuthorize("hasAnyAuthority('admin:spot-request:describe', 'admin:instance-request:describe', "
+            + "'apikey:admin:spot-request:describe', 'apikey:admin:instance-request:describe')")
     @Operation(summary = "Describe any instance requests",
             description = "Request to describe instance requests based on the action specified",
             responses = {

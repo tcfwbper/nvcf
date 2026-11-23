@@ -578,11 +578,38 @@ func TestValidatePullSecretContexts(t *testing.T) {
 	}
 }
 
-// TestSingleClusterHelmfileFeatureFileWiresToSteps runs
-// single-cluster-helmfile.feature against a fake runner. The fixture
-// the feature copies from is seeded into the wiring suite's RepoRoot
-// so the I copy / I update yaml chain has a real source file. The
-// fake runner is pre-loaded with canned JSON for the Helm release assertion.
+// icmsKeyHTTPFake models the API Keys and ICMS calls added to the Helmfile scenario.
+type icmsKeyHTTPFake struct {
+	next harness.HTTPClient
+}
+
+func (f *icmsKeyHTTPFake) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (harness.HTTPResponse, error) {
+	if strings.HasPrefix(rawURL, "http://api-keys.localhost:8080/v1/keys") &&
+		headers["Key-Issuer-Id"] == "icms-api" {
+		if method == "POST" {
+			return harness.HTTPResponse{Status: 200, Body: `{"id":"icms-key-1","value":"nvapi-icms-test"}`}, nil
+		}
+		return harness.HTTPResponse{Status: 204}, nil
+	}
+	if strings.HasPrefix(rawURL, "http://sis.localhost:8080/") {
+		if headers["Authorization"] == "Bearer nvapi-not-a-real-key" {
+			return harness.HTTPResponse{Status: 401}, nil
+		}
+		if headers["Authorization"] == "Bearer nvapi-icms-test" {
+			if method == "POST" {
+				if headers["Content-Type"] != "application/json" {
+					return harness.HTTPResponse{Status: 415}, nil
+				}
+				return harness.HTTPResponse{Status: 403}, nil
+			}
+			return harness.HTTPResponse{Status: 200, Body: `{}`}, nil
+		}
+	}
+	return f.next.Do(ctx, method, rawURL, headers, body)
+}
+
+// TestSingleClusterHelmfileFeatureFileWiresToSteps runs the Helmfile feature
+// against a fake runner with fixture files and Helm release responses.
 func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	const templateCommand = "make -C deploy/stacks/self-managed template HELMFILE_ENV=local-bdd"
 	const selectedFunctionStatusCommand = `/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml status --json`
@@ -623,7 +650,8 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		gatewayTransportCommand:  {ExitCode: 0, Stdout: "true"},
 		llmWorkerShutdownCommand: {ExitCode: 0, Stdout: "grace=120 prestop=sleep 60 drain=55000\n"},
 		"kubectl --context k3d-ncp-local get configmap/vanity-gateway-env -n nvcf -o jsonpath={.data.MAX_REQUEST_SIZE_BYTES}": {ExitCode: 0, Stdout: "67108864"},
-		gatewayServiceMonitorCommand: {ExitCode: 0, Stdout: "kind: ConfigMap\nmetadata:\n  name: llm-api-gateway\n"},
+		gatewayServiceMonitorCommand:                                 {ExitCode: 0, Stdout: "kind: ConfigMap\nmetadata:\n  name: llm-api-gateway\n"},
+		`/bin/bash -c 'date -u -d "+1 day" +%Y-%m-%dT%H:%M:%S.000Z'`: {ExitCode: 0, Stdout: "2030-01-01T00:00:00.000Z\n"},
 		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke --request-body '{\"message\":\"bdd-echo\",\"repeats\":1}' --timeout 120 --poll-duration 5": {
 			ExitCode: 0,
 			Stdout:   "Function invocation completed!\n\nResponse:\n{\"rawResponse\":\"bdd-echo\"}\n",
@@ -689,6 +717,10 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	writeProfileHandoffArtifact(t, suite.Config.RepoRoot)
 	writeHelmfileRegisterValues(t, suite.Config.RepoRoot)
 	seedFunctionAPIKey(t, home)
+	if err := os.WriteFile(filepath.Join(home, ".nvcf-cli.nvcf-cli-local.state"),
+		[]byte(`{"token":"admin-jwt","apiKey":"wiring-function-api-key"}`), 0o600); err != nil {
+		t.Fatalf("write NVCF CLI state: %v", err)
+	}
 
 	decisionRoutes := newDecisionRoutesFake("", &llmRoutingHTTPFake{seen: map[string]bool{}})
 	vanityShadow := newVanityShadowFake("", decisionRoutes)
@@ -696,7 +728,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	decisionRoutes.attach(runner, suite.Config.RepoRoot)
 	requestBody := newVanityRequestBodyFake("", vanityShadow)
 	requestBody.attach(runner)
-	suite.HTTP = requestBody
+	suite.HTTP = &icmsKeyHTTPFake{next: requestBody}
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "single-cluster-helmfile.feature")
 	var out strings.Builder

@@ -23,7 +23,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.nvidia.icms.configuration.nvca.NvcaConfigurationProperties;
-import com.nvidia.icms.configuration.security.AuthManagerResolver;
+import com.nvidia.icms.configuration.security.AuthManagerResolverConfiguration;
 import com.nvidia.icms.inbound.rest.model.nvca.NatsAuthorizeRequest;
 import com.nvidia.icms.inbound.rest.model.nvca.TokenIntrospectRequest;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
@@ -46,7 +46,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 class NvcaControllerUnitTest {
 
     @Mock
-    private AuthManagerResolver authManagerResolver;
+    private AuthManagerResolverConfiguration authManagerResolver;
 
     @Mock
     private ClusterOidcIdentityService clusterOidcIdentityService;

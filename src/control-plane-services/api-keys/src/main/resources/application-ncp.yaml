@@ -43,6 +43,7 @@ management:
 apikeys:
   nca-id: ${NVCF_NCA_ID:nvcf-default}  # Hardcoded till we support multitenancy in self-hosted env
   service-id-map:
+    icms: ${ICMS_SERVICE_ID:icms-api}
     nvcf: ${NVCF_SERVICE_ID:nvidia-cloud-functions-ncp-service-id-aketm}
     nvct: ${NVCT_SERVICE_ID:nvidia-cloud-tasks-ncp-service-id-nvcttasks}
     event-ledger: ${EVENT_LEDGER_SERVICE_ID:nvidia-event-ledger-ncp-service-id-ckozoh6f}

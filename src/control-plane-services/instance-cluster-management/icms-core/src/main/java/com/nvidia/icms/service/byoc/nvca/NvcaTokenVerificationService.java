@@ -4,7 +4,7 @@
  */
 package com.nvidia.icms.service.byoc.nvca;
 
-import com.nvidia.icms.configuration.security.AuthManagerResolver;
+import com.nvidia.icms.configuration.security.AuthManagerResolverConfiguration;
 import com.nvidia.icms.configuration.security.JwtSizeLimitFilter;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import java.nio.charset.StandardCharsets;
@@ -36,7 +36,7 @@ import org.springframework.stereotype.Service;
 @RequiredArgsConstructor
 public class NvcaTokenVerificationService {
 
-    private final AuthManagerResolver authManagerResolver;
+    private final AuthManagerResolverConfiguration authManagerResolver;
     private final ClusterOidcIdentityService clusterOidcIdentityService;
 
     /**
@@ -56,7 +56,8 @@ public class NvcaTokenVerificationService {
 
         // Unsigned parse of the audience to pick the right JWKS. Any signature
         // error surfaces below when the decoder runs against that JWKS.
-        String clusterIdFromAud = AuthManagerResolver.extractClusterIdFromAudience("Bearer " + token);
+        String clusterIdFromAud = AuthManagerResolverConfiguration.extractClusterIdFromAudience(
+                "Bearer " + token);
         if (clusterIdFromAud == null) {
             return Outcome.reject(RejectReason.INVALID_AUDIENCE,
                     "Audience must contain cluster ID in format nvcf-icms:{clusterId}");

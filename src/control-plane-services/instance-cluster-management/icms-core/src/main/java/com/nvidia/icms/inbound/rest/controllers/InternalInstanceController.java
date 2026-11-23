@@ -57,7 +57,8 @@ public class InternalInstanceController {
     }
 
     @PutMapping("/{spotInstanceRequestId}")
-    @PreAuthorize("hasAuthority('spot-status-update') or hasAuthority('instance-status-update') or hasAuthority('instance_request_update') or hasAuthority('apikey:nvca-cluster')")
+    @PreAuthorize("hasAnyAuthority('spot-status-update', 'instance-status-update', "
+            + "'instance_request_update', 'apikey:nvca-cluster')")
     @Operation(summary = "Update instance request status",
             description = "Request to update the status of an instance request",
             responses = {
@@ -88,7 +89,8 @@ public class InternalInstanceController {
     }
 
     @PostMapping("/{spotInstanceRequestId}/{instanceId}")
-    @PreAuthorize("hasAuthority('spot-status-update') or hasAuthority('instance-status-update') or hasAuthority('instance_request_update') or hasAuthority('apikey:nvca-cluster')")
+    @PreAuthorize("hasAnyAuthority('spot-status-update', 'instance-status-update', "
+            + "'instance_request_update', 'apikey:nvca-cluster')")
     @Operation(summary = "Update instance status",
             description = "Update status of an instance associated with an instanceId and requestId",
             responses = {
