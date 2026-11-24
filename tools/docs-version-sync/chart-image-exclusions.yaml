@@ -29,15 +29,14 @@
 #                      by rendering.
 #   vendored-subchart  Lives at <parent>/charts/<name>, where <parent> is
 #                      itself a chart. Skipped.
-#   dev-only           Deployed only by an unreleased development stack, such
-#                      as stargate-dev. Skipped, and may declare an image
-#                      index. The entry fails when a released stack deploys
-#                      the chart, including a dev-only stack that gains
-#                      release-inventory.yaml. CI cannot build a dev-only
-#                      stack (stargate-dev reads a protected values file), so
-#                      whether one deploys the chart is not verified. Never
-#                      use it for a chart users install directly; review
-#                      enforces this.
+#   dev-only           Deployed only by an unreleased development stack.
+#                      Skipped, and may declare an image index. The entry
+#                      fails when a released stack deploys the chart,
+#                      including a dev-only stack that gains
+#                      release-inventory.yaml. CI does not build
+#                      dev-only stacks, so whether one deploys the chart is
+#                      not verified. Never use it for a chart users install
+#                      directly; review enforces this.
 #
 # issue (optional, pending-fix only): a free-form note, such as a tracking
 # link. It is not validated. This file is public, so keep private tracker IDs
@@ -78,10 +77,6 @@ deploy/stacks/self-managed/charts/nvcf-upgrade-receipt: {reason: pending-fix}
 src/compute-plane-services/nvsnap/deploy/helm/nvsnap: {reason: pending-fix}
 # Listed conservatively; revisit if this turns out to be a sample.
 src/uis/nvcf-ui/helm: {reason: pending-fix}
-
-# dev-only
-deploy/stacks/stargate-dev/charts/stargate-dev-auth: {reason: dev-only}
-deploy/stacks/stargate-dev/charts/stargate-dev-mockdc: {reason: dev-only}
 
 # vendored-subchart
 deploy/helm/cert-manager/charts/cert-manager: {reason: vendored-subchart}

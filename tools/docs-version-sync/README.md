@@ -365,7 +365,9 @@ mirrors with different repository names. The image index is used by CI; Helm
 consumes the existing values keys directly.
 
 Run the image coverage test, which checks defaults, indirect images and
-ordinary overrides for every tracked chart, then this chart's own guards:
+ordinary overrides for every tracked chart, then this chart's own guards.
+The coverage test runs `helmfile build` on the released stacks to classify
+each chart, so it needs `helmfile` as well as `helm`:
 
 ```sh
 NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestChartImageCoverage$' -count=1

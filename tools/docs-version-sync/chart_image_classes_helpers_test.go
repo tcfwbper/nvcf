@@ -38,7 +38,7 @@ func (s chartStacks) class(chart string) string {
 }
 
 // chartSubject labels a chart with its class in findings and summary lines,
-// such as "deploy/helm/nvstor (standalone)".
+// such as "deploy/helm/x (standalone)".
 func chartSubject(chart, class string) string {
 	return chart + " (" + class + ")"
 }

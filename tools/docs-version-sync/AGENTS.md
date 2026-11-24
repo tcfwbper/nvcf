@@ -52,7 +52,7 @@ override helpers test-only; installation uses native Helm values.
 
 A chart that only an unreleased development stack deploys is listed as
 `dev-only`. The entry fails when a released stack deploys the chart. Where the
-chart lives is not checked. CI cannot build a `dev-only` stack, so whether one
+chart lives is not checked. CI does not build `dev-only` stacks, so whether one
 deploys the chart is not verified. Never list a chart that users install
 directly as `dev-only`; it must pass the standalone checks instead. Review
 enforces this.
