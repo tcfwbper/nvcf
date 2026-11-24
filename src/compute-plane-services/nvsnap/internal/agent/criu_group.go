@@ -168,6 +168,37 @@ func recordProcessConfig(data map[string]string, i int, pod *corev1.Pod, contain
 	data[fmt.Sprintf("processConfig.%d", i)] = pc
 }
 
+// groupUnusedVolumesKey holds, comma-separated, the emptyDir volumes every
+// placeholder of the group skips filling (webhook.GroupUnusedVolumes).
+const groupUnusedVolumesKey = "unusedVolumes"
+
+// recordUnusedVolumes decides, from the members' dumps, the volumes the
+// group's placeholders skip filling, and records them in data; it records
+// none, and logs why, when the group skips nothing. members holds the
+// ranks first, then the companions, in results' order.
+func recordUnusedVolumes(data map[string]string, members []*corev1.Pod, ranks int, companionContainers map[string]string, results []*CheckpointResult, log *logrus.Entry) {
+	uses := make([]webhook.MemberVolumeUse, len(results))
+	for i, r := range results {
+		ctr := companionContainers[members[i].Name]
+		if i < ranks {
+			ctr = gpuContainer(members[i])
+		}
+		u := webhook.MemberVolumeUse{Pod: members[i], Container: ctr,
+			Large: webhook.VolumesAt(members[i], ctr, r.LargeEmptyDirs)}
+		if r.UsedMounts != nil {
+			u.Used = webhook.VolumesAt(members[i], ctr, *r.UsedMounts)
+		}
+		uses[i] = u
+	}
+	unused, why := webhook.GroupUnusedVolumes(uses)
+	if len(unused) == 0 {
+		log.WithField("reason", why).Info("CRIU group capture: its restores run all their setup")
+		return
+	}
+	data[groupUnusedVolumesKey] = strings.Join(unused, ",")
+	log.WithField("volumes", unused).Info("CRIU group capture: no restored process uses these volumes, too large to copy; its restores skip filling them")
+}
+
 // processConfigRecordBudget bounds the room the members' process
 // configurations take in a group record, a ConfigMap of at most 1 MiB that
 // also holds the members' failures (groupReasonMax). A Dynamo worker's is
@@ -201,6 +232,9 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 		g.Bundles[i] = data[fmt.Sprintf("bundle.%d", i)]
 		g.ColdEntrypoints[i] = data[fmt.Sprintf("coldEntrypoint.%d", i)]
 		g.ProcessConfigs[i] = data[fmt.Sprintf("processConfig.%d", i)]
+	}
+	if v := data[groupUnusedVolumesKey]; v != "" {
+		g.UnusedVolumes = strings.Split(v, ",")
 	}
 	return g, true
 }
@@ -782,6 +816,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		if c.a.gpushareEnabledFor(ranks[0]) {
 			data["gpushare"] = "true"
 		}
+		if c.a.config.Webhook.SkipUnusedInits {
+			recordUnusedVolumes(data, members, len(ranks), companionContainers, results, log)
+		}
 		if aliases != "" {
 			data["serviceAddrs"] = aliases
 		}
@@ -1242,12 +1279,15 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	defer metrics.Active("checkpoint")()
 	capture := time.Now().UTC().Format("20060102T150405.000000000")
 	reqs := make([]CheckpointRequest, 0, len(ranks)+len(companions))
+	// Only an instance of several members restores as a group, whose
+	// placeholders may skip setup.
+	use := c.a.config.Webhook.SkipUnusedInits && len(ranks)+len(companions) > 1
 	for _, p := range ranks {
-		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture})
+		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use})
 	}
 	for _, p := range companions {
 		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: companionContainers[p.Name],
-			CaptureID: capture, Companion: true})
+			CaptureID: capture, Companion: true, VolumeUse: use})
 	}
 	if len(reqs) == 1 {
 		// A failed dump puts the pod back as it was.

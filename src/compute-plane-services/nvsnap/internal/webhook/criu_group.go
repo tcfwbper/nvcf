@@ -69,6 +69,11 @@ type CRIUGroup struct {
 	// configuration as its pod was admitted (ProcessConfig). Empty for
 	// none recorded: a capture from before it was.
 	ProcessConfigs []string
+	// UnusedVolumes are the emptyDir volumes no restored process of any
+	// member uses, whose setup every placeholder skips
+	// (GroupUnusedVolumes); empty for none, or a capture that did not
+	// decide it.
+	UnusedVolumes []string
 	// VerifyNamespace, when set, is the only namespace that may restore
 	// from the capture: the instance stopped for it, whose restore
 	// verifies it. Empty once a restore has succeeded.
@@ -240,6 +245,9 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	}
 	if ordinal < len(g.ColdEntrypoints) && g.ColdEntrypoints[ordinal] != "" {
 		man.SourcePodMeta[ColdEntrypointMeta] = g.ColdEntrypoints[ordinal]
+	}
+	if len(g.UnusedVolumes) > 0 {
+		man.SourcePodMeta[unusedVolumesMeta] = strings.Join(g.UnusedVolumes, ",")
 	}
 	id := g.Checkpoints[ordinal]
 	// A capture of one pod with no companions restores alone: nothing it

@@ -277,7 +277,7 @@ func TestCaptureReplayMountsSkipsWhatTheDumpSaves(t *testing.T) {
 	dir := t.TempDir()
 	a := &Agent{}
 	ci := &containerd.ContainerInfo{PID: uint32(os.Getpid())} //nolint:gosec // a pid fits in 32 bits
-	got := a.captureReplayMounts(context.Background(), ci, dir, map[string]bool{"/dev/shm": true}, logrus.NewEntry(logrus.New()))
+	got := a.captureReplayMounts(context.Background(), ci, dir, map[string]bool{"/dev/shm": true}, nil, logrus.NewEntry(logrus.New()))
 	if len(got) != 0 {
 		t.Errorf("replay mounts: %+v", got)
 	}

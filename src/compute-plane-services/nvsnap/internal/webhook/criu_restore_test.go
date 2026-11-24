@@ -483,7 +483,15 @@ func TestCRIURestore_GroupPlaceholderKeepsInitChainsAndSidecarInputs(t *testing.
 // name, whether each init container still runs its own command.
 func placeholderInits(t *testing.T, pod *corev1.Pod, group bool) map[string]bool {
 	t.Helper()
-	got := applyPatches(t, pod, placeholderInitPatches(pod, group))
+	return placeholderInitsUnused(t, pod, group, nil)
+}
+
+// placeholderInitsUnused is placeholderInits for a group whose capture
+// found the volumes in unused used by no restored process.
+func placeholderInitsUnused(t *testing.T, pod *corev1.Pod, group bool, unused map[string]bool) map[string]bool {
+	t.Helper()
+	ctr := pod.Spec.Containers[gpuContainerIndex(pod, 1)].Name
+	got := applyPatches(t, pod, placeholderInitPatches(pod, group, ctr, unused))
 	run := map[string]bool{}
 	for _, c := range got.Spec.InitContainers {
 		skipped := len(c.Command) > 1 && c.Command[0] == HelperBin && c.Command[1] == "skip"

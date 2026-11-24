@@ -186,6 +186,9 @@ spec:
             {{- with .Values.webhook.dynamoNamespace }}
             - --webhook-dynamo-namespace={{ . }}
             {{- end }}
+            {{- if .Values.webhook.skipUnusedInits }}
+            - --webhook-skip-unused-inits
+            {{- end }}
             {{- with .Values.webhook.dynamoLeaseTTL }}
             - --webhook-dynamo-lease-ttl={{ . }}
             {{- end }}

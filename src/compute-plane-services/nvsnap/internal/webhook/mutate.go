@@ -372,6 +372,10 @@ type Mutator struct {
 	// Job runs within it.
 	AgentPlacement AgentPlacement
 
+	// SkipUnusedInits lets a group restore's placeholders skip the init
+	// containers that fill only volumes no restored process uses, as the
+	// group's capture recorded them (unused_volumes.go).
+	SkipUnusedInits bool
 	// DynamoNamespace is the fixed Dynamo namespace the webhook gives
 	// every Dynamo component whose etcd and NATS are its instance's own
 	// (dynamo.go). Empty leaves the operator's.

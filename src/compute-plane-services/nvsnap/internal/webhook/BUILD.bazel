@@ -34,6 +34,7 @@ go_library(
         "rootfs_l2_overlay.go",
         "server.go",
         "tools_mount.go",
+        "unused_volumes.go",
     ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook",
     visibility = ["//src/compute-plane-services/nvsnap:__subpackages__"],
@@ -89,6 +90,7 @@ go_test(
         "rootfs_l2_overlay_test.go",
         "server_test.go",
         "tools_mount_test.go",
+        "unused_volumes_test.go",
     ],
     embed = [":webhook"],
     deps = [

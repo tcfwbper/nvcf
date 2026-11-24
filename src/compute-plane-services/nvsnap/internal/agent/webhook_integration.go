@@ -61,6 +61,9 @@ type WebhookConfig struct {
 	// DynamoNamespace is the fixed Dynamo namespace for Dynamo components
 	// (webhook.Mutator.DynamoNamespace).
 	DynamoNamespace string
+	// SkipUnusedInits is webhook.Mutator.SkipUnusedInits; it also makes a
+	// group capture record the volumes its restores may skip filling.
+	SkipUnusedInits bool
 	// DynamoLeaseTTL is webhook.Mutator.DynamoLeaseTTL.
 	DynamoLeaseTTL int
 	// CaptureLivenessBudget is webhook.Mutator.CaptureLivenessBudget.
@@ -153,6 +156,7 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		Backend:               backend,
 		AgentPlacement:        placement,
 		DynamoNamespace:       cfg.DynamoNamespace,
+		SkipUnusedInits:       cfg.SkipUnusedInits,
 		DynamoLeaseTTL:        cfg.DynamoLeaseTTL,
 		CaptureLivenessBudget: cfg.CaptureLivenessBudget,
 		// nvsnap#194 + #88: per-pod OverlayFS unions over every captured

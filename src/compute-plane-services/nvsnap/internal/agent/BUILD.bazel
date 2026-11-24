@@ -104,6 +104,7 @@ go_library(
         "tar_extract.go",
         "teardown_barrier.go",
         "verify_abandoned.go",
+        "volume_uses.go",
         "webhook_integration.go",
         "workload_exited.go",
     ],
@@ -281,6 +282,7 @@ go_test(
         "tar_pipe_test.go",
         "teardown_barrier_test.go",
         "verify_abandoned_test.go",
+        "volume_uses_test.go",
         "workload_exited_test.go",
     ],
     data = glob(["testdata/**"]) + [

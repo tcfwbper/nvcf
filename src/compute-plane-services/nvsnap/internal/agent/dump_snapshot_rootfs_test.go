@@ -28,7 +28,7 @@ func snapshotOf(t *testing.T, upper string) (snap func() error, ckpt string) {
 	log.SetOutput(io.Discard)
 	a := &Agent{log: log}
 	ci := &containerd.ContainerInfo{PID: uint32(os.Getpid())} //nolint:gosec // a pid fits in 32 bits
-	take := a.dumpSnapshot(context.Background(), ci, ckpt, upper, nil, &[]ReplayMount{}, logrus.NewEntry(log))
+	take := a.dumpSnapshot(context.Background(), ci, ckpt, upper, nil, &[]ReplayMount{}, nil, logrus.NewEntry(log))
 	return func() error { return take(map[string]bool{"/dev/shm": true}) }, ckpt
 }
 

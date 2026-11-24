@@ -39,28 +39,12 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
-// recreatingOwners are the controller kinds known to replace a pod of
-// theirs that is deleted. A pod owned by any other kind, or by none, is
-// treated as one nothing recreates: keeping it costs a cold start in place,
-// deleting it may cost the pod.
-var recreatingOwners = map[string]bool{
-	"ReplicaSet":            true,
-	"ReplicationController": true,
-	"StatefulSet":           true,
-	"DaemonSet":             true,
-	"Job":                   true,
-	"PodClique":             true, // grove.io: Dynamo multi-node graphs
-}
-
 // podRecreatedOnDelete reports whether a controller replaces pod when it is
-// deleted.
+// deleted (webhook.RecreatingOwners). A pod owned by any other kind, or by
+// none, is treated as one nothing recreates: keeping it costs a cold start
+// in place, deleting it may cost the pod.
 func podRecreatedOnDelete(pod *corev1.Pod) bool {
-	for _, o := range pod.OwnerReferences {
-		if o.Controller != nil && *o.Controller && recreatingOwners[o.Kind] {
-			return true
-		}
-	}
-	return false
+	return webhook.PodRecreatedOnDelete(pod)
 }
 
 // coldStarted reports whether pod is a placeholder the agent started cold:

@@ -670,6 +670,18 @@ webhook:
   # or for a gradual rollout. The pod-level opt-out applies in both.
   injectScope: all
 
+  # Let a group restore's placeholders skip the init containers that fill
+  # only emptyDirs too large to copy into the checkpoint (over
+  # NVSNAP_REPLAY_EMPTYDIR_MAX_BYTES, 4 GiB) that no restored process of
+  # any member uses, typically a model download: without a model volume,
+  # every placeholder would download the whole model again before its
+  # restore could start. Decided once per group at capture, from the dumps;
+  # pods with no recreating controller, Jobs' pods, and pods annotated
+  # nvsnap.io/keep-inits never skip. Verify does not send inference
+  # requests, so a workload that reads its model files again after it
+  # starts would serve errors from a restore: keep off in production until
+  # verify checks inference.
+  skipUnusedInits: false
   # Fixed Dynamo namespace (DYN_NAMESPACE and DYN_NAMESPACE_PREFIX) for
   # Dynamo components whose etcd and NATS are services of their own
   # Kubernetes namespace. The operator derives the Dynamo namespace from the

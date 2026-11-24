@@ -83,6 +83,7 @@ where the files column says.
 | `nvsnap.io/hash` | `HashAnnotation` (internal/election/election.go)<br>`HashLabel` (internal/election/election.go)<br>`stampedHashAnnotation` (internal/rootfsonly/watcher.go) | Carries the full cache hash the webhook composed at admission. |
 | `nvsnap.io/hash-short` | `labelHashShort` (internal/checkpointstore/promoter_shared.go) |  |
 | `nvsnap.io/inject` | `InjectLabel` (internal/webhook/mutate.go) | On a pod (or, via the registration's namespaceSelector, on its namespace) set to InjectDisabled opts the pod out of every nvsnap mutation. |
+| `nvsnap.io/keep-inits` | `KeepInitsAnnotation` (internal/webhook/unused_volumes.go) | Keeps every init a group placeholder would skip for unused volumes, when set to any value on a workload's pods: for a workload that reads its setup's output again after it starts. |
 | `nvsnap.io/kind` | `CMLabelKind` (internal/checkpointstore/cmregistry.go)<br>`LeaseKindLabel` (internal/election/election.go) | Marks ConfigMaps managed by nvsnap so list/cleanup queries can filter them. |
 | `nvsnap.io/last-used` | `LastUsedAnnotation` (internal/modelvolume/modelvolume.go) | On a primary PV is the RFC 3339 time a pod last admitted against it (or it completed). |
 | `nvsnap.io/leader-id` | `LeaderIDAnnotation` (internal/election/election.go) |  |
@@ -118,12 +119,14 @@ where the files column says.
 | `nvsnap.io/restored` | inline: internal/webhook/criu_restore.go |  |
 | `nvsnap.io/role` | `RoleAnnotation` (internal/election/election.go)<br>`ViewRoleLabel` (internal/modelvolume/modelvolume.go) | Records the admission decision: leader, follower or restore. |
 | `nvsnap.io/short-hash` | `CMLabelShortHash` (internal/checkpointstore/cmregistry.go) | Is the 32-char short hash (128 bits), suitable for label selectors. |
+| `nvsnap.io/skipped-inits` | `SkippedInitsAnnotation` (internal/webhook/unused_volumes.go) | Names, on a group placeholder, the init containers it skips because they fill only volumes no restored process uses. |
 | `nvsnap.io/source-engine` | `LabelSourceEngine` (internal/checkpointstore/cmregistry.go) | Is the engine type ("vllm", "sglang", "trtllm", "nim"). |
 | `nvsnap.io/source-image-base` | `LabelSourceImageBase` (internal/checkpointstore/cmregistry.go) | Is the base image name (no registry, no tag, DNS-label-sanitized). |
 | `nvsnap.io/source-namespace` | `LabelSourceNamespace` (internal/checkpointstore/cmregistry.go) | Identifies the originating pod's namespace. |
 | `nvsnap.io/source-pv` | `SourcePVLabel` (internal/modelvolume/modelvolume.go) | On a read-only view names the primary it was minted from, so liveness and retirement work per generation. |
 | `nvsnap.io/target-node` | `TargetNodeAnnotation` (internal/webhook/mutate.go) | Overrides the auto-pin to manifest.CapturedOnNodes. |
 | `nvsnap.io/tenant` | `LabelTenant` (internal/fnstatus/fnstatus.go) |  |
+| `nvsnap.io/unused-volumes` | `unusedVolumesMeta` (internal/webhook/unused_volumes.go) | Carries a group record's UnusedVolumes to the placeholder patches, comma-separated. |
 | `nvsnap.io/v1alpha1` | inline: internal/server/server.go |  |
 | `nvsnap.io/volume-bytes` | `BytesAnnotation` (internal/modelvolume/modelvolume.go) | On a primary PV is the byte count of the tree it holds, measured at completion. |
 | `nvsnap.io/wait-for-cache` | `GateName` (internal/election/election.go) | Is the schedulingGates entry a follower carries until the capture for its hash is promoted. |

@@ -217,6 +217,9 @@ func main() {
 	flag.StringVar(&config.Webhook.AgentPlacement, "webhook-agent-placement", "",
 		"The agent DaemonSet's nodeSelector and nodeAffinity as JSON; pods nvsnap creates without a GPU request run within it.")
 
+	flag.BoolVar(&config.Webhook.SkipUnusedInits, "webhook-skip-unused-inits", false,
+		"Let a group restore's placeholders skip the init containers that fill only emptyDirs too large to copy into the checkpoint that no restored process uses (a model download), as the group's capture recorded them.")
+
 	flag.StringVar(&config.Webhook.DynamoNamespace, "webhook-dynamo-namespace", "",
 		"Fixed Dynamo namespace (DYN_NAMESPACE, DYN_NAMESPACE_PREFIX) for Dynamo components whose etcd and NATS are their instance's own; empty keeps the operator's.")
 
