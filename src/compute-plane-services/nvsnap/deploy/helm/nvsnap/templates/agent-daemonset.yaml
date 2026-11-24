@@ -361,8 +361,12 @@ spec:
             # Mounted at its host path so the agent's runtime probe sees the
             # right name: /run/containerd/containerd.sock is containerd,
             # /run/crio/crio.sock is CRI-O (hostPaths.containerdSock).
+            # The socket's directory is mounted, not the socket: a runtime
+            # restart replaces the socket file, and a mount of the file keeps
+            # the deleted one, so every runtime call is refused until the
+            # agent restarts.
             - name: containerd-sock
-              mountPath: {{ .Values.agent.hostPaths.containerdSock }}
+              mountPath: {{ dir .Values.agent.hostPaths.containerdSock }}
             - name: host-proc
               mountPath: /host/proc
               readOnly: true
@@ -450,8 +454,8 @@ spec:
         {{- end }}
         - name: containerd-sock
           hostPath:
-            path: {{ .Values.agent.hostPaths.containerdSock }}
-            type: Socket
+            path: {{ dir .Values.agent.hostPaths.containerdSock }}
+            type: Directory
         - name: host-proc
           hostPath:
             path: /proc
