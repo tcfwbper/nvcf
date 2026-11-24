@@ -56,6 +56,26 @@ for the current `agentBundle`, `state=failed` (capture failed), `state=restore-f
 any bundle, until `criuGroupMaxCaptures` is spent; once it is, the record falls back whatever its bundle. A fallback pod is never taken for a CRIU capture, since its restore
 placeholder would lack its cachedir. A usable record, or none, changes nothing.
 
+A record of another process configuration is replaced, whatever its state, unless it is `capturing` or `verifying`.
+The key leaves out per-deployment settings such as `DYN_NAMESPACE_WORKER_SUFFIX`, and admission refuses to restore a
+pod whose process configuration differs from its checkpoint's, so after a redeploy that changes one, the record could
+otherwise never be restored from or captured again. The capture compares each member with the record's slots as
+admission does (`processConfigChanged`, `internal/agent/criu_group.go`): a rank against its own slot, a companion
+against every companion slot. It replaces the record (`claimGroupRecord`), and that configuration's attempts start
+over. A record is kept for `recordReplaceCooldown` (30 minutes) after it was verified or started, so a value that
+differs per instance rather than per deploy, or two configurations alternating during a rollout, costs at most one
+capture per cooldown. The members' configurations are written at the claim, so a capture that then fails still says
+which configuration failed. The replaced capture's checkpoints are retired by the checkpoint reaper, which removes an
+instance capture no complete record names.
+
+A failed record does not send a pod of another process configuration to the fallback: the pod's rank slot differs
+(`otherConfiguration`, `internal/agent/criu_fallback.go`), and its instance's capture replaces the record. That pod's
+admission also marks the record `reconfiguredAt` (`markReconfigured`), after which no pod falls back on it, so a leader
+whose own slot still matches, when a redeploy changed only the workers, does not keep its instance from capturing. A
+failure under the library marks the record with the failing pod's process configuration (`markFailedConfiguration`):
+unless the pod's slot already holds it, every slot is dropped and the pod's written, and the `reconfiguredAt` mark
+goes, so the configuration's next pods fall back without the library instead of failing under it again.
+
 For a GPU pod of a configuration that falls back, the webhook, in place of the CRIU-only decoration:
 
 1. does not inject the gpushare library when the reason is `gpushare-failed`; otherwise keeps it, as a later CRIU

@@ -476,7 +476,7 @@ type Mutator struct {
 	// CRIUFallback returns why a configuration CRIU cannot serve falls
 	// back to the caches, and the cachedir capture of the pod's rank
 	// (criu_fallback.go). Nil: none does.
-	CRIUFallback func(ctx context.Context, namespace, cacheURI string, ordinal int) (CRIUFallback, bool)
+	CRIUFallback func(ctx context.Context, namespace, cacheURI string, ordinal int, processConfig string) (CRIUFallback, bool)
 	// CRIUScope returns the tenant scope of a namespace, the value a CRIU
 	// capture records under checkpointstore.CRIUScopeMetaKey. Nil: the
 	// scope is the namespace itself.

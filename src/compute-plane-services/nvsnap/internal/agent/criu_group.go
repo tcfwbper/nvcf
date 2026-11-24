@@ -462,7 +462,12 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 	if size == 1 {
 		// One pod: its record is known now, so a captured configuration
 		// is not waited on again.
-		if prev, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(criuGroupKeyDriver(uri, scope, c.a.keyDriver(ctx))), metav1.GetOptions{}); err == nil && !c.groupRecaptures(ctx, prev.Data) {
+		// Not when the record is an alias (a rank with companions: the
+		// instance's own record decides) or of another process
+		// configuration that may be replaced (captureGroup decides).
+		if prev, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(criuGroupKeyDriver(uri, scope, c.a.keyDriver(ctx))), metav1.GetOptions{}); err == nil && !c.groupRecaptures(ctx, prev.Data) &&
+			prev.Data["state"] != criuGroupStateAlias &&
+			!(replaceableRecord(prev.Data, time.Now()) && len(processConfigChanged(prev.Data, []*corev1.Pod{pod}, 1, nil)) > 0) {
 			return false
 		}
 	}
@@ -610,11 +615,24 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	key := criuGroupKeyDriver(instanceConfigURIOf(uris), scope, drv)
 	log = log.WithField("criuGroup", key)
+	// A record of another process configuration (a redeploy gave the
+	// workers a new DYN_NAMESPACE_WORKER_SUFFIX, which the key leaves out)
+	// is one admission never restores this instance from: it is replaced,
+	// or the configuration would start cold for good.
+	members0 := append(append([]*corev1.Pod{}, ranks...), companions...)
+	reconfigured := func(data map[string]string) bool {
+		return len(processConfigChanged(data, members0, len(ranks), companionContainers)) > 0
+	}
 	if prev, gerr := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{}); gerr == nil && !c.groupRecaptures(ctx, prev.Data) {
-		c.writeGroupAliases(ctx, key, scope, drv, uris, len(ranks), log)
-		log.WithFields(logrus.Fields{"state": prev.Data["state"], "captures": prev.Data["captures"], "source": prev.Data["source"]}).
-			Info("CRIU group capture: skipped; the configuration's record says it is captured, being captured, or out of attempts")
-		return false
+		if changed := processConfigChanged(prev.Data, members0, len(ranks), companionContainers); len(changed) > 0 && replaceableRecord(prev.Data, time.Now()) {
+			log.WithFields(logrus.Fields{"state": prev.Data["state"], "changed": changed[0]}).
+				Info("CRIU group capture: the configuration's record is of another process configuration, which no pod of this one restores from; capturing again")
+		} else {
+			c.writeGroupAliases(ctx, key, scope, drv, uris, len(ranks), log)
+			log.WithFields(logrus.Fields{"state": prev.Data["state"], "captures": prev.Data["captures"], "source": prev.Data["source"]}).
+				Info("CRIU group capture: skipped; the configuration's record says it is captured, being captured, or out of attempts")
+			return false
+		}
 	}
 	for _, r := range ranks {
 		if !a.gpushareEnabledFor(r) {
@@ -683,7 +701,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		c.unholdForCapture(ctx, members, log)
 		return true
 	}
-	record, err := c.claimGroupRecord(ctx, key, drv, leader, len(uris))
+	record, err := c.claimGroupRecord(ctx, key, drv, leader, len(uris), reconfigured)
 	if err != nil {
 		log.WithError(err).Warn("CRIU group capture: cannot claim the group record")
 		// Not captured yet: the members are held as before, by the limit
@@ -693,6 +711,22 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	if record == nil {
 		return false // another agent captures it
+	}
+	// The members' process configurations, now: a capture that then fails
+	// still says which configuration failed, so the next instance of it
+	// is not taken for another configuration's (processConfigChanged reads
+	// a record without them as unchanged).
+	// In the local snapshot too: the failure path persists record.Data.
+	startedAt := record.Data["startedAt"]
+	recordMemberConfigs(record.Data, members, len(ranks), companionContainers)
+	if err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
+		if d["state"] != criuGroupStateCapturing || d["startedAt"] != startedAt {
+			return false
+		}
+		recordMemberConfigs(d, members, len(ranks), companionContainers)
+		return true
+	}); err != nil {
+		log.WithError(err).Warn("CRIU group capture: cannot record the members' process configurations at the claim")
 	}
 
 	log.Info("CRIU group capture: instance ready; checkpointing it")
@@ -978,7 +1012,11 @@ func (c *criuAutoRestorer) namespaceGone(ctx context.Context, name string) bool 
 // claimGroupRecord makes the agent the capturer of key: it creates the
 // record, or takes over one that may be captured again. It returns nil
 // when another agent holds it.
-func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, drv int, leader *corev1.Pod, size int) (*corev1.ConfigMap, error) {
+//
+// replaceIf, when given, also lets it take over a record that may not be
+// captured again but is of another process configuration than the
+// instance's (replaceableRecord): that configuration's attempts start over.
+func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, drv int, leader *corev1.Pod, size int, replaceIf ...func(map[string]string) bool) (*corev1.ConfigMap, error) {
 	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
 	data := map[string]string{"state": criuGroupStateCapturing, "size": strconv.Itoa(size), "captures": "1",
 		"source": leader.Namespace + "/" + leader.Name, "startedAt": time.Now().UTC().Format(time.RFC3339),
@@ -1003,10 +1041,19 @@ func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, drv
 	if err != nil {
 		return nil, err
 	}
+	replace := false
 	if !c.groupRecaptures(ctx, prev.Data) {
-		return nil, nil
+		for _, f := range replaceIf {
+			replace = replace || (replaceableRecord(prev.Data, time.Now()) && f(prev.Data))
+		}
+		if !replace {
+			return nil, nil
+		}
 	}
 	n, _ := strconv.Atoi(prev.Data["captures"])
+	if replace {
+		n = 0 // a new configuration: its own attempts
+	}
 	data["captures"] = strconv.Itoa(n + 1)
 	if prev.Data["reason"] != "" {
 		data["previousReason"] = truncate(prev.Data["reason"], groupReasonMax)
@@ -1022,6 +1069,99 @@ func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, drv
 		c.a.nameRecordLater(key, leader.Namespace)
 	}
 	return updated, err
+}
+
+// recordMemberConfigs writes every member's process configuration, and
+// which members are companions, into record data d: ranks first, then
+// companions, as the capture records them.
+func recordMemberConfigs(d map[string]string, members []*corev1.Pod, ranks int, companionContainers map[string]string) {
+	for i, m := range members {
+		ctr := gpuContainer(m)
+		if i >= ranks {
+			ctr = companionContainers[m.Name]
+			d[fmt.Sprintf("companion.%d", i)] = "true"
+		}
+		recordProcessConfig(d, i, m, ctr, len(members))
+	}
+}
+
+// replaceableRecord reports whether a record may be replaced by a capture of
+// another process configuration: not while a capture of it is under way or
+// being verified (two configurations racing for one key: the first keeps
+// it).
+//
+// Nor before recordReplaceCooldown has passed since it was verified (or,
+// unverified, started): a value of the process configuration that differs
+// per instance rather than per deploy, or two configurations alternating
+// during a rollout, then cost at most one capture per cooldown instead of
+// one per instance.
+func replaceableRecord(data map[string]string, now time.Time) bool {
+	switch data["state"] {
+	case criuGroupStateCapturing, criuGroupStateVerifying:
+		return false
+	}
+	for _, k := range []string{"verifiedAt", "startedAt"} {
+		if at, err := time.Parse(time.RFC3339, data[k]); err == nil {
+			return now.Sub(at) >= recordReplaceCooldown
+		}
+	}
+	return true
+}
+
+// recordReplaceCooldown is how long a record is kept before a capture of
+// another process configuration may replace it.
+const recordReplaceCooldown = 30 * time.Minute
+
+// processConfigChanged names, for the first member whose process
+// configuration differs from its slot in a group record, what differs
+// (webhook.ProcessConfigChanges, as admission compares a restoring pod).
+// members are the ranks, then the companions, as the record's slots are.
+// A slot or a pod with no configuration recorded is not called changed.
+//
+// As admission compares a restoring pod: its whole stamp against the slot
+// (on the slot's containers), a rank against its own slot, a companion
+// against every companion slot (changed only if none matches), since which
+// companion lands in which slot, and which of its containers was
+// checkpointed, may differ from instance to instance.
+func processConfigChanged(data map[string]string, members []*corev1.Pod, ranks int, companionContainers map[string]string) []string {
+	size, _ := strconv.Atoi(data["size"])
+	if size < len(members) {
+		size = len(members)
+	}
+	var companionSlots []string
+	for i := 0; i < size; i++ {
+		if data[fmt.Sprintf("companion.%d", i)] == "true" || (data[fmt.Sprintf("companion.%d", i)] == "" && i >= ranks) {
+			companionSlots = append(companionSlots, data[fmt.Sprintf("processConfig.%d", i)])
+		}
+	}
+	for i, m := range members {
+		cur := m.Annotations[webhook.ProcessConfigAnnotation]
+		if cur == "" {
+			continue
+		}
+		if i < ranks {
+			if changed := webhook.ProcessConfigChanges(data[fmt.Sprintf("processConfig.%d", i)], cur); len(changed) > 0 {
+				return append([]string{m.Name + ": " + changed[0]}, changed[1:]...)
+			}
+			continue
+		}
+		var first []string
+		matched := len(companionSlots) == 0
+		for _, slot := range companionSlots {
+			changed := webhook.ProcessConfigChanges(slot, cur)
+			if len(changed) == 0 {
+				matched = true
+				break
+			}
+			if first == nil {
+				first = changed
+			}
+		}
+		if !matched {
+			return append([]string{m.Name + ": " + first[0]}, first[1:]...)
+		}
+	}
+	return nil
 }
 
 // recordRefusal records on group record key that the preflight refuses

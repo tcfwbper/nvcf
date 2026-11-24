@@ -252,7 +252,7 @@ func TestConsiderGPUShareFailure(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("fn").Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
 		t.Error("the pod was not replaced")
 	}
-	fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0)
+	fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, "")
 	if !ok || fb.Reason != webhook.FallbackGPUShareFailed {
 		t.Fatalf("fallback %+v %v", fb, ok)
 	}
@@ -316,14 +316,14 @@ func TestCRIUFallbackFor(t *testing.T) {
 		}
 	}
 	ctx := context.Background()
-	fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0)
+	fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, "")
 	if !ok || fb.Reason != "failed" || fb.Capture != webhook.FallbackCaptureID(own, 0) {
 		t.Fatalf("rank 0: %+v %v", fb, ok)
 	}
-	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 1); !ok || fb.Capture != "" {
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 1, ""); !ok || fb.Capture != "" {
 		t.Fatalf("rank 1 is still capturing: %+v %v", fb, ok)
 	}
-	if _, ok := a.criuFallbackFor(ctx, "fn", "cache://other", 0); ok {
+	if _, ok := a.criuFallbackFor(ctx, "fn", "cache://other", 0, ""); ok {
 		t.Fatal("a configuration without a record falls back")
 	}
 }
@@ -696,7 +696,7 @@ func TestRecordRefusalWithCompanionFallsBack(t *testing.T) {
 	if d := getRecord(t, a, criuGroupConfigMapName(key)); d["state"] != criuGroupStateFailed {
 		t.Fatalf("instance record %v", d)
 	}
-	fb, ok := a.criuFallbackFor(context.Background(), "fn", "cache://cfg", 0)
+	fb, ok := a.criuFallbackFor(context.Background(), "fn", "cache://cfg", 0, "")
 	if !ok || fb.Reason != criuGroupStateFailed {
 		t.Errorf("the engine's configuration does not fall back: %+v %v", fb, ok)
 	}

@@ -197,7 +197,7 @@ func TestDriverGateAdmission(t *testing.T) {
 	if g, ok := a.lookupCRIUGroupFor(ctx, "fn", "cache://cfg"); !ok || g.Key != key {
 		t.Fatalf("driver 610: lookup %+v %v, want the capture keyed with 610", g, ok)
 	}
-	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0); ok {
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, ""); ok {
 		t.Fatalf("driver 610: falls back %+v", fb)
 	}
 
@@ -210,7 +210,7 @@ func TestDriverGateAdmission(t *testing.T) {
 		t.Fatal("a capture restores while a GPU node runs 580")
 	}
 	for _, uri := range []string{"cache://cfg", "cache://never-captured"} {
-		fb, ok := a.criuFallbackFor(ctx, "fn", uri, 0)
+		fb, ok := a.criuFallbackFor(ctx, "fn", uri, 0, "")
 		if !ok || fb.Reason != webhook.FallbackDriver {
 			t.Fatalf("%s with a 580 node: %+v %v, want the driver fallback", uri, fb, ok)
 		}
@@ -221,12 +221,12 @@ func TestDriverGateAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.drivers.at = time.Time{}
-	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0); !ok || fb.Reason != webhook.FallbackDriver {
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, ""); !ok || fb.Reason != webhook.FallbackDriver {
 		t.Fatalf("all on 580: %+v %v", fb, ok)
 	}
 	// ... unless the minimum is lowered to it.
 	a.config.CRIUMinDriverMajor = 580
-	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0); ok {
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, ""); ok {
 		t.Fatalf("minimum 580, all on 580: falls back %+v", fb)
 	}
 	// The 610 capture is not restored under 580: its key names 610.

@@ -29,7 +29,7 @@ func fallbackModelMutator(t *testing.T, fb CRIUFallback, ok bool) (*Mutator, *co
 	m, _ := mvMutatorReader(t, modelvolume.ModeBlock, "", election.RoleFollower, kc)
 	m.CRIUCapture, m.Kube, m.GPUShareByDefault, m.CheckpointHostRoot = true, kc, true, fbCheckpoints
 	asked := 0
-	m.CRIUFallback = func(_ context.Context, ns, uri string, ordinal int) (CRIUFallback, bool) {
+	m.CRIUFallback = func(_ context.Context, ns, uri string, ordinal int, _ string) (CRIUFallback, bool) {
 		asked++
 		if ns != "sr-fn" || !strings.HasPrefix(uri, "cache://") || ordinal != 0 {
 			t.Errorf("asked for %s %s %d", ns, uri, ordinal)
@@ -177,7 +177,7 @@ func TestCRIUFallbackWithoutModelVolume(t *testing.T) {
 	id := FallbackCaptureID("k", 0)
 	m := &Mutator{Backend: newBackend(t), CacheDir: "/opt/nvsnap", Composer: &rootfsonly.HashInputComposer{CUDADriverMajor: 610}, CRIUCapture: true,
 		CheckpointHostRoot: fbCheckpoints,
-		CRIUFallback: func(context.Context, string, string, int) (CRIUFallback, bool) {
+		CRIUFallback: func(context.Context, string, string, int, string) (CRIUFallback, bool) {
 			return CRIUFallback{Reason: "restore-failed", Capture: id}, true
 		}}
 	pod := gpuRank("engine-0", metav1.OwnerReference{Kind: "StatefulSet", Name: "engine"})
@@ -197,7 +197,7 @@ func TestCRIUFallbackNotForPlaceholders(t *testing.T) {
 	g := CRIUGroup{Checkpoints: []string{"r0__1", "r1__1"}, Nodes: []string{"n0", "n1"}}
 	m, _ := groupMutator(t, g, "")
 	m.CRIUCapture, m.CacheDir = true, "/opt/nvsnap"
-	m.CRIUFallback = func(context.Context, string, string, int) (CRIUFallback, bool) {
+	m.CRIUFallback = func(context.Context, string, string, int, string) (CRIUFallback, bool) {
 		t.Error("asked for a fallback")
 		return CRIUFallback{Reason: "failed"}, true
 	}
