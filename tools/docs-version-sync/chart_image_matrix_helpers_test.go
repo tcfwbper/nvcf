@@ -72,16 +72,16 @@ func validateChartImageExclusion(repoRoot, chart string, entry imageExclusion, c
 
 // validateDevOnlyChart allows dev-only only for a chart that no released
 // stack deploys, resolved from the released stacks' Helmfile states. Example:
-// stargate-dev's charts/stargate-dev-auth passes; once self-managed deploys
-// it, or once stargate-dev gains release-inventory.yaml and is built as a
-// released stack, the entry fails and the chart is checked.
+// a chart of an unreleased dev stack passes; once self-managed deploys it, or
+// once the dev stack is released and built, the entry fails and the chart is
+// checked.
 //
 // Where the chart lives is deliberately not checked: a path rule would break
 // when a chart moves or is referenced from elsewhere, and it would not prove
-// that a dev-only stack deploys the chart either. CI cannot build the
-// dev-only stacks (stargate-dev reads a protected values file), so whether
-// one of them deploys the chart is not verified. Nor is whether users install
-// the chart directly: review keeps dev-only off a chart that ships on its own.
+// that a dev-only stack deploys the chart either. CI does not build the
+// dev-only stacks, so whether one of them deploys the chart is not verified.
+// Nor is whether users install the chart directly: review keeps dev-only off
+// a chart that ships on its own.
 func validateDevOnlyChart(chart string, stacks chartStacks) error {
 	if deployers := stacks.deployedBy[chart]; len(deployers) > 0 {
 		return fmt.Errorf("chart is deployed by released stacks %s; remove the %s entry so the chart is checked",

@@ -38,7 +38,7 @@ func (s chartStacks) class(chart string) string {
 }
 
 // chartSubject labels a chart with its class in findings and summary lines,
-// such as "deploy/helm/nvstor (standalone)".
+// such as "deploy/helm/x (standalone)".
 func chartSubject(chart, class string) string {
 	return chart + " (" + class + ")"
 }
@@ -92,9 +92,10 @@ func releasedStackCharts(repoRoot string, tracked trackedStacks, directories []s
 	deployedBy := make(map[string][]string)
 	var findings []imageGateFinding
 	for _, stack := range tracked.stacks {
-		// Released means having release-inventory.yaml. A stack without one
-		// is dev-only or reported by the stack image source check.
-		if !tracked.hasFile(stack, stackInventoryFile) {
+		// Released means the release inventory renders a state of the stack
+		// (stackReleaseStates on this branch). Any other stack is dev-only or
+		// reported by the stack image source check.
+		if !releasedStack(stack) {
 			continue
 		}
 		// stackRenderStates also reports inventory problems, such as a state

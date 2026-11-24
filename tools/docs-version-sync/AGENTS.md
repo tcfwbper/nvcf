@@ -21,8 +21,9 @@ fixture repository, one chart per rule.
 declares `thirdPartyImages` or `ownedImages` in its `values.yaml` and passes
 the chart image checks, or carries an entry in `chart-image-exclusions.yaml`.
 The test first classifies each chart. A chart is stack-deployed when a
-released stack (one with `release-inventory.yaml`) declares a release of it,
-enabled or not, resolved as the stack image source check resolves releases.
+released stack (one the release inventory renders; `stackReleaseStates` on
+this branch) declares a release of it, enabled or not, resolved as the stack
+image source check resolves releases.
 Every other chart is standalone. Classification runs `helmfile build`, so the
 chart test needs `helmfile` as well as `helm`. Use the `HELMFILE_VERSION`
 pinned in `.github/workflows/build-test.yml`. Findings name the class, such as
@@ -52,7 +53,7 @@ override helpers test-only; installation uses native Helm values.
 
 A chart that only an unreleased development stack deploys is listed as
 `dev-only`. The entry fails when a released stack deploys the chart. Where the
-chart lives is not checked. CI cannot build a `dev-only` stack, so whether one
+chart lives is not checked. CI does not build `dev-only` stacks, so whether one
 deploys the chart is not verified. Never list a chart that users install
 directly as `dev-only`; it must pass the standalone checks instead. Review
 enforces this.

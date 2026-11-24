@@ -335,9 +335,9 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	devInventoryTool := coverageFixtureChart("devinv-tool", "{}\n")
 	for _, stack := range []map[string]string{
 		fixtureStack("released", "{}\n", released),
-		// A stack with release-inventory.yaml that deploys its own dev-only
-		// chart: once a dev-only stack gains an inventory, its charts are no
-		// longer excluded.
+		// A released stack (its fixture inventory lists its state) that
+		// deploys its own dev-only chart: once the release inventory renders a
+		// dev-only stack, its charts are no longer excluded.
 		fixtureStack("devinv", "{}\n", "releases:\n  - {name: tool, namespace: devinv, chart: ../charts/dev-tool}\n"),
 		// Its charts cannot be classified, so the run fails: the state does
 		// not build, a release names no tracked chart, or a local chart path
@@ -439,6 +439,9 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// This branch reads released stacks from stackReleaseStates, not from
+	// release-inventory.yaml, so declare the fixture inventories' states.
+	useStackReleaseStates(t, fixtureReleaseStates(t, files))
 	report, err := evaluateChartImageCoverage(root, filepath.Join(root, chartImageExclusionsFile), t.TempDir)
 	if err != nil {
 		t.Fatal(err)
