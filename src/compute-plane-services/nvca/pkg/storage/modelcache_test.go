@@ -46,6 +46,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -594,13 +595,28 @@ var nvmeshMountOptionDefaults = map[string]string{
 	NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
 }
 
+// newReaderPVOnDriver returns a reader PV whose CSI source names driver, or a
+// PV with no CSI source when driver is empty.
+func newReaderPVOnDriver(driver string) *corev1.PersistentVolume {
+	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "secondary-pv-test"}}
+	if driver != "" {
+		pv.Spec.CSI = &corev1.CSIPersistentVolumeSource{Driver: driver, VolumeHandle: "handle"}
+	}
+	return pv
+}
+
+const fssProvisioner = "fss.csi.oraclecloud.com"
+
 func TestResolveCacheMountOptions(t *testing.T) {
 	tests := []struct {
 		name        string
 		provisioner string
-		cmData      map[string]string
-		configured  []string
-		want        []string
+		// pvDriver is the reader PV's CSI driver; empty leaves the PV without a
+		// CSI source so the storage class provisioner is used.
+		pvDriver   string
+		cmData     map[string]string
+		configured []string
+		want       []string
 	}{
 		{
 			name:        "nvmesh provisioner gets its defaults when nothing configured",
@@ -639,21 +655,61 @@ func TestResolveCacheMountOptions(t *testing.T) {
 		},
 		{
 			// doModelCacheNVMesh also serves requests with an empty backend, whose
-			// storage class need not be NVMesh at all.
-			name:        "provisioner absent from the configmap uses configured options",
+			// storage class need not be NVMesh at all. The configured options
+			// are written for NVMesh, so another driver does not get them.
+			name:        "provisioner absent from the configmap gets no configured options",
 			provisioner: "ebs.csi.aws.com",
 			cmData:      nvmeshMountOptionDefaults,
 			configured:  []string{"noatime"},
-			want:        []string{"noatime"},
+			want:        nil,
 		},
 		{
+			// The ConfigMap entry is the whole set for a non-NVMesh driver.
 			name:        "a new provisioner is picked up from the configmap without a code change",
 			provisioner: "some-other.csi.driver",
 			cmData: map[string]string{
 				"some-other.csi.driver": "ro, nouuid ",
 			},
 			configured: []string{"noatime"},
-			want:       []string{"ro", "nouuid", "noatime"},
+			want:       []string{"ro", "nouuid"},
+		},
+		{
+			// The reported failure: NFS rejects norecovery and nouuid, so the
+			// reader on an OCI File Storage volume must not get them.
+			name:        "fss reader without a configmap entry gets none of the nvmesh options",
+			provisioner: "fss.csi.oraclecloud.com",
+			pvDriver:    "fss.csi.oraclecloud.com",
+			cmData:      nvmeshMountOptionDefaults,
+			configured:  []string{"ro", "norecovery", "nouuid"},
+			want:        nil,
+		},
+		{
+			name:        "fss reader with a configmap entry gets exactly that entry",
+			provisioner: "fss.csi.oraclecloud.com",
+			pvDriver:    "fss.csi.oraclecloud.com",
+			cmData: map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				"fss.csi.oraclecloud.com":     "ro",
+			},
+			configured: []string{"ro", "norecovery", "nouuid"},
+			want:       []string{"ro"},
+		},
+		{
+			name:        "nvmesh reader keeps the configured nvmesh options",
+			provisioner: NVMeshStorageClassProvisioner,
+			pvDriver:    NVMeshStorageClassProvisioner,
+			cmData:      nvmeshMountOptionDefaults,
+			configured:  []string{"ro", "norecovery", "nouuid"},
+			want:        []string{"ro", "norecovery", "nouuid"},
+		},
+		{
+			// The PV's own driver decides, not the storage class.
+			name:        "the reader PV driver wins over the storage class provisioner",
+			provisioner: NVMeshStorageClassProvisioner,
+			pvDriver:    "fss.csi.oraclecloud.com",
+			cmData:      nvmeshMountOptionDefaults,
+			configured:  []string{"ro", "norecovery", "nouuid"},
+			want:        nil,
 		},
 		{
 			// An unreadable ConfigMap is an error state, not a statement about the
@@ -684,11 +740,11 @@ func TestResolveCacheMountOptions(t *testing.T) {
 			want:        []string{"noatime"},
 		},
 		{
-			name:        "missing configmap on a non-nvmesh provisioner uses configured options",
+			name:        "missing configmap on a non-nvmesh provisioner gets no configured options",
 			provisioner: "ebs.csi.aws.com",
 			cmData:      nil,
 			configured:  []string{"noatime"},
-			want:        []string{"noatime"},
+			want:        nil,
 		},
 		{
 			name:        "missing storage class falls back to configured options",
@@ -706,9 +762,11 @@ func TestResolveCacheMountOptions(t *testing.T) {
 				WithObjects(newMountOptionDefaultsObjects(tt.provisioner, tt.cmData)...).
 				Build()
 			r := newMountOptionsReconciler(t, c, tt.configured)
-			pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "secondary-pv-test"}}
+			pv := newReaderPVOnDriver(tt.pvDriver)
 
-			if got := r.resolveCacheMountOptions(context.Background(), pv); !slices.Equal(got, tt.want) {
+			got, err := r.resolveCacheMountOptions(context.Background(), pv)
+			require.NoError(t, err)
+			if !slices.Equal(got, tt.want) {
 				t.Errorf("resolveCacheMountOptions() = %v, want %v", got, tt.want)
 			}
 		})
@@ -727,8 +785,8 @@ func TestResolveCacheMountOptions_ConfigMapEditTakesEffect(t *testing.T) {
 	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "secondary-pv-test"}}
 
 	want := []string{"ro", "norecovery", "nouuid"}
-	if got := r.resolveCacheMountOptions(ctx, pv); !slices.Equal(got, want) {
-		t.Fatalf("before edit = %v, want %v", got, want)
+	if got, err := r.resolveCacheMountOptions(ctx, pv); err != nil || !slices.Equal(got, want) {
+		t.Fatalf("before edit = %v, %v, want %v", got, err, want)
 	}
 
 	cm := &corev1.ConfigMap{}
@@ -742,9 +800,74 @@ func TestResolveCacheMountOptions_ConfigMapEditTakesEffect(t *testing.T) {
 	}
 
 	want = []string{"ro", "norecovery", "nouuid", "noatime"}
-	if got := r.resolveCacheMountOptions(ctx, pv); !slices.Equal(got, want) {
-		t.Errorf("after edit = %v, want %v (edit did not take effect without a restart)", got, want)
+	if got, err := r.resolveCacheMountOptions(ctx, pv); err != nil || !slices.Equal(got, want) {
+		t.Errorf("after edit = %v, %v, want %v (edit did not take effect without a restart)", got, err, want)
 	}
+}
+
+// A ConfigMap read that fails for any reason other than NotFound must not be
+// read as "no entry": the reader PV would be written without the driver's
+// options (such as NFS sec=), and a shared-filesystem reader PV is not patched
+// afterwards. The error is returned so the reconcile retries, except for a
+// driver with built-in defaults, which still falls back to them.
+func TestReaderMountOptions_ConfigMapReadError(t *testing.T) {
+	readErr := apierrors.NewServiceUnavailable("etcd timeout")
+	newReconciler := func(t *testing.T) *Reconciler {
+		t.Helper()
+		c := fake.NewClientBuilder().
+			WithScheme(mgrScheme).
+			WithObjects(newMountOptionDefaultsObjects(NVMeshStorageClassProvisioner, map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				fssProvisioner:                "sec=krb5p",
+			})...).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object,
+					opts ...client.GetOption,
+				) error {
+					if _, ok := obj.(*corev1.ConfigMap); ok {
+						return readErr
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			}).
+			Build()
+		return newMountOptionsReconciler(t, c, []string{"ro", "norecovery", "nouuid"})
+	}
+	durableFSS := storageRequestWithSelection(
+		readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionRWXReadOnly, nil))
+
+	t.Run("durable fss reader returns the error", func(t *testing.T) {
+		_, err := newReconciler(t).resolveReaderMountOptions(context.Background(), durableFSS,
+			newReaderPVOnDriver(fssProvisioner))
+		require.ErrorIs(t, err, readErr)
+	})
+	t.Run("legacy fss reader returns the error", func(t *testing.T) {
+		_, err := newReconciler(t).resolveCacheMountOptions(context.Background(),
+			newReaderPVOnDriver(fssProvisioner))
+		require.ErrorIs(t, err, readErr)
+	})
+	t.Run("nvmesh reader falls back to the built-in defaults", func(t *testing.T) {
+		got, err := newReconciler(t).resolveCacheMountOptions(context.Background(),
+			newReaderPVOnDriver(NVMeshStorageClassProvisioner))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"ro", "norecovery", "nouuid"}, got)
+	})
+	t.Run("durable rox fss reader does not read the ConfigMap", func(t *testing.T) {
+		roxFSS := storageRequestWithSelection(
+			readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionROXReadOnly, []string{"ro"}))
+		got, err := newReconciler(t).resolveReaderMountOptions(context.Background(), roxFSS,
+			newReaderPVOnDriver(fssProvisioner))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"ro"}, got)
+	})
+	t.Run("shared-fs reader PV is not built", func(t *testing.T) {
+		writerPV := newReaderPVOnDriver(fssProvisioner)
+		writerPV.Name = "writer-pv"
+		roPV, err := newReconciler(t).newSharedFSReaderPV(context.Background(), durableFSS,
+			&nvcav2beta1.ICMSRequest{}, writerPV, "ro-pvc")
+		require.ErrorIs(t, err, readErr)
+		assert.Nil(t, roPV)
+	})
 }
 
 // TestModelCacheStorageClassResolvedOnce covers the storage class NewReconciler
@@ -968,11 +1091,25 @@ func TestReconcileSecondaryPVMountOptions(t *testing.T) {
 		{
 			name:        "matching pv is left alone",
 			provisioner: "ebs.csi.aws.com",
+			cmData: map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				"ebs.csi.aws.com":             "noatime",
+			},
+			existing:   []string{"noatime"},
+			configured: []string{"noatime"},
+			want:       []string{"noatime"},
+			wantPatch:  false,
+		},
+		{
+			// A reader created before the driver check carries the NVMesh
+			// options; the next reconcile takes them off so the next mount works.
+			name:        "nvmesh options are removed from a pv on another driver",
+			provisioner: fssProvisioner,
 			cmData:      nvmeshMountOptionDefaults,
-			existing:    []string{"noatime"},
-			configured:  []string{"noatime"},
-			want:        []string{"noatime"},
-			wantPatch:   false,
+			existing:    []string{"ro", "norecovery", "nouuid"},
+			configured:  []string{"ro", "norecovery", "nouuid"},
+			want:        nil,
+			wantPatch:   true,
 		},
 	}
 
@@ -2264,9 +2401,14 @@ func TestMergeReaderMountOptions(t *testing.T) {
 
 func TestResolveReaderMountOptions(t *testing.T) {
 	wekaProvisioner := "csi.weka.io"
+	nvmeshOptions := []string{"ro", "norecovery", "nouuid"}
 	tests := []struct {
-		name       string
-		selection  string
+		name      string
+		selection string
+		// pvDriver is the reader PV's CSI driver; empty leaves the PV without
+		// a CSI source so the selection's provisioner, then the storage class
+		// provisioner, is used.
+		pvDriver   string
 		cmData     map[string]string
 		configured []string
 		want       []string
@@ -2285,23 +2427,118 @@ func TestResolveReaderMountOptions(t *testing.T) {
 			want:   []string{"ro", "nouuid"},
 		},
 		{
-			name:       "configured extras are appended after the selection's options",
-			selection:  readerSelectionAnnotation(t, wekaProvisioner, ModelCacheTransitionROXReadOnly, []string{"ro"}),
+			name: "configured extras are appended after the selection's options on nvmesh",
+			selection: readerSelectionAnnotation(t, NVMeshStorageClassProvisioner, ModelCacheTransitionROXReadOnly,
+				[]string{"ro"}),
 			configured: []string{"noatime"},
 			want:       []string{"ro", "noatime"},
 		},
 		{
-			name:       "configured rw cannot negate the selection's ro",
-			selection:  readerSelectionAnnotation(t, wekaProvisioner, ModelCacheTransitionROXReadOnly, []string{"ro"}),
+			name: "configured rw cannot negate the selection's ro",
+			selection: readerSelectionAnnotation(t, NVMeshStorageClassProvisioner, ModelCacheTransitionROXReadOnly,
+				[]string{"ro"}),
 			configured: []string{"rw", "noatime"},
 			want:       []string{"ro", "noatime"},
 		},
 		{
-			name:       "durable selection without reader options keeps only the configured ones",
+			name:       "configured options are not appended on a driver they are not written for",
+			selection:  readerSelectionAnnotation(t, wekaProvisioner, ModelCacheTransitionROXReadOnly, []string{"ro"}),
+			configured: []string{"noatime"},
+			want:       []string{"ro"},
+		},
+		{
+			name:       "durable selection without reader options gets no configured ones on another driver",
 			selection:  readerSelectionAnnotation(t, wekaProvisioner, ModelCacheTransitionRWXReadOnly, nil),
 			cmData:     nvmeshMountOptionDefaults,
 			configured: []string{"noatime"},
-			want:       []string{"noatime"},
+			want:       []string{},
+		},
+		{
+			name: "nvmesh reader keeps the nvmesh options",
+			selection: readerSelectionAnnotation(t, NVMeshStorageClassProvisioner, ModelCacheTransitionROXReadOnly,
+				nvmeshOptions),
+			pvDriver:   NVMeshStorageClassProvisioner,
+			cmData:     nvmeshMountOptionDefaults,
+			configured: nvmeshOptions,
+			want:       nvmeshOptions,
+		},
+		{
+			// The reported failure: an OCI File Storage reader was handed
+			// norecovery and nouuid, which mount.nfs rejects.
+			name:       "fss reader gets none of the configured nvmesh options",
+			selection:  readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionRWXReadOnly, nil),
+			pvDriver:   fssProvisioner,
+			cmData:     nvmeshMountOptionDefaults,
+			configured: nvmeshOptions,
+			want:       []string{},
+		},
+		{
+			// A durable rwxReadOnly selection carries no reader options, so an
+			// installation's per-driver ConfigMap entry (here NFS sec=) must
+			// still reach the reader.
+			name:      "fss reader on an rwx selection keeps its per-driver ConfigMap options",
+			selection: readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionRWXReadOnly, nil),
+			pvDriver:  fssProvisioner,
+			cmData: map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				fssProvisioner:                "sec=krb5p",
+			},
+			configured: nvmeshOptions,
+			want:       []string{"sec=krb5p"},
+		},
+		{
+			// A roxReadOnly selection already carries the catalog's complete
+			// reader options, so a legacy ConfigMap entry for the driver must not
+			// be added on top (here a conflicting nfsvers).
+			name: "rox selection on another driver ignores its ConfigMap entry",
+			selection: readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionROXReadOnly,
+				[]string{"ro", "nfsvers=4.1"}),
+			pvDriver: fssProvisioner,
+			cmData: map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				fssProvisioner:                "nfsvers=3",
+			},
+			configured: nvmeshOptions,
+			want:       []string{"ro", "nfsvers=4.1"},
+		},
+		{
+			name:       "fss reader on a PV without a CSI driver falls back to the selection's provisioner",
+			selection:  readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionRWXReadOnly, nil),
+			cmData:     nvmeshMountOptionDefaults,
+			configured: nvmeshOptions,
+			want:       []string{},
+		},
+		{
+			name:       "a driver with catalog reader options gets exactly those",
+			selection:  readerSelectionAnnotation(t, wekaProvisioner, ModelCacheTransitionROXReadOnly, []string{"ro"}),
+			pvDriver:   wekaProvisioner,
+			cmData:     nvmeshMountOptionDefaults,
+			configured: nvmeshOptions,
+			want:       []string{"ro"},
+		},
+		{
+			name:       "fallback without a selection: nvmesh reader keeps the nvmesh options",
+			pvDriver:   NVMeshStorageClassProvisioner,
+			cmData:     nvmeshMountOptionDefaults,
+			configured: nvmeshOptions,
+			want:       nvmeshOptions,
+		},
+		{
+			name:       "fallback without a selection: fss reader gets none of the nvmesh options",
+			pvDriver:   fssProvisioner,
+			cmData:     nvmeshMountOptionDefaults,
+			configured: nvmeshOptions,
+			want:       nil,
+		},
+		{
+			name:     "fallback without a selection: a driver's configmap entry is the whole set",
+			pvDriver: fssProvisioner,
+			cmData: map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				fssProvisioner:                "ro",
+			},
+			configured: nvmeshOptions,
+			want:       []string{"ro"},
 		},
 		{
 			name:   "request without a selection uses the ConfigMap defaults",
@@ -2336,9 +2573,10 @@ func TestResolveReaderMountOptions(t *testing.T) {
 			objs := newMountOptionDefaultsObjects(NVMeshStorageClassProvisioner, tt.cmData)
 			c := fake.NewClientBuilder().WithScheme(mgrScheme).WithObjects(objs...).Build()
 			r := newMountOptionsReconciler(t, c, tt.configured)
-			pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "secondary-pv-test"}}
+			pv := newReaderPVOnDriver(tt.pvDriver)
 
-			got := r.resolveReaderMountOptions(context.Background(), storageRequestWithSelection(tt.selection), pv)
+			got, err := r.resolveReaderMountOptions(context.Background(), storageRequestWithSelection(tt.selection), pv)
+			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -2396,9 +2634,60 @@ func TestNewSharedFSReaderPVTakesMountOptionsFromSelection(t *testing.T) {
 
 	roPV, err := r.newSharedFSReaderPV(context.Background(), st, icmsReq, writerPV, "ro-pvc")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"ro", "noatime"}, roPV.Spec.MountOptions,
-		"the catalog's reader options are required and the configured rw must not negate them")
+	assert.Equal(t, []string{"ro"}, roPV.Spec.MountOptions,
+		"the catalog's reader options are the whole set; the configured options are not for this driver")
 	assert.True(t, roPV.Spec.CSI.ReadOnly)
+}
+
+// TestNewSharedFSReaderPVOnFSSGetsNoNVMeshOptions reproduces the Helm model
+// cache on OCI File Storage: the agent keeps the default NVMesh cache mount
+// options, the cluster's mount option ConfigMap has only the NVMesh entry, and
+// the derived reader PV is on fss.csi.oraclecloud.com. mount.nfs rejects
+// norecovery and nouuid, so the reader must get neither, with or without a
+// durable selection on the request.
+func TestNewSharedFSReaderPVOnFSSGetsNoNVMeshOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		selection string
+	}{
+		{name: "durable selection", selection: readerSelectionAnnotation(t, fssProvisioner,
+			ModelCacheTransitionRWXReadOnly, nil)},
+		{name: "no selection"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().
+				WithScheme(mgrScheme).
+				WithRESTMapper(newTestRESTMapper(mgrScheme)).
+				WithObjects(newMountOptionDefaultsObjects(fssProvisioner, nvmeshMountOptionDefaults)...).
+				Build()
+			r := newMountOptionsReconciler(t, c, []string{"ro", "norecovery", "nouuid"})
+
+			writerPV := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: "writer-pv"},
+				Spec: corev1.PersistentVolumeSpec{
+					Capacity:     corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+					MountOptions: []string{"hard", "nconnect=16", "local_lock=all"},
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver:       fssProvisioner,
+							VolumeHandle: "filesystem-id:10.0.0.1:/csi-fss-export",
+						},
+					},
+				},
+			}
+			st := storageRequestWithSelection(tc.selection)
+			icmsReq := &nvcav2beta1.ICMSRequest{ObjectMeta: metav1.ObjectMeta{Name: "req", Namespace: "reader-ns"}}
+
+			roPV, err := r.newSharedFSReaderPV(context.Background(), st, icmsReq, writerPV, "ro-pvc")
+			require.NoError(t, err)
+			assert.NotContains(t, roPV.Spec.MountOptions, "norecovery")
+			assert.NotContains(t, roPV.Spec.MountOptions, "nouuid")
+			assert.Empty(t, roPV.Spec.MountOptions,
+				"the catalog lists no reader options for this driver and it has no ConfigMap entry")
+			assert.True(t, roPV.Spec.CSI.ReadOnly, "the CSI source keeps the reader read-only")
+			assert.Equal(t, "filesystem-id:10.0.0.1:/csi-fss-export", roPV.Spec.CSI.VolumeHandle)
+		})
+	}
 }
 
 // TestReconcile_ModelCacheSharedFSWriterIdentity pins that the Helm
@@ -2461,3 +2750,29 @@ func TestReconcile_ModelCacheSharedFSWriterIdentity(t *testing.T) {
 }
 
 func ptrBool(b bool) *bool { return &b }
+
+func TestLegacyReaderMountOptions(t *testing.T) {
+	const fss = "fss.csi.oraclecloud.com"
+	nvmesh := []string{"ro", "norecovery", "nouuid"}
+	tests := []struct {
+		name        string
+		driver      string
+		configured  []string
+		wantKept    []string
+		wantDropped []string
+	}{
+		{"nvmesh keeps every option", NVMeshStorageClassProvisioner, nvmesh, nvmesh, nil},
+		{"unknown driver keeps every option", "", nvmesh, nvmesh, nil},
+		{"another driver drops the nvmesh-only options", fss, nvmesh, []string{"ro"}, []string{"norecovery", "nouuid"}},
+		{"another driver keeps a compatible override", fss, []string{"ro", "sec=krb5p"},
+			[]string{"ro", "sec=krb5p"}, nil},
+		{"nothing configured", fss, nil, nil, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kept, dropped := LegacyReaderMountOptions(tt.driver, tt.configured)
+			assert.Equal(t, tt.wantKept, kept)
+			assert.Equal(t, tt.wantDropped, dropped)
+		})
+	}
+}

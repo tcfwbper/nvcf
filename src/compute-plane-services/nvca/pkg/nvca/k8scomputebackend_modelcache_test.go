@@ -415,9 +415,33 @@ func TestReaderMountOptionsForRequest(t *testing.T) {
 		return raw
 	}
 
+	const fssProvisioner = "fss.csi.oraclecloud.com"
+	nvmeshOptions := []string{"ro", "norecovery", "nouuid"}
+	fssDurable := func(t *testing.T) string {
+		t.Helper()
+		raw, err := (&nvcastorage.PersistedModelCacheStorageSelection{
+			Version:             nvcastorage.ModelCacheStorageSelectionVersion,
+			Workflow:            nvcastorage.ModelCacheWorkflowRegular,
+			Mode:                nvcastorage.ModelCacheSelectionDurable,
+			StorageClassName:    nvcastorage.DefaultModelCacheStorageClassName,
+			StorageClassUID:     "uid-1",
+			StorageClassDigest:  "v1:sha256:" + strings.Repeat("a", 64),
+			ProfileDigest:       "sha256:" + strings.Repeat("b", 64),
+			Provider:            "ociFss",
+			Provisioner:         fssProvisioner,
+			Transition:          nvcastorage.ModelCacheTransitionRWXReadOnly,
+			RequiredAccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+		}).Marshal()
+		require.NoError(t, err)
+		return raw
+	}
+
 	tests := []struct {
 		name       string
 		annotation string
+		// pvDriver is the reader PV's CSI driver; empty means no PV or no CSI
+		// source, so the selection's provisioner, if any, is used.
+		pvDriver   string
 		configured []string
 		want       []string
 	}{
@@ -425,6 +449,50 @@ func TestReaderMountOptionsForRequest(t *testing.T) {
 			name:       "no selection keeps the configured options",
 			configured: []string{"noatime"},
 			want:       []string{"noatime"},
+		},
+		{
+			name:       "no selection on nvmesh keeps the configured nvmesh options",
+			pvDriver:   nvcastorage.NVMeshStorageClassProvisioner,
+			configured: nvmeshOptions,
+			want:       nvmeshOptions,
+		},
+		{
+			name:       "no selection on another driver drops the nvmesh-only options",
+			pvDriver:   fssProvisioner,
+			configured: nvmeshOptions,
+			want:       []string{"ro"},
+		},
+		{
+			name:       "no selection on another driver keeps a compatible override",
+			pvDriver:   fssProvisioner,
+			configured: []string{"ro", "sec=krb5p"},
+			want:       []string{"ro", "sec=krb5p"},
+		},
+		{
+			name:       "no selection on another driver with only nvmesh-only options gets none",
+			pvDriver:   fssProvisioner,
+			configured: []string{"norecovery", "nouuid"},
+			want:       nil,
+		},
+		{
+			name:       "durable nvmesh selection on an nvmesh PV keeps the nvmesh options",
+			annotation: durable(t, nvmeshOptions),
+			pvDriver:   nvcastorage.NVMeshStorageClassProvisioner,
+			configured: nvmeshOptions,
+			want:       nvmeshOptions,
+		},
+		{
+			name:       "durable fss selection gets none of the configured nvmesh options",
+			annotation: fssDurable(t),
+			pvDriver:   fssProvisioner,
+			configured: nvmeshOptions,
+			want:       []string{},
+		},
+		{
+			name:       "durable fss selection without a PV driver uses the selection's provisioner",
+			annotation: fssDurable(t),
+			configured: nvmeshOptions,
+			want:       []string{},
 		},
 		{
 			name:       "durable selection supplies the required options",
@@ -457,7 +525,15 @@ func TestReaderMountOptionsForRequest(t *testing.T) {
 			if tt.annotation != "" {
 				req.Annotations = map[string]string{nvcastorage.ModelCacheStorageSelectionAnnotationKey: tt.annotation}
 			}
-			assert.Equal(t, tt.want, c.readerMountOptionsForRequest(newTestContext(), req))
+			var pv *corev1.PersistentVolume
+			if tt.pvDriver != "" {
+				pv = &corev1.PersistentVolume{Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{Driver: tt.pvDriver},
+					},
+				}}
+			}
+			assert.Equal(t, tt.want, c.readerMountOptionsForRequest(newTestContext(), req, pv))
 		})
 	}
 }
