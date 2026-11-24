@@ -8,7 +8,7 @@
 # listed here. Keys are chart directories relative to the repository root.
 #
 # The checks depend on the chart class. A chart is stack-deployed when a
-# released stack (one with release-inventory.yaml) declares a release of it;
+# released stack (one the release inventory renders) declares a release of it;
 # the stack's base.yaml supplies its image source, so the chart leaves each
 # indexed registry and repository empty. Every other chart is standalone: it
 # is installed directly with Helm, so it prefills a working registry and
@@ -29,15 +29,14 @@
 #                      by rendering.
 #   vendored-subchart  Lives at <parent>/charts/<name>, where <parent> is
 #                      itself a chart. Skipped.
-#   dev-only           Deployed only by an unreleased development stack, such
-#                      as stargate-dev. Skipped, and may declare an image
-#                      index. The entry fails when a released stack deploys
-#                      the chart, including a dev-only stack that gains
-#                      release-inventory.yaml. CI cannot build a dev-only
-#                      stack (stargate-dev reads a protected values file), so
-#                      whether one deploys the chart is not verified. Never
-#                      use it for a chart users install directly; review
-#                      enforces this.
+#   dev-only           Deployed only by an unreleased development stack.
+#                      Skipped, and may declare an image index. The entry
+#                      fails when a released stack deploys the chart,
+#                      including a dev-only stack that the release
+#                      inventory starts to render. CI does not build
+#                      dev-only stacks, so whether one deploys the chart is
+#                      not verified. Never use it for a chart users install
+#                      directly; review enforces this.
 #
 # issue (optional, pending-fix only): a free-form note, such as a tracking
 # link. It is not validated. This file is public, so keep private tracker IDs
@@ -77,10 +76,6 @@ src/compute-plane-services/nvca/deployments/nvca-operator: {reason: pending-fix}
 src/compute-plane-services/nvsnap/deploy/helm/nvsnap: {reason: pending-fix}
 # Listed conservatively; revisit if this turns out to be a sample.
 src/uis/nvcf-ui/helm: {reason: pending-fix}
-
-# dev-only
-deploy/stacks/stargate-dev/charts/stargate-dev-auth: {reason: dev-only}
-deploy/stacks/stargate-dev/charts/stargate-dev-mockdc: {reason: dev-only}
 
 # vendored-subchart
 deploy/helm/cert-manager/charts/cert-manager: {reason: vendored-subchart}
