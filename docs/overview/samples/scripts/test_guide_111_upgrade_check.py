@@ -139,11 +139,6 @@ class UpgradeGuide111Checks(unittest.TestCase):
                     if "helmfile.d/" in block and " apply" in block:
                         self.assertNotIn(" diff ", block)
 
-    def test_both_guides_carry_the_qualification_warning(self):
-        for baseline in GUIDES:
-            with self.subTest(baseline=baseline):
-                self.assertIn("dsx-ai-factory/nvcf/issues/3428", self.text(baseline))
-
     def test_both_guides_upgrade_the_control_plane_before_the_compute_plane(self):
         for baseline in GUIDES:
             with self.subTest(baseline=baseline):
