@@ -93,14 +93,14 @@ download command in this catalog.
 {/*docs-version-sync:BEGIN stack-package-downloads*/}
 
 ```bash
-# Self-Managed 1.1.5
-ngc registry resource download-version "nvidia/nvcf/nvcf-self-managed-stack:1.1.5"
-tar -xzf "nvcf-self-managed-stack_v1.1.5/nvcf-self-managed-stack-1.1.5.tar.gz" \
+# Self-Managed 1.1.9
+ngc registry resource download-version "nvidia/nvcf/nvcf-self-managed-stack:1.1.9"
+tar -xzf "nvcf-self-managed-stack_v1.1.9/nvcf-self-managed-stack-1.1.9.tar.gz" \
   -C "$BUNDLE_DIR/deploy/stacks/self-managed"
 
-# Compute Plane 1.1.0
-ngc registry resource download-version "nvidia/nvcf/nvcf-compute-plane-stack:1.1.0"
-tar -xzf "nvcf-compute-plane-stack_v1.1.0/nvcf-compute-plane-stack-1.1.0.tar.gz" \
+# Compute Plane 1.1.1
+ngc registry resource download-version "nvidia/nvcf/nvcf-compute-plane-stack:1.1.1"
+tar -xzf "nvcf-compute-plane-stack_v1.1.1/nvcf-compute-plane-stack-1.1.1.tar.gz" \
   -C "$BUNDLE_DIR/deploy/stacks/nvcf-compute-plane"
 
 # Observability 1.1.0

@@ -29,10 +29,6 @@ publications:
     type: image
     version: 1.0.9
     registry: public-images
-  - name: nvcf_worker_niclls
-    type: image
-    version: 2.118.2
-    registry: public-images
   - name: oss-vault-k8s
     type: image
     version: 1.7.4
@@ -107,34 +103,14 @@ publications:
     version: 0.26.0
     registry: public-helm
     chart_format: http
-  - name: helm-nvcf-cert-manager
-    type: chart
-    version: 0.1.0
-    registry: public-helm
-    chart_format: http
   - name: helm-nvcf-ess-api
     type: chart
     version: 1.11.1
     registry: public-helm
     chart_format: http
-  - name: helm-nvcf-event-ledger
-    type: chart
-    version: 0.10.0
-    registry: public-helm
-    chart_format: http
-  - name: helm-nvcf-function-autoscaler
-    type: chart
-    version: 0.8.0
-    registry: public-helm
-    chart_format: http
   - name: helm-nvcf-grpc-proxy
     type: chart
     version: 1.14.0
-    registry: public-helm
-    chart_format: http
-  - name: helm-nvcf-invocation-service
-    type: chart
-    version: 1.9.0
     registry: public-helm
     chart_format: http
   - name: helm-nvcf-llm-api-gateway
@@ -145,11 +121,6 @@ publications:
   - name: helm-nvcf-llm-request-router
     type: chart
     version: 1.18.2
-    registry: public-helm
-    chart_format: http
-  - name: helm-nvcf-nats
-    type: chart
-    version: 0.9.0
     registry: public-helm
     chart_format: http
   - name: helm-nvcf-nats-auth-callout-service
@@ -165,11 +136,6 @@ publications:
   - name: helm-nvcf-nvct-api
     type: chart
     version: 1.11.0
-    registry: public-helm
-    chart_format: http
-  - name: helm-nvcf-openbao-server
-    type: chart
-    version: 0.36.1
     registry: public-helm
     chart_format: http
   - name: helm-nvcf-pki
@@ -206,49 +172,13 @@ publications:
     type: image
     version: 1.1.3
     registry: public-images
-  - name: byoo-otel-collector
-    type: image
-    version: 0.160.0-nv-0.4.7
-    registry: public-images
-  - name: cert-manager-cainjector
-    type: image
-    version: v1.20.2
-    registry: public-images
-  - name: cert-manager-controller
-    type: image
-    version: v1.20.2
-    registry: public-images
-  - name: cert-manager-startupapicheck
-    type: image
-    version: v1.20.2
-    registry: public-images
-  - name: cert-manager-webhook
-    type: image
-    version: v1.20.2
-    registry: public-images
   - name: ess-agent
     type: image
     version: 1.4.5
     registry: public-images
-  - name: icms-service-oss
-    type: image
-    version: 0.8.5
-    registry: public-images
   - name: llm-api-gateway
     type: image
     version: 0.20.1
-    registry: public-images
-  - name: nvca
-    type: image
-    version: 3.18.6
-    registry: public-images
-  - name: nvca-operator
-    type: image
-    version: 3.18.6
-    registry: public-images
-  - name: nvcf-ai-api-gateway-service
-    type: image
-    version: 1.42.0
     registry: public-images
   - name: nvcf-api-keys-service
     type: image
@@ -258,14 +188,6 @@ publications:
     type: image
     version: 0.19.4
     registry: public-images
-  - name: nvcf-event-ledger
-    type: image
-    version: 0.21.0
-    registry: public-images
-  - name: nvcf-function-autoscaler
-    type: image
-    version: 1.23.1
-    registry: public-images
   - name: nvcf-grpc-proxy
     type: image
     version: 1.35.2
@@ -274,25 +196,9 @@ publications:
     type: image
     version: 0.11.4
     registry: public-images
-  - name: nvcf-invocation-service
-    type: image
-    version: 0.14.2
-    registry: public-images
   - name: nvcf-nats-auth-callout-service
     type: image
     version: 0.8.8
-    registry: public-images
-  - name: nvcf-openbao
-    type: image
-    version: 2.6.3-nv-1.3.7
-    registry: public-images
-  - name: nvcf-openbao-migrations
-    type: image
-    version: 0.19.10
-    registry: public-images
-  - name: nvcf-openbao-migrations
-    type: image
-    version: 0.23.1
     registry: public-images
   - name: nvcf-ratelimiter
     type: image
@@ -310,10 +216,6 @@ publications:
     type: image
     version: 1.3.2
     registry: public-images
-  - name: nvcf-worker-llm-credentials-oss
-    type: image
-    version: 1.2.2
-    registry: public-images
   - name: nvcf-worker-task-oss
     type: image
     version: 1.2.4
@@ -326,10 +228,6 @@ publications:
     type: image
     version: 1.70.4
     registry: public-images
-  - name: pylon
-    type: image
-    version: 0.29.2
-    registry: public-images
   - name: reval-server
     type: image
     version: 0.20.4
@@ -338,25 +236,119 @@ publications:
     type: image
     version: 0.29.2
     registry: public-images
-  - name: nvcf-self-managed-stack
-    type: resource
-    version: 1.1.5
-    registry: public-resources
-  - name: nvcf-compute-plane-stack
-    type: resource
-    version: 1.1.0
-    registry: public-resources
   - name: nvcf-observability-stack
     type: resource
     version: 1.1.0
     registry: public-resources
+  - name: byoo-otel-collector
+    type: image
+    version: 0.160.0-nv-0.4.9
+    registry: public-images
+  - name: icms-service-oss
+    type: image
+    version: 0.8.6
+    registry: public-images
+  - name: nvca
+    type: image
+    version: 3.18.10
+    registry: public-images
+  - name: nvca-operator
+    type: image
+    version: 3.18.10
+    registry: public-images
+  - name: nvcf-ai-api-gateway-service
+    type: image
+    version: 1.42.2
+    registry: public-images
+  - name: nvcf-event-ledger
+    type: image
+    version: 0.21.2
+    registry: public-images
+  - name: nvcf-function-autoscaler
+    type: image
+    version: 1.23.2
+    registry: public-images
+  - name: nvcf-invocation-service
+    type: image
+    version: 0.15.1
+    registry: public-images
+  - name: nvcf-openbao
+    type: image
+    version: 2.6.3-nv-1.3.9
+    registry: public-images
+  - name: nvcf-openbao-migrations
+    type: image
+    version: 0.23.4
+    registry: public-images
+  - name: nvcf-otel-collector
+    type: image
+    version: 0.160.0-nv-0.4.9
+    registry: public-images
+  - name: nvcf-worker-llm-credentials-oss
+    type: image
+    version: 1.2.3
+    registry: public-images
+  - name: nvcf_worker_niclls
+    type: image
+    version: 2.118.5
+    registry: public-images
+  - name: pylon
+    type: image
+    version: 0.29.3
+    registry: public-images
+  - name: stargate
+    type: image
+    version: 0.29.3
+    registry: public-images
+  - name: helm-nvcf-cert-manager
+    type: chart
+    version: 0.2.0
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-event-ledger
+    type: chart
+    version: 0.10.2
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-function-autoscaler
+    type: chart
+    version: 0.8.1
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-invocation-service
+    type: chart
+    version: 1.10.0
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-nats
+    type: chart
+    version: 0.9.1
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-openbao-server
+    type: chart
+    version: 0.37.1
+    registry: public-helm
+    chart_format: http
+  - name: nvcf-compute-plane-stack
+    type: resource
+    version: 1.1.1
+    registry: public-resources
+  - name: nvcf-self-managed-stack
+    type: resource
+    version: 1.1.9
+    registry: public-resources
+  - name: helm-nvcf-worker-callback-proxy
+    type: chart
+    version: 0.1.0
+    registry: public-helm
+    chart_format: http
 version_overrides:
   - name: nvcf-cli
     type: resource
     version: 1.16.8
     source: independent source release; not pinned by stack
-publication_pending:
-  - nvcf-otel-collector-image
+publication_pending: []
 manifest:
   entries:
     - artifact_id: helm-nvcf-api-keys
@@ -546,12 +538,6 @@ manifest:
       requirement: required
       description: Runs account bootstrap and upgrade receipt jobs; check client/server version compatibility.
       upstream_url: https://github.com/alpine-docker/k8s
-    - artifact_id: k8s-image-1.33.1
-      plane: control
-      kind: service-image
-      requirement: required
-      description: Runs the upgrade receipt job; check client/server version compatibility.
-      upstream_url: https://github.com/alpine-docker/k8s
     - artifact_id: helm-nvcf-event-ledger
       plane: control
       kind: chart
@@ -663,13 +649,7 @@ manifest:
       requirement: required
       description: Stores and manages control-plane secrets.
       upstream_url: https://github.com/openbao/openbao
-    - artifact_id: nvcf-openbao-migrations-image-0.19.10
-      plane: control
-      kind: service-image
-      requirement: required
-      description: Applies the OpenBao configuration required by NVCF.
-      github_url: https://github.com/NVIDIA/nvcf/tree/main/migrations/openbao
-    - artifact_id: nvcf-openbao-migrations-image-0.23.1
+    - artifact_id: nvcf-openbao-migrations
       plane: control
       kind: service-image
       requirement: required
@@ -720,6 +700,24 @@ manifest:
       requirement: optional
       description: Routes LLM requests to eligible worker instances.
       github_url: https://github.com/NVIDIA/nvcf/tree/main/src/libraries/rust/stargate
+    - artifact_id: stargate-image-0.29.3
+      plane: control
+      kind: service-image
+      requirement: optional
+      description: Routes LLM requests to eligible worker instances.
+      github_url: https://github.com/NVIDIA/nvcf/tree/main/src/libraries/rust/stargate
+    - artifact_id: helm-nvcf-worker-callback-proxy
+      plane: control
+      kind: chart
+      requirement: optional
+      description: Deploys the Envoy proxy that workers call back to, so a multi-cluster install can run more than one invocation replica.
+      github_url: https://github.com/NVIDIA/nvcf/tree/main/deploy/helm/worker-callback-proxy
+    - artifact_id: envoy
+      plane: control
+      kind: service-image
+      requirement: optional
+      description: Runs the worker callback proxy.
+      upstream_url: https://github.com/envoyproxy/envoy
     - artifact_id: nvcf-state-metrics-service
       plane: control
       kind: service-image
@@ -1016,16 +1014,16 @@ manifest:
 release_set:
   stacks:
     control-plane:
-      version: 1.1.5
-      source_tag: deploy/stacks/self-managed/v1.1.5
-      source_commit: e11b44050c3770d650d5fd4bf0b8e8bebca6786c
+      version: 1.1.9
+      source_tag: deploy/stacks/self-managed/v1.1.9
+      source_commit: 859ad9e45d45f0503ea3759d7b2d07f5a5eb75df
       inventory_asset: nvcf-self-managed-stack-inventory.json
       documentation_version: dev
       status: development
     compute-plane:
-      version: 1.1.0
-      source_tag: deploy/stacks/nvcf-compute-plane/v1.1.0
-      source_commit: 507d8e2ece81d04b8e63f6be31a0ea2d83561b4b
+      version: 1.1.1
+      source_tag: deploy/stacks/nvcf-compute-plane/v1.1.1
+      source_commit: daf87d512a7980e3124a4d69d5e449458a5bb5e9
       inventory_asset: nvcf-compute-plane-stack-inventory.json
       documentation_version: dev
       status: development
@@ -1038,46 +1036,31 @@ release_set:
       status: development
 compatibility:
   - stack: control-plane
-    version: 1.0.10
+    version: 1.1.9
     compatible_with:
-      compute-plane: 1.0.5
-      observability: 1.0.0
-  - stack: compute-plane
-    version: 1.0.5
-    compatible_with:
-      control-plane: 1.0.10
-      observability: 1.0.0
-  - stack: observability
-    version: 1.0.0
-    compatible_with:
-      compute-plane: 1.0.5
-      control-plane: 1.0.10
-  - stack: control-plane
-    version: 1.1.5
-    compatible_with:
-      compute-plane: 1.1.0
+      compute-plane: 1.1.1
       observability: 1.1.0
   - stack: compute-plane
-    version: 1.1.0
+    version: 1.1.1
     compatible_with:
-      control-plane: 1.1.5
+      control-plane: 1.1.9
       observability: 1.1.0
   - stack: observability
     version: 1.1.0
     compatible_with:
-      compute-plane: 1.1.0
-      control-plane: 1.1.5
+      compute-plane: 1.1.1
+      control-plane: 1.1.9
 stack:
   name: nvcf-self-managed-stack
-  version: 1.1.5
+  version: 1.1.9
   registry: public-resources
-  source_tag: deploy/stacks/self-managed/v1.1.5
-  source_commit: e11b44050c3770d650d5fd4bf0b8e8bebca6786c
+  source_tag: deploy/stacks/self-managed/v1.1.9
+  source_commit: 859ad9e45d45f0503ea3759d7b2d07f5a5eb75df
   pin_sources:
     - deploy/stacks/self-managed/environments/base.yaml
     - deploy/stacks/self-managed/global.yaml.gotmpl
     - deploy/stacks/self-managed/helmfile.d/02-core.yaml.gotmpl
-  pin_source_digest: sha256:173c9f91465ea8c58b15768ca929a2b386ecc8eeb1fa642f828b41cf1c82108d
+  pin_source_digest: sha256:4c2e832d4b862e388a801e41ebb135a594e85e08609652217eb152791cba55dd
 denylist:
   - name: strap
     reason: Legacy name replaced by nvcf-service-oss
@@ -1112,15 +1095,6 @@ denylist:
   - name: gdn-streaming
     reason: Excluded from the published manifest
 artifacts:
-  - id: k8s-image-1.33.1
-    name: k8s
-    type: image
-    registry: public-images
-    upstream_repository: docker.io/alpine/k8s
-    version: 1.33.1
-    stacks:
-      - self-managed
-    requirement: required
   - id: k8s
     name: k8s
     type: image
@@ -1150,7 +1124,7 @@ artifacts:
     type: image
     registry: public-images
     upstream_repository: docker.io/natsio/nats-server-config-reloader
-    version: 0.24.0
+    version: 0.25.0
     stacks:
       - compute-plane
       - self-managed
@@ -1159,10 +1133,18 @@ artifacts:
     type: image
     registry: public-images
     upstream_repository: docker.io/synadia/nats-server
-    version: 2.14.6-alpine3.22
+    version: 2.14.9-alpine3.22
     stacks:
       - self-managed
     requirement: required
+  - name: envoy
+    type: image
+    registry: public-images
+    upstream_repository: docker.io/envoyproxy/envoy
+    version: v1.40.1
+    stacks:
+      - self-managed
+    requirement: optional
   - name: grove-install-crds
     type: image
     registry: public-images
@@ -1230,7 +1212,7 @@ artifacts:
   - name: byoo-otel-collector
     type: image
     registry: public-images
-    version: 0.160.0-nv-0.4.7
+    version: 0.160.0-nv-0.4.9
     stacks:
       - compute-plane
     requirement: required
@@ -1238,34 +1220,6 @@ artifacts:
     type: image
     registry: public-images
     version: 5.0.9-nv-2.0.7
-    stacks:
-      - self-managed
-    requirement: required
-  - name: cert-manager-cainjector
-    type: image
-    registry: public-images
-    version: v1.20.2
-    stacks:
-      - self-managed
-    requirement: required
-  - name: cert-manager-controller
-    type: image
-    registry: public-images
-    version: v1.20.2
-    stacks:
-      - self-managed
-    requirement: required
-  - name: cert-manager-startupapicheck
-    type: image
-    registry: public-images
-    version: v1.20.2
-    stacks:
-      - self-managed
-    requirement: required
-  - name: cert-manager-webhook
-    type: image
-    registry: public-images
-    version: v1.20.2
     stacks:
       - self-managed
     requirement: required
@@ -1279,7 +1233,7 @@ artifacts:
   - name: icms-service-oss
     type: image
     registry: public-images
-    version: 0.8.5
+    version: 0.8.6
     stacks:
       - self-managed
     requirement: required
@@ -1293,21 +1247,21 @@ artifacts:
   - name: nvca-operator
     type: image
     registry: public-images
-    version: 3.18.6
+    version: 3.18.10
     stacks:
       - compute-plane
     requirement: required
   - name: nvca
     type: image
     registry: public-images
-    version: 3.18.6
+    version: 3.18.10
     stacks:
       - compute-plane
     requirement: required
   - name: nvcf-ai-api-gateway-service
     type: image
     registry: public-images
-    version: 1.42.0
+    version: 1.42.2
     stacks:
       - self-managed
     requirement: optional
@@ -1335,14 +1289,14 @@ artifacts:
   - name: nvcf-event-ledger
     type: image
     registry: public-images
-    version: 0.21.0
+    version: 0.21.2
     stacks:
       - self-managed
     requirement: required
   - name: nvcf-function-autoscaler
     type: image
     registry: public-images
-    version: 1.23.1
+    version: 1.23.2
     stacks:
       - self-managed
     requirement: required
@@ -1363,7 +1317,7 @@ artifacts:
   - name: nvcf-invocation-service
     type: image
     registry: public-images
-    version: 0.14.2
+    version: 0.15.1
     stacks:
       - self-managed
     requirement: required
@@ -1381,26 +1335,17 @@ artifacts:
     stacks:
       - self-managed
     requirement: required
-  - id: nvcf-openbao-migrations-image-0.19.10
-    name: nvcf-openbao-migrations
+  - name: nvcf-openbao-migrations
     type: image
     registry: public-images
-    version: 0.19.10
-    stacks:
-      - self-managed
-    requirement: optional
-  - id: nvcf-openbao-migrations-image-0.23.1
-    name: nvcf-openbao-migrations
-    type: image
-    registry: public-images
-    version: 0.23.1
+    version: 0.23.4
     stacks:
       - self-managed
     requirement: required
   - name: nvcf-openbao
     type: image
     registry: public-images
-    version: 2.6.3-nv-1.3.7
+    version: 2.6.3-nv-1.3.9
     stacks:
       - self-managed
     requirement: required
@@ -1408,7 +1353,7 @@ artifacts:
     name: nvcf-otel-collector
     type: image
     registry: public-images
-    version: 0.160.0-nv-0.4.7
+    version: 0.160.0-nv-0.4.9
     stacks:
       - compute-plane
     requirement: optional
@@ -1450,7 +1395,7 @@ artifacts:
   - name: nvcf-worker-llm-credentials-oss
     type: image
     registry: public-images
-    version: 1.2.2
+    version: 1.2.3
     stacks:
       - self-managed
     requirement: required
@@ -1471,7 +1416,7 @@ artifacts:
   - name: nvcf_worker_niclls
     type: image
     registry: public-images
-    version: 2.118.2
+    version: 2.118.5
     stacks:
       - self-managed
     requirement: required
@@ -1492,7 +1437,7 @@ artifacts:
   - name: pylon
     type: image
     registry: public-images
-    version: 0.29.2
+    version: 0.29.3
     stacks:
       - self-managed
     requirement: optional
@@ -1510,10 +1455,19 @@ artifacts:
     stacks:
       - compute-plane
     requirement: required
-  - name: stargate
+  - id: stargate
+    name: stargate
     type: image
     registry: public-images
     version: 0.29.2
+    stacks:
+      - self-managed
+    requirement: optional
+  - id: stargate-image-0.29.3
+    name: stargate
+    type: image
+    registry: public-images
+    version: 0.29.3
     stacks:
       - self-managed
     requirement: optional
@@ -1521,10 +1475,42 @@ artifacts:
     type: image
     registry: public-images
     upstream_repository: quay.io/jetstack/cert-manager-acmesolver
-    version: v1.20.2
+    version: v1.20.5
     stacks:
       - self-managed
     requirement: optional
+  - name: cert-manager-cainjector
+    type: image
+    registry: public-images
+    upstream_repository: quay.io/jetstack/cert-manager-cainjector
+    version: v1.20.5
+    stacks:
+      - self-managed
+    requirement: required
+  - name: cert-manager-controller
+    type: image
+    registry: public-images
+    upstream_repository: quay.io/jetstack/cert-manager-controller
+    version: v1.20.5
+    stacks:
+      - self-managed
+    requirement: required
+  - name: cert-manager-startupapicheck
+    type: image
+    registry: public-images
+    upstream_repository: quay.io/jetstack/cert-manager-startupapicheck
+    version: v1.20.5
+    stacks:
+      - self-managed
+    requirement: required
+  - name: cert-manager-webhook
+    type: image
+    registry: public-images
+    upstream_repository: quay.io/jetstack/cert-manager-webhook
+    version: v1.20.5
+    stacks:
+      - self-managed
+    requirement: required
   - name: victoria-metrics
     type: image
     registry: public-images
@@ -1533,21 +1519,21 @@ artifacts:
     stacks:
       - observability
     requirement: required
-  - name: nvcf-cluster-topology
-    type: chart
-    registry: public-helm
-    upstream_repository: https://github.com/NVIDIA/nvcf/tree/507d8e2ece81d04b8e63f6be31a0ea2d83561b4b/deploy/stacks/nvcf-compute-plane/charts
-    version: 0.1.0
-    stacks:
-      - compute-plane
-    requirement: required
   - name: nvcf-upgrade-receipt
     type: chart
     registry: public-helm
-    upstream_repository: https://github.com/NVIDIA/nvcf/tree/e11b44050c3770d650d5fd4bf0b8e8bebca6786c/deploy/stacks/self-managed/charts
+    upstream_repository: https://github.com/NVIDIA/nvcf/tree/859ad9e45d45f0503ea3759d7b2d07f5a5eb75df/deploy/stacks/self-managed/charts
     version: 0.1.0
     stacks:
       - self-managed
+    requirement: required
+  - name: nvcf-cluster-topology
+    type: chart
+    registry: public-helm
+    upstream_repository: https://github.com/NVIDIA/nvcf/tree/daf87d512a7980e3124a4d69d5e449458a5bb5e9/deploy/stacks/nvcf-compute-plane/charts
+    version: 0.1.0
+    stacks:
+      - compute-plane
     requirement: required
   - name: nvcf-default-monitors
     type: chart
@@ -1612,7 +1598,7 @@ artifacts:
   - name: helm-nvcf-cert-manager
     type: chart
     registry: public-helm
-    version: 0.1.0
+    version: 0.2.0
     stacks:
       - self-managed
     requirement: required
@@ -1626,14 +1612,14 @@ artifacts:
   - name: helm-nvcf-event-ledger
     type: chart
     registry: public-helm
-    version: 0.10.0
+    version: 0.10.2
     stacks:
       - self-managed
     requirement: required
   - name: helm-nvcf-function-autoscaler
     type: chart
     registry: public-helm
-    version: 0.8.0
+    version: 0.8.1
     stacks:
       - self-managed
     requirement: required
@@ -1647,7 +1633,7 @@ artifacts:
   - name: helm-nvcf-invocation-service
     type: chart
     registry: public-helm
-    version: 1.9.0
+    version: 1.10.0
     stacks:
       - self-managed
     requirement: required
@@ -1675,7 +1661,7 @@ artifacts:
   - name: helm-nvcf-nats
     type: chart
     registry: public-helm
-    version: 0.9.0
+    version: 0.9.1
     stacks:
       - self-managed
     requirement: required
@@ -1696,7 +1682,7 @@ artifacts:
   - name: helm-nvcf-openbao-server
     type: chart
     registry: public-helm
-    version: 0.36.1
+    version: 0.37.1
     stacks:
       - self-managed
     requirement: required
@@ -1739,6 +1725,13 @@ artifacts:
     type: chart
     registry: public-helm
     version: 0.11.0
+    stacks:
+      - self-managed
+    requirement: optional
+  - name: helm-nvcf-worker-callback-proxy
+    type: chart
+    registry: public-helm
+    version: 0.1.0
     stacks:
       - self-managed
     requirement: optional
@@ -1805,7 +1798,7 @@ supplemental_artifacts:
   - name: nvcf-compute-plane-stack
     type: resource
     registry: public-resources
-    version: 1.1.0
+    version: 1.1.1
     stacks:
       - compute-plane
   - name: nvcf-observability-stack
