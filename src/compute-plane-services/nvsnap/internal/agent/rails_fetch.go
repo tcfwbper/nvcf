@@ -97,6 +97,35 @@ type RailsConfig struct {
 	// KeepFreePercent is the share of the checkpoint filesystem a copy
 	// must leave free.
 	KeepFreePercent int
+	// NICMode is how a rails pod gets its node's RDMA NICs:
+	// RailsNICsClaim (default) claims every one through DRA
+	// (ClaimTemplate); RailsNICsHost claims none and uses Devices in the
+	// host's network namespace, for clusters whose NICs are a
+	// device-plugin resource the workers take whole, where the physical
+	// functions stay on the host and the workers hold the virtual ones.
+	NICMode string
+	// Devices is bedrock-peer's --devices: "all", "netns" or a
+	// comma-separated list of RDMA device names. Empty: "all" with
+	// claimed NICs (the claim holds only them), "netns" on host NICs.
+	Devices string
+}
+
+// Rails NIC modes.
+const (
+	RailsNICsClaim = "claim"
+	RailsNICsHost  = "host"
+)
+
+func (c RailsConfig) hostNICs() bool { return c.NICMode == RailsNICsHost }
+
+func (c RailsConfig) devices() string {
+	switch {
+	case c.Devices != "":
+		return c.Devices
+	case c.hostNICs():
+		return "netns"
+	}
+	return "all"
 }
 
 const (
@@ -162,8 +191,13 @@ func (c RailsConfig) Validate() error {
 			return fmt.Errorf("rails %s %q: %w", name, v, err)
 		}
 	}
-	if c.Namespace == "" || c.ClaimTemplate == "" || c.SecretName == "" {
-		return errors.New("rails: namespace, claim template and secret are required")
+	switch c.NICMode {
+	case "", RailsNICsClaim, RailsNICsHost:
+	default:
+		return fmt.Errorf("rails: NIC mode %q: want %q or %q", c.NICMode, RailsNICsClaim, RailsNICsHost)
+	}
+	if c.Namespace == "" || c.SecretName == "" || (!c.hostNICs() && c.ClaimTemplate == "") {
+		return errors.New("rails: namespace and secret, and a claim template unless on host NICs, are required")
 	}
 	return nil
 }
@@ -605,7 +639,7 @@ func railsFetchArgs(cfg RailsConfig, sources []string, checkpointID string) []st
 	for _, s := range sources {
 		args = append(args, "--source", s)
 	}
-	return append(args, "--prefix", checkpointID, "--devices", "all", "--dest", railsMountPath+"/"+checkpointID,
+	return append(args, "--prefix", checkpointID, "--devices", cfg.devices(), "--dest", railsMountPath+"/"+checkpointID,
 		"--connections", strconv.Itoa(cfg.connections()), "--json")
 }
 
@@ -656,7 +690,7 @@ func railsPod(cfg RailsConfig, spec railsPodSpec) *corev1.Pod {
 	if spec.owner != nil {
 		meta.OwnerReferences = []metav1.OwnerReference{*spec.owner}
 	}
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: meta,
 		Spec: corev1.PodSpec{
 			// nodeSelector, not nodeName: the scheduler allocates the DRA
@@ -710,4 +744,19 @@ func railsPod(cfg RailsConfig, spec railsPodSpec) *corev1.Pod {
 			}},
 		},
 	}
+	if cfg.hostNICs() {
+		// No claim: the host's network namespace, where the physical
+		// functions are, and privileged to open their device files (a
+		// container is denied device files it was not given). Privileged
+		// rules out the no-escalation flag.
+		yes := true
+		pod.Spec.HostNetwork = true
+		pod.Spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+		pod.Spec.ResourceClaims = nil
+		c := &pod.Spec.Containers[0]
+		c.Resources.Claims = nil
+		c.SecurityContext.Privileged = &yes
+		c.SecurityContext.AllowPrivilegeEscalation = nil
+	}
+	return pod
 }

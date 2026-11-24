@@ -763,3 +763,50 @@ func sameSet(a, b []string) bool {
 	slices.Sort(y)
 	return slices.Equal(x, y)
 }
+
+// Host NICs: on a cluster whose RDMA NICs are a device-plugin resource
+// (no DRA DeviceClass) and whose workers take them all, the rails pod
+// claims none. It runs in the host's network namespace on the devices it
+// is told to use (the physical functions; the workers hold the virtual
+// ones), privileged to open them.
+func TestRailsHostNICMode(t *testing.T) {
+	cfg := testRailsConfig()
+	cfg.NICMode, cfg.Devices = RailsNICsHost, "rdma_rail0,rdma_rail1"
+	cfg.ClaimTemplate = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("host mode without a claim template: %v", err)
+	}
+	pod := railsServePod(cfg, "src-node", "/var/lib/containerd/nvsnap-checkpoints", testOwner, time.Now())
+	s, c := pod.Spec, pod.Spec.Containers[0]
+	if !s.HostNetwork || s.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
+		t.Errorf("hostNetwork %v dnsPolicy %q", s.HostNetwork, s.DNSPolicy)
+	}
+	if len(s.ResourceClaims) != 0 || len(c.Resources.Claims) != 0 {
+		t.Errorf("claims %+v %+v; host mode claims no NIC", s.ResourceClaims, c.Resources.Claims)
+	}
+	if c.SecurityContext.Privileged == nil || !*c.SecurityContext.Privileged {
+		t.Error("not privileged: it could not open the host's RDMA devices")
+	}
+	if got := strings.Join(c.Args, " "); !strings.Contains(got, "--devices rdma_rail0,rdma_rail1") {
+		t.Errorf("serve args %q", got)
+	}
+	if got := strings.Join(railsFetchArgs(cfg, []string{"10.0.0.1:9890"}, "ck"), " "); !strings.Contains(got, "--devices rdma_rail0,rdma_rail1") {
+		t.Errorf("fetch args %q", got)
+	}
+	// Defaults: claim mode keeps every claimed NIC; host mode with no
+	// device list takes the host namespace's NICs.
+	cfg.Devices = ""
+	if got := strings.Join(railsServePod(cfg, "n", "/x", testOwner, time.Now()).Spec.Containers[0].Args, " "); !strings.Contains(got, "--devices netns") {
+		t.Errorf("host mode default devices: %q", got)
+	}
+	bad := testRailsConfig()
+	bad.NICMode = "shared"
+	if bad.Validate() == nil {
+		t.Error("an unknown NIC mode validated")
+	}
+	claim := testRailsConfig()
+	claim.ClaimTemplate = ""
+	if claim.Validate() == nil {
+		t.Error("claim mode without a claim template validated")
+	}
+}

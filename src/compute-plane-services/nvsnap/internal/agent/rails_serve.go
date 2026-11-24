@@ -91,7 +91,7 @@ func railsServePod(cfg RailsConfig, node, hostRoot string, owner *metav1.OwnerRe
 	c := &pod.Spec.Containers[0]
 	c.Name = "serve"
 	c.Command = []string{"/bin/sh", "-c", railsPodScript(railsMountPath + "/" + railsJobsDir), "bedrock-peer"}
-	c.Args = []string{"serve", "--root", railsMountPath, "--devices", "all",
+	c.Args = []string{"serve", "--root", railsMountPath, "--devices", cfg.devices(),
 		"--port", fmt.Sprint(cfg.port()), "--max-fetchers", fmt.Sprint(cfg.serveMaxFetchers()), "--ready-file", ready}
 	c.ReadinessProbe = &corev1.Probe{
 		ProbeHandler:  corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"test", "-f", ready}}},

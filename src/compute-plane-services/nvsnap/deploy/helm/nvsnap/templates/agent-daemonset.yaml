@@ -116,6 +116,10 @@ spec:
             - --rails-fetch-cpu={{ .fetch.cpu }}
             - --rails-fetch-memory={{ .fetch.memory }}
             - --rails-keep-free-percent={{ .keepFreePercent }}
+            - --rails-nic-mode={{ .nicMode | default "claim" }}
+            {{- with .devices }}
+            - --rails-devices={{ . }}
+            {{- end }}
             {{- end }}
             {{- end }}
             - --rootfs-capture

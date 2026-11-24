@@ -6,7 +6,9 @@
 # claim template and the secret of the bedrock-peer serve and fetch pods
 # the agent creates in this namespace.
 #
-# Every RDMA NIC of the pod's node, for the length of one copy.
+{{- if ne (.Values.agent.rails.nicMode | default "claim") "host" }}
+# Every RDMA NIC of the pod's node, for the length of one copy. Not with
+# host NICs (agent.rails.nicMode=host), which claim none.
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -23,6 +25,7 @@ spec:
             deviceClassName: {{ .Values.agent.rails.deviceClass | quote }}
             allocationMode: All
 ---
+{{- end }}
 # The secret both ends present (BEDROCK_PEER_SECRET): a serve pod refuses a
 # fetch without it. Generated once and kept across upgrades, as the agent
 # token is (templates/agent-token-secret.yaml): a rotation mid-copy would

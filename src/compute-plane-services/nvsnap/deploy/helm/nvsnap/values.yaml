@@ -603,6 +603,16 @@ agent:
       memory: 64Gi
     # Share of the checkpoint filesystem a copy must leave free.
     keepFreePercent: 10
+    # How a rails pod gets its node's RDMA NICs. "claim": every NIC,
+    # through DRA (deviceClass). "host": none claimed; it runs in the
+    # host's network namespace, privileged, on `devices`. For clusters
+    # whose NICs are a device-plugin resource the workers take whole, with
+    # the physical functions left on the host (the workers hold virtual
+    # functions): the copy shares the ports with the workers' traffic.
+    nicMode: claim
+    # bedrock-peer --devices: all, netns, or comma-separated RDMA device
+    # names. Empty: all when claiming, netns on host NICs.
+    devices: ""
 
 # ─── NvSnap Server (REST API + UI) ───────────────────────────────────────
 

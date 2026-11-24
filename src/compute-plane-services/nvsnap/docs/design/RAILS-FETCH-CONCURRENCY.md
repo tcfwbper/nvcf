@@ -13,6 +13,7 @@ Scope: those files and the agent chart's `rails.*` values.
 
 - [1. The problem](#1-the-problem)
 - [2. Why the transfers wait](#2-why-the-transfers-wait)
+  - [2.1 Host NICs](#21-host-nics)
 - [3. Design](#3-design)
   - [3.1 Small checkpoints: the peer tier, on clusters with no L2](#31-small-checkpoints-the-peer-tier-on-clusters-with-no-l2)
   - [3.2 One rails pod per node, shared by every transfer](#32-one-rails-pod-per-node-shared-by-every-transfer)
@@ -36,13 +37,26 @@ to 57 s end to end. The transfers waited for each other, not for the rails. No r
 ## 2. Why the transfers wait
 
 1. A rails pod holds every RDMA NIC of its node through one DRA claim (`ClaimTemplate`), so a second rails pod
-   on the node cannot schedule until the first ends.
+   on the node cannot schedule until the first ends. With host NICs (section 2.1) it claims none.
 2. Before this design, every transfer created its own pods: a serve pod on each source node and a fetch pod on
    its own node. Concurrent fetches from one source queued for its NICs.
 3. Small checkpoints paid the full pod cost (10 s or more of scheduling, sandbox and readiness) for well under
    a second of data, while holding NICs a large transfer needed.
 4. Source choice ignored what a node was doing: picking a node that was itself waiting to fetch blocked that
    node's own fetch.
+
+### 2.1 Host NICs
+
+Some clusters publish their RDMA NICs only as a device-plugin resource (`nvidia.com/mlnxnics`), with no DRA
+DeviceClass, and a multi-node worker running NCCL over RDMA takes every one. A claiming rails pod can then never
+start there. On such nodes each RDMA rail is a physical function, which stays in the host's network namespace, with
+an SR-IOV virtual function that the device plugin gives a worker. Both are separate RDMA devices on the same port.
+
+With `agent.rails.nicMode=host` the rails pod claims no NIC. It runs in the host's network namespace, privileged
+to open the devices, on `agent.rails.devices` (bedrock-peer `--devices`: names, or `netns` for every active device
+of the host namespace). It uses the physical functions while the workers keep the virtual functions, and the copy
+shares the port bandwidth with the workers' traffic. During a restore the destination node serves nothing yet, so
+the sharing is on the source nodes. `railsPod` (`internal/agent/rails_fetch.go`) builds both modes.
 
 ## 3. Design
 

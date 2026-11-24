@@ -314,6 +314,10 @@ func main() {
 	flag.StringVar(&config.Rails.ServeMemory, "rails-serve-memory", "32Gi", "Memory request and limit of a rails serve pod.")
 	flag.StringVar(&config.Rails.FetchCPU, "rails-fetch-cpu", "32", "CPU request and limit of a rails fetch pod.")
 	flag.StringVar(&config.Rails.FetchMemory, "rails-fetch-memory", "64Gi", "Memory request and limit of a rails fetch pod.")
+	flag.StringVar(&config.Rails.NICMode, "rails-nic-mode", "claim",
+		"How a rails pod gets its node's RDMA NICs: claim (every NIC, through DRA) or host (none claimed; the --rails-devices in the host's network namespace).")
+	flag.StringVar(&config.Rails.Devices, "rails-devices", "",
+		"bedrock-peer --devices: all, netns, or comma-separated RDMA device names (empty: all when claiming, netns on host NICs).")
 	flag.IntVar(&config.Rails.KeepFreePercent, "rails-keep-free-percent", 0,
 		"Share of the checkpoint filesystem a rails copy must leave free (0: 10).")
 
