@@ -163,6 +163,30 @@ agent:
   # modelVolume.readerMode: pvc); readerMode: hostPath schedules readers
   # at once and binds the volume in, for gang-scheduled charts where
   # policy allows hostPath. Needs agent.l2. Off until qualified.
+  # Node-local model cache (docs/design/node-model-cache.md). A cold pod
+  # whose init downloads its model into an emptyDir seeds it from a copy on
+  # its node, or one the agent fetches from a peer node, instead of
+  # downloading; after a real download the agent keeps a copy. The pod's
+  # volumes, its main container and restores are unchanged, and any cache
+  # problem falls back to the pod's own download. Needs agent.auth
+  # enabled with mode required; not with modelVolume.
+  nodeModelCache:
+    enabled: false
+    # Host directory of the cache, on the node's local disk (NVMe).
+    root: /var/lib/containers/nvsnap-model-cache
+    # Most of root's filesystem the cache may use, in percent. 10% of the
+    # filesystem always stays free.
+    maxPercent: 30
+    # Most seconds a download init waits for a peer fetch in progress.
+    wait: 600
+    # Most time one fetch from one peer may take.
+    fetchTimeout: 30m
+    # One pod per model downloads from the registry; the other pods stream
+    # its download from its node as the files land, instead of each
+    # downloading (docs/design/model-cache-single-flight.md). The agent then
+    # mounts kubeletPodsDir read-write, to write those pods' volumes.
+    singleFlight: false
+    kubeletPodsDir: /var/lib/kubelet/pods
   modelVolume:
     enabled: false
     # How long a reader waits for the writer's download before it downloads

@@ -263,3 +263,40 @@ func TestScrapedCountsServedScrapes(t *testing.T) {
 		t.Fatalf("a served scrape after creation left the series at %v, want 1", v)
 	}
 }
+
+// The model cache's counters are held on first sight like the lifecycle
+// counters: a node's first harvest, fetch or seeded init is counted by
+// increase().
+func TestModelCacheCountersAreHeldOnFirstSight(t *testing.T) {
+	fs := newFakeSight(2 * time.Minute)
+	prev := sight
+	sight = fs.firstSight
+	defer func() { sight = prev }()
+
+	CountModelCacheInit("seeded")
+	CountModelCacheOp("harvest", "ok")
+	AddModelCacheBytes("harvest", 1<<20)
+	for _, c := range []struct {
+		name string
+		vec  prometheus.Collector
+		lbl  []string
+		want float64
+	}{
+		{"inits", ModelCacheInits, []string{"seeded"}, 1},
+		{"operations", ModelCacheOps, []string{"harvest", "ok"}, 1},
+		{"bytes", ModelCacheBytes, []string{"harvest"}, 1 << 20},
+	} {
+		if n := len(series(t, c.vec)); n != 1 {
+			t.Fatalf("%s: %d series after the first observation, want the one, at zero", c.name, n)
+		}
+		if v := value(t, c.vec, c.lbl...); v != 0 {
+			t.Fatalf("%s: first observation applied at once (%v): increase() would not count it", c.name, v)
+		}
+		defer func(name string, vec prometheus.Collector, lbl []string, want float64) {
+			if v := value(t, vec, lbl...); v != want {
+				t.Errorf("%s after the hold = %v, want %v", name, v, want)
+			}
+		}(c.name, c.vec, c.lbl, c.want)
+	}
+	fs.advance(2 * time.Minute)
+}

@@ -74,6 +74,7 @@ where the files column says.
 | `nvsnap.io/election-id` | `ElectionIDAnnotation` (internal/election/election.go) | On the leader pod is the id the webhook minted at admission and used as the Lease holder. |
 | `nvsnap.io/fallback-capture` | `FallbackCaptureAnnotation` (internal/webhook/criu_fallback.go) | Names the cachedir capture a fallback pod is seeded from; the agent on its node fetches it. |
 | `nvsnap.io/fallback-reason` | `FallbackReasonAnnotation` (internal/webhook/criu_fallback.go) | Is the group record state that made the pod fall back; the agent captures the cachedir of a pod that carries it. |
+| `nvsnap.io/feeds` | `feedsAnnotation` (internal/agent/model_cache_flight.go) | FeedsAnnotation, on the Lease, maps each streaming pod's identity to the identity it streams from, so no source feeds more than maxFeeds. |
 | `nvsnap.io/function-id` | `LabelFunction` (internal/fnstatus/fnstatus.go) |  |
 | `nvsnap.io/function-version-id` | `FunctionVersionIDAnnotation` (internal/podtimings/podtimings.go)<br>`LabelFunctionVersion` (internal/fnstatus/fnstatus.go) | Is the annotation key NVCA's Hook A stamps with the function-version id so downstream tools can group + summarize without re-deriving from labels. |
 | `nvsnap.io/gated` | `GatedLabel` (internal/election/election.go) | Is "true" while a follower holds the scheduling gate. |
@@ -92,6 +93,9 @@ where the files column says.
 | `nvsnap.io/leader-uid` | `LeaderUIDAnnotation` (internal/election/election.go) | On the Lease is the UID of the leader pod, bound once the pod exists (see ResolveLeader). |
 | `nvsnap.io/lease-kind` | inline: internal/agent/replication_poll.go, internal/checkpointstore/percapture_pvc.go |  |
 | `nvsnap.io/model` | `IdentityLabel` (internal/modelvolume/modelvolume.go)<br>`annModel` (internal/server/manifests.go) | Is the short identity key on claims, PVs and pods. |
+| `nvsnap.io/model-cache-init` | `ModelCacheInitAnnotation` (internal/webhook/node_model_cache.go) | Names the wrapped download init, whose successful exit tells the agent the volume is complete. |
+| `nvsnap.io/model-cache-key` | `ModelCacheKeyLabel` (internal/webhook/node_model_cache.go) | Carries the download's cache key, for the agent on the pod's node (harvest, peer fetch, eviction pins). |
+| `nvsnap.io/model-cache-volume` | `ModelCacheVolumeAnnotation` (internal/webhook/node_model_cache.go) | Names the download volume the agent harvests from. |
 | `nvsnap.io/model-capture` | `CaptureLabel` (internal/modelvolume/modelvolume.go) | Is "true" on a pod whose engine downloads an artifact nvsnap has no download recipe for (a chart script pulling an NGC model) into a pod volume. |
 | `nvsnap.io/model-capture-volume` | `CaptureVolumeAnnotation` (internal/modelvolume/modelvolume.go) | Names the pod volume the engine downloads into. |
 | `nvsnap.io/model-complete` | `CompleteLabel` (internal/modelvolume/modelvolume.go) | Is "true" on the writer claim once the download exited 0. |
@@ -177,7 +181,7 @@ binary.
 | `NVSNAP_PIDNS_FDS` |  | cmd/agent/pidns_exec.go |
 | `NVSNAP_PIDNS_UNIX_LISTENERS` |  | cmd/agent/pidns_exec.go |
 | `NVSNAP_POD_CACHE_DIR` |  | cmd/agent/main.go |
-| `NVSNAP_POD_UID` |  | cmd/nvsnap-mount-prep/main.go |
+| `NVSNAP_POD_UID` |  | cmd/nvsnap-helper/modelcache.go, cmd/nvsnap-mount-prep/main.go |
 | `NVSNAP_POLL_INTERVAL` |  | cmd/nvsnap-l2-wait/main.go |
 | `NVSNAP_PREP_DEADLINE` |  | cmd/nvsnap-mount-prep/main.go |
 | `NVSNAP_PREP_MOUNTS` |  | cmd/nvsnap-mount-prep/main.go |

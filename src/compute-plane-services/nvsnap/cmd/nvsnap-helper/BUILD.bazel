@@ -4,10 +4,12 @@ go_library(
     name = "nvsnap-helper_lib",
     srcs = [
         "main.go",
+        "modelcache.go",
         "pidfloor.go",
     ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/cmd/nvsnap-helper",
     visibility = ["//visibility:private"],
+    deps = ["//src/compute-plane-services/nvsnap/internal/modelcache"],
 )
 
 go_binary(
@@ -20,7 +22,9 @@ go_test(
     name = "nvsnap-helper_test",
     srcs = [
         "main_test.go",
+        "modelcache_test.go",
         "pidfloor_test.go",
     ],
     embed = [":nvsnap-helper_lib"],
+    deps = ["//src/compute-plane-services/nvsnap/internal/modelcache"],
 )

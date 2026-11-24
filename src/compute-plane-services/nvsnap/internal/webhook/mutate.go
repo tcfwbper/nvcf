@@ -340,6 +340,10 @@ type Mutator struct {
 	// group members that name no model (LWS workers); may be nil.
 	// ModelWaitDeadline bounds a reader's wait before it downloads itself.
 	ModelVolume *modelvolume.Provisioner
+	// NodeModelCache, when set, seeds a cold pod's model download from
+	// the node's local copy (docs/design/node-model-cache.md). Never
+	// together with ModelVolume.
+	NodeModelCache *NodeModelCache
 	// CacheVolume shares compile caches between Helm pods on block storage
 	// (KindCache provisioner); nil disables.
 	CacheVolume       *modelvolume.Provisioner
@@ -643,8 +647,14 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	// gpushare placement is independent of every other decision below and
 	// rides along with whichever patches they return.
+	// Whether the pod already runs from the node's nvsnap bundle (the
+	// gpushare library): only then may the model cache add the helper,
+	// which comes from the same bundle.
+	bundled := false
 	if !isFallback || (fallback.Reason != FallbackGPUShareFailed && fallback.Reason != FallbackDriver) {
 		gp := m.gpusharePatches(ctx, pod)
+		_, helperBundle := m.bundleHelperVolume(pod)
+		bundled = len(gp) > 0 || podHasVolume(pod, gpushareLibVolume) || helperBundle
 		injectPatches = append(injectPatches, gp...)
 		injectPatches = append(injectPatches, m.captureHoldPatches(ctx, pod, len(gp) > 0)...)
 	}
@@ -678,6 +688,11 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		} else if ep != nil {
 			return mergePatchPlan(append(injectPatches, ep...)), nil
 		}
+		// A cold pod's model download seeds from the node's copy
+		// (node_model_cache.go); it changes only the download init. Here,
+		// after the restore and election branches returned: a pod those
+		// admit keeps its spec.
+		injectPatches = append(injectPatches, m.nodeModelCachePatches(ctx, pod, bundled)...)
 		// No restore-from — this is a CAPTURE/cold pod. In cachedir mode,
 		// inject the cache/model env vars + the /opt/nvsnap emptyDir so the
 		// engine funnels its caches there and the agent captures that dir.
@@ -713,6 +728,17 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	span.SetAttributes(attribute.String("nvsnap.hash", hash))
 
+	// coldStart admits a stamped pod that restores nothing: it keeps the
+	// placement every cold pod gets, its model download seeding from the
+	// node's copy among it.
+	coldStart := func() ([]PatchOp, error) {
+		patches := append(injectPatches, m.nodeModelCachePatches(ctx, pod, bundled)...)
+		if len(patches) == 0 {
+			return nil, nil
+		}
+		return mergePatchPlan(patches), nil
+	}
+
 	// A CRIU capture: the pod becomes the placeholder the agent restores
 	// the captured process into.
 	plog := m.logger().WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "hash": checkpointstore.ShortHash(hash)})
@@ -720,7 +746,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		cp, err := m.criuRestorePatches(pod, id, cman)
 		if err != nil {
 			plog.WithError(err).Warn("CRIU restore: cannot prepare the pod; cold start")
-			return mergePatchPlan(injectPatches), nil
+			return coldStart()
 		}
 		// The restored process keeps the mounts it was dumped with, so the
 		// placeholder gets the model landing the captured pod had, as a
@@ -763,10 +789,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	// node never schedules (the platform kills it as "no capacity").
 	if haveManifest && criuCheckpointID(manifest) != "" {
 		plog.Info("CRIU capture not restored; cold start")
-		if len(injectPatches) == 0 {
-			return nil, nil
-		}
-		return mergePatchPlan(injectPatches), nil
+		return coldStart()
 	}
 	// Dispatch on the AUTHORITATIVE capture method stamped at capture
 	// time (v0.0.56). Fall back to the shape heuristic only for
@@ -837,10 +860,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		// be taken from it.
 		m.logger().WithField("hash", checkpointstore.ShortHash(hash)).
 			Info("no capture for hash; cold start")
-		if len(injectPatches) == 0 {
-			return nil, nil
-		}
-		return mergePatchPlan(injectPatches), nil
+		return coldStart()
 	}
 
 	// Note: we do NOT peer-fetch the capture bytes here. The webhook

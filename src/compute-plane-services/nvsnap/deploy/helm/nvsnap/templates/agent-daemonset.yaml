@@ -150,6 +150,24 @@ spec:
             {{- end }}
             - --model-volume-host-root={{ .Values.agent.hostPaths.nvsnapModels | default "/var/lib/containerd/nvsnap-models" }}
             {{- end }}
+            {{- if and .Values.agent.nodeModelCache .Values.agent.nodeModelCache.enabled }}
+            {{- if and .Values.agent.modelVolume .Values.agent.modelVolume.enabled }}
+            {{- fail "agent.nodeModelCache and agent.modelVolume cannot both be enabled" }}
+            {{- end }}
+            {{- if not (and .Values.agent.auth.enabled (eq .Values.agent.auth.mode "required")) }}
+            {{- fail "agent.nodeModelCache needs agent.auth.enabled=true and agent.auth.mode=required: its routes serve models between nodes" }}
+            {{- end }}
+            # node-local model cache (values: agent.nodeModelCache)
+            - --node-model-cache
+            - --node-model-cache-root={{ .Values.agent.nodeModelCache.root | default "/var/lib/containers/nvsnap-model-cache" }}
+            - --node-model-cache-max-percent={{ .Values.agent.nodeModelCache.maxPercent | default 30 }}
+            - --node-model-cache-wait={{ .Values.agent.nodeModelCache.wait | default 600 }}
+            - --node-model-cache-fetch-timeout={{ .Values.agent.nodeModelCache.fetchTimeout | default "30m" }}
+            {{- if .Values.agent.nodeModelCache.singleFlight }}
+            - --node-model-cache-single-flight
+            - --node-model-cache-pods-root=/var/lib/nvsnap/kubelet-pods
+            {{- end }}
+            {{- end }}
             {{- if and .Values.agent.election .Values.agent.election.enabled }}
             # one-downloader election (values: agent.election)
             - --election
@@ -415,6 +433,20 @@ spec:
               mountPath: {{ .Values.agent.hostPaths.nvsnapModels | default "/var/lib/containerd/nvsnap-models" }}
               mountPropagation: Bidirectional
             {{- end }}
+            {{- if and .Values.agent.nodeModelCache .Values.agent.nodeModelCache.enabled }}
+            # Node model cache: same path in the agent and on the host, as
+            # admission mounts <root>/<key> read-only into download inits.
+            - name: nvsnap-model-cache
+              mountPath: {{ .Values.agent.nodeModelCache.root | default "/var/lib/containers/nvsnap-model-cache" }}
+            {{- if .Values.agent.nodeModelCache.singleFlight }}
+            # Single flight writes waiting pods' model volumes; the host
+            # root above is read-only. HostToContainer: pods' in-memory
+            # emptyDirs (the signal volume) are mounts made after start.
+            - name: kubelet-pods
+              mountPath: /var/lib/nvsnap/kubelet-pods
+              mountPropagation: HostToContainer
+            {{- end }}
+            {{- end }}
             {{- if .Values.webhook.enabled }}
             - name: webhook-tls
               mountPath: /etc/nvsnap/webhook
@@ -448,6 +480,18 @@ spec:
           hostPath:
             path: {{ .Values.agent.hostPaths.nvsnapModels | default "/var/lib/containerd/nvsnap-models" }}
             type: DirectoryOrCreate
+        {{- end }}
+        {{- if and .Values.agent.nodeModelCache .Values.agent.nodeModelCache.enabled }}
+        - name: nvsnap-model-cache
+          hostPath:
+            path: {{ .Values.agent.nodeModelCache.root | default "/var/lib/containers/nvsnap-model-cache" }}
+            type: DirectoryOrCreate
+        {{- if .Values.agent.nodeModelCache.singleFlight }}
+        - name: kubelet-pods
+          hostPath:
+            path: {{ .Values.agent.nodeModelCache.kubeletPodsDir | default "/var/lib/kubelet/pods" }}
+            type: Directory
+        {{- end }}
         {{- end }}
         {{- if .Values.agent.podCacheDir }}
         - name: cachedir-env

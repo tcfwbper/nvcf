@@ -49,6 +49,8 @@ func main() {
 		code, err = writeCmd(args)
 	case "seed":
 		seedCmd(args)
+	case "model-cache":
+		code, err = modelCacheCmd(args)
 	case "prewarm":
 		prewarmCmd(args)
 	case "await-pid-floor":
@@ -66,7 +68,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: nvsnap-helper skip | wait | write | seed | prewarm | await-pid-floor [flags] [-- command...]")
+	fmt.Fprintln(os.Stderr, "usage: nvsnap-helper skip | wait | write | seed | model-cache | prewarm | await-pid-floor [flags] [-- command...]")
 	os.Exit(2)
 }
 

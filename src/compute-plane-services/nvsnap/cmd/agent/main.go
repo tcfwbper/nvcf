@@ -196,6 +196,21 @@ func main() {
 		"How long a complete model or cache volume is kept after its last use before the reaper frees its storage (0 = keep forever)")
 	flag.DurationVar(&config.ModelVolume.WaitDeadline, "model-volume-wait-deadline", 0,
 		"How long a reader waits for the writer's download before downloading itself (default 1h)")
+	// Node-local model cache (docs/design/node-model-cache.md).
+	flag.BoolVar(&config.NodeModelCache.Enabled, "node-model-cache", false,
+		"Keep downloaded models on the node's disk and seed later cold pods from it or from a peer node (needs --auth-mode=required; not with --model-volume)")
+	flag.StringVar(&config.NodeModelCache.Root, "node-model-cache-root", "",
+		"Host directory of the node model cache, mounted into the agent at the same path")
+	flag.IntVar(&config.NodeModelCache.MaxPercent, "node-model-cache-max-percent", 30,
+		"Most of the cache filesystem the node model cache may use, in percent")
+	flag.IntVar(&config.NodeModelCache.Wait, "node-model-cache-wait", 600,
+		"Most seconds a download init waits for a peer fetch in progress before downloading itself")
+	flag.DurationVar(&config.NodeModelCache.FetchTimeout, "node-model-cache-fetch-timeout", 30*time.Minute,
+		"Most time one fetch of a model from one peer may take")
+	flag.BoolVar(&config.NodeModelCache.SingleFlight, "node-model-cache-single-flight", false,
+		"One pod per model downloads; the others stream its download from its node (docs/design/model-cache-single-flight.md)")
+	flag.StringVar(&config.NodeModelCache.PodsRoot, "node-model-cache-pods-root", "/var/lib/nvsnap/kubelet-pods",
+		"The kubelet pods directory, mounted read-write: single flight writes waiting pods' volumes there")
 	flag.StringVar(&config.ModelVolume.TenantLabel, "model-volume-tenant-label", "",
 		"Namespace label naming the tenant a namespace belongs to; model volumes are shared only between namespaces of one tenant (empty = --tenant-label)")
 	flag.BoolVar(&config.ModelVolume.RefreshDisabled, "cache-set-refresh-disabled", false,

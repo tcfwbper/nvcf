@@ -14,6 +14,7 @@ package webhook
 // PATH.
 
 import (
+	"path"
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
@@ -86,6 +87,24 @@ func (m *Mutator) withHelperVolume(pod *corev1.Pod, patches []PatchOp) []PatchOp
 		return patches
 	}
 	return append(patches, addVolumes(pod, []corev1.Volume{m.helperVolume()})...)
+}
+
+// bundleHelperVolume reports whether pod declares the helper's volume
+// (by name), and whether that volume is the node bundle: a hostPath to
+// the bundle directory or one of its versions. A pod's own volume of that
+// name, from anything else, does not hold the helper.
+func (m *Mutator) bundleHelperVolume(pod *corev1.Pod) (declared, bundle bool) {
+	for _, v := range pod.Spec.Volumes {
+		if v.Name != helperVolumeName {
+			continue
+		}
+		if v.HostPath == nil {
+			return true, false
+		}
+		p := path.Clean(v.HostPath.Path)
+		return true, p == m.bundleDir("") || path.Dir(p) == path.Dir(m.bundleDir("v"))
+	}
+	return false, false
 }
 
 func podHasVolume(pod *corev1.Pod, name string) bool {

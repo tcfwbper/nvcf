@@ -49,9 +49,18 @@ function or checkpoint label: those are in the summary lines.
 | `nvsnap_webhook_request_seconds` | histogram | |
 | `nvsnap_gpu_probes_total` | counter | `gpu`, `result`, `error` |
 | `nvsnap_build_info` | gauge | `version` |
+| `nvsnap_model_cache_inits_total` | counter | `result` |
+| `nvsnap_model_cache_operations_total` | counter | `op`, `result` |
+| `nvsnap_model_cache_bytes_total` | counter | `op` |
 
 Labels:
 
+- For the node model cache ([node-model-cache.md](../design/node-model-cache.md)):
+  - `nvsnap_model_cache_inits_total{result}`: `seeded` (filled from the cache), `downloaded`, `failed`. The seeded
+    share is the cache's hit rate.
+  - `nvsnap_model_cache_operations_total{op,result}`: `op` is `harvest`, `fetch` or `evict`; `result` is `ok`,
+    `error` or `skipped` (no room).
+  - `nvsnap_model_cache_bytes_total{op}`: bytes written by `harvest` and `fetch`.
 - `method`: `criu` (restored from a CRIU capture), `cachedir` (seeded from a
   cachedir capture, the fallback), `cold`.
 - `gpu`: the node's GPU product (`nvidia.com/gpu.product`).

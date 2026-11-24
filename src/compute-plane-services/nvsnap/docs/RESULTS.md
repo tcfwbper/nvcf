@@ -18,6 +18,7 @@ not name it.
 - [CRIU, single GPU](#criu-single-gpu)
 - [cachedir](#cachedir)
 - [Cache-set refresh](#cache-set-refresh)
+- [Node model cache](#node-model-cache)
 - [Records](#records)
 <!-- /toc -->
 
@@ -102,6 +103,17 @@ section 6).
 | Start of a restarted container that kept the kernel, against a first start | 62 to 70 s against 93 to 100 s |
 | Collecting generation 2 from eight warm ranks | 59 s, 7.51 GB (generation 1: 7.45 GB) |
 
+## Node model cache
+
+A 4-pod multi-node instance on GB300, November 2026, nvsnap build not recorded
+([results/NODE-MODEL-CACHE-2026-11.md](results/NODE-MODEL-CACHE-2026-11.md)).
+
+| What was measured | Result |
+|---|---|
+| Download init of a 1.56 TB model, each of the 4 pods | 30 to 32 minutes, about 870 MB/s |
+| Harvest of one pod's download volume into the node's cache | about 5.5 minutes |
+| Engine load, after the harvest ended | about 13 minutes more |
+
 ## Records
 
 | Record | What it holds |
@@ -112,3 +124,4 @@ section 6).
 | [design/GPUSHARE.md](design/GPUSHARE.md#validation) | gpushare validation |
 | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) | Model volume results (H100, NVMesh, September 2026) |
 | [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) | Election results (H100, NVMesh, 2026-09-25); cache-set refresh run (GB300, 2026-10-01) |
+| [results/NODE-MODEL-CACHE-2026-11.md](results/NODE-MODEL-CACHE-2026-11.md) | Node model cache: download, harvest and engine-load times of a 1.56 TB model (GB300, November 2026) |

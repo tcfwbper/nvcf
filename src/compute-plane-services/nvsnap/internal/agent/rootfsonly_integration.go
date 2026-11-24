@@ -260,7 +260,7 @@ func buildAgentBackend(cfg RootfsCaptureConfig, kubeClient kubernetes.Interface,
 
 // buildKubeClient prefers in-cluster ServiceAccount config and falls back
 // to KUBECONFIG / ~/.kube/config for dev runs outside a cluster.
-func buildKubeClient() (kubernetes.Interface, error) {
+var buildKubeClient = func() (kubernetes.Interface, error) {
 	cfg, err := loadKubeConfig()
 	if err != nil {
 		return nil, err

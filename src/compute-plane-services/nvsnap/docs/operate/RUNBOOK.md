@@ -23,6 +23,7 @@ records are in `nvsnap-system`.
 - [NvsnapCaptureFailed](#nvsnapcapturefailed)
 - [NvsnapInventoryStale](#nvsnapinventorystale)
 - [NvsnapCaptureStuckVerifying](#nvsnapcapturestuckverifying)
+- [Node model cache](#node-model-cache)
 <!-- /toc -->
 
 ## Following one capture or restore
@@ -275,3 +276,50 @@ for 6 minutes; until then only its own namespace restores from it.
 - Its namespace's pods: deleted and restored again and again within 6
   minutes (a test that cycles its instance) never verify it. Otherwise
   [follow its last restore](#following-one-capture-or-restore).
+
+## Node model cache
+
+Not an alert. The cache ([node-model-cache.md](../design/node-model-cache.md)) seeds cold pods' model downloads from
+a copy on the node.
+
+- **Is it working?** `sum by (result) (increase(nvsnap_model_cache_inits_total[1h]))`: `seeded` against
+  `downloaded`. A wrapped init logs `nvsnap: model cache: seeded <bytes> ...` or `... downloading`. The agent logs
+  `model cache: harvested`, `fetched from peer` and `evicted` with the key.
+- **Which nodes have a model?** `kubectl -n nvsnap-system get cm -l app.kubernetes.io/component=model-cache -o yaml`:
+  one ConfigMap per key, one entry per node. `nvsnap-system` is the default; the ConfigMaps are in the agent's
+  `--rootfs-cm-namespace`, so use that namespace if it is set.
+- **A pod seeded a bad model.** Every copy is checked against its manifest, so a bad tree was bad when it was
+  downloaded, and every node that has the key may serve it to its peers. Remove it everywhere, and keep it from being
+  kept again:
+  1. Turn the cache off (below), so no init waits on a fetch and no download is kept while you clean up.
+  2. Turning it off does not change pods already admitted: their init still mounts the cache and can seed from the
+     bad copy. List them with `kubectl get pods -A -l nvsnap.io/model-cache-key=<key>`, and scale their workloads
+     to zero (or delete those pods and keep them from being replaced) until step 5.
+  3. Delete `<root>/<key>` on every node of the cluster that could hold it, not only the nodes listed in
+     `nvsnap-model-cache-<key>`: a node can keep a copy whose registration failed. For example, for each node,
+     `kubectl debug node/<node> -it --image=busybox -- rm -rf /host<root>/<key>`. A node you cannot reach now
+     (cordoned, down) must be cleaned before it runs pods again, or before the cache is turned back on. Then delete
+     the ConfigMap.
+  4. Fix what made the download bad (the model version, the init's inputs) before turning the cache back on. A
+     download with the same inputs has the same key, and the first cold start after that keeps a copy of it again.
+  5. Only then turn the cache back on and scale the workloads back up.
+- **Turn it off.** Set `agent.nodeModelCache.enabled=false` and upgrade. New pods are admitted unwrapped. The files
+  under `root` stay until removed by hand.
+
+**Single flight** (`agent.nodeModelCache.singleFlight`, [model-cache-single-flight.md](../design/model-cache-single-flight.md)):
+one pod per model downloads, and the others stream its download.
+
+- **Who downloads?** `kubectl -n nvsnap-system get lease -l app.kubernetes.io/component=model-cache`: one Lease
+  `nvsnap-model-dl-<key>` per model being downloaded. Its holder is `<node>/<pod uid>`. Its `nvsnap.io/feeds`
+  annotation says which pod streams from which.
+- **What was a pod told?** On its node, `<root>/<key>/.plan-<pod uid>` holds `download` or `wait`. The init logs
+  `this pod downloads; other nodes copy from it` or `another node downloads this model; the agent copies it here`,
+  then `copied from another node in ...`. The agent logs `single flight:` lines with the key.
+- **A pod waits too long.** It waits while the agent's `<root>/<key>/.streaming-<pod uid>` heartbeat is fresh. The agent
+  stops it after 5 minutes without progress at the source, and the pod then downloads. Deleting the downloading
+  pod moves the download to a waiting pod within about 30 seconds.
+- **Is it on?** With it on, the agent mounts the kubelet pods directory read-write (`kubeletPodsDir`) to write
+  waiting pods' volumes. If it cannot write there, it logs `single flight needs a writable kubelet pods directory; it
+  is off` and admission adds no plans.
+- **Turn it off.** Set `agent.nodeModelCache.singleFlight=false` and upgrade. New pods are admitted without plans,
+  and each downloads or seeds as without single flight. Leases left by a running download expire on their own.

@@ -188,7 +188,9 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		// off (docs/ARCHITECTURE.md, section 7).
 		Elector: a.elector,
 		// Write-once model volume for Helm functions; nil when off.
-		ModelVolume:       a.modelVolume,
+		ModelVolume: a.modelVolume,
+		// Node-local model cache; nil when off (node_model_cache.go).
+		NodeModelCache:    a.webhookNodeModelCache(),
 		CacheVolume:       a.cacheVolume,
 		ModelWaitDeadline: a.config.ModelVolume.WaitDeadline,
 		ModelHostRoot:     a.modelHostRoot(),
