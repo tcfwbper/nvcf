@@ -344,6 +344,14 @@ by a shared read-only attach, depending on the storage
 A node bundle version that a node lacks is fetched from a peer agent and
 installed only when its digest matches the one its staging agents recorded
 (`internal/agent/bundle_digest.go` `verifyBundle`).
+A restore placeholder whose version no agent can supply is given up rather
+than left in FailedMount for good: the restore is recorded as not run, the
+placeholder is deleted, and its checkpoint is blocked (so the replacement
+starts cold) when no node has the version. When the version exists but
+could not be installed on the node, or the capture record no longer names
+it, only the placeholder is deleted
+(`internal/agent/bundle_versions.go` `restoreWithoutBundle`;
+[VERSIONED-NODE-BUNDLE.md](design/VERSIONED-NODE-BUNDLE.md)).
 
 ## 7. Model volumes and the election
 
@@ -458,6 +466,7 @@ keys and request data.
 | No usable capture for a pod's hash | The pod is admitted without a restore and starts cold (under CRIU it is still prepared for a later capture) | `internal/webhook/mutate.go` |
 | A CRIU restore fails, or the restored engine dies | The pod is deleted. Its checkpoint is blocked, and the replacement starts cold, unless the capture is verified and has failures to spare (section 3); then the replacement restores from it again. A failure on a faulty GPU never blocks it ([GPU fault probe](design/GPU-FAULT-PROBE.md)). A pod no controller recreates (a bare pod, or one whose owner does not replace its pods) is kept and starts its workload cold in place instead (below) | `internal/agent/criu_auto_restore.go` `markFailed`, `disposeFailedPlaceholder`; `criu_group.go` `failedRestoreBlocks`, `recordGPUFault`; `restored_watch.go` `failRestored` |
 | The checkpoint could not be fetched | The placeholder is deleted so its replacement tries again; not blocked. A pod nothing recreates starts cold in place | `criu_auto_restore.go` (`errCheckpointUnavailable`) |
+| The node bundle version a placeholder mounts cannot be fetched | When no node has it (every peer says so, or has been down for ten minutes and does not serve it, confirmed two minutes later): the checkpoint is blocked, the restore recorded as not run, and the placeholder (an instance's placeholders) deleted; the replacement starts cold. When the fetch has no final answer for 30 minutes: the same, but the checkpoint is blocked only if no peer served the version and the capture record names it | `internal/agent/bundle_versions.go` `fetchBundle`, `bundleFetchFailed`, `restoreWithoutBundle` |
 | A group restore fails | The group's members are deleted. A restore that failed blocks the group's checkpoints and lets the next Ready instance capture anew, unless the capture is verified and has failures to spare (section 3); a restore that never ran keeps them | `criu_group.go` `failGroup`, `endGroup` (`TestFailGroup_RestoreFailureBlocksAndAllowsRecapture`, `TestFailGroup_StallKeepsCheckpointsAndDeletesEveryRank`) |
 | A capture's namespace is removed while it is being verified | Nothing can verify it. The agents' node sweep (every 10 minutes) finds a `verifying` record whose source namespace is gone or terminating and marks it `abandonedAt` with the reason; the record stays `verifying`, and the function status reports it `abandoned`. The one agent that marks it counts the `abandoned` capture outcome. Not done: the sweep runs only on an agent whose default method is CRIU (`criuIsDefault`), and is skipped in a round where the agent cannot list its node's pods; with no such agent, or until a round succeeds, the record stays `verifying` unmarked | `internal/agent/verify_abandoned.go` `resolveAbandonedVerifies`, `abandonVerify` (run by `gpushare_store_reaper.go` `reapNode`); `internal/fnstatus` `StateAbandoned` |
 | A member ends before the freeze, or a release is not taken | Every member's capture is aborted. Before gpushare's quiesce vote has passed, the instance runs on; after it, the instance's pods are deleted and their replacements start cold | `group_freeze.go` `driveGroupFreeze`; `criu_group.go` `checkpointInstance` (`stopped`), `captureGroup` |

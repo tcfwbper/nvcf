@@ -316,6 +316,12 @@ func (a *Agent) nodeInAgentPlacement(ctx context.Context, name string) (bool, er
 	if err != nil {
 		return false, err
 	}
+	return a.placesAgent(node)
+}
+
+// placesAgent reports whether node is one the agent DaemonSet runs on (its
+// placement); without one, whether the node has GPUs.
+func (a *Agent) placesAgent(node *corev1.Node) (bool, error) {
 	if a.config.Webhook.AgentPlacement == "" {
 		q, ok := node.Status.Allocatable["nvidia.com/gpu"]
 		return ok && !q.IsZero() && agentTolerates(nil, node), nil

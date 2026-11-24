@@ -105,6 +105,8 @@ func TestReason(t *testing.T) {
 		"context deadline exceeded":                                                                                     "timeout",
 		"CRIU dump failed (criu-v2): exit status 1":                                                                     "criu",
 		"the restored engine never served":                                                                              "other",
+		"bundle version unavailable: v0.2.90: no peer agent has the bundle version: n2: 404 Not Found":                  "bundle_unavailable",
+		"bundle version unavailable: v1: no peer agent has the bundle version: mptcp-worker: 404 Not Found":             "bundle_unavailable",
 		"CRIU dump failed (criu-v2): the workload exited during the capture: criu-v2 pid-namespace dump: exit status 1": "workload_exited",
 		"group checkpoint s1: 2 of 2 members failed: ns/p-0: 500 Internal Server Error: checkpoint failed: CRIU dump failed (criu-v2): " +
 			"gpushare: fabric session s1, but no process of this pod runs on the GPU under libnvsnap_gpushare.so": "no_gpu_process",

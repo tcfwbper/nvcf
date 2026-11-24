@@ -46,7 +46,36 @@ deleted:
 5. **A missing version is fetched.** A placeholder scheduled to a node without
    its version cannot start (the hostPath must exist). The node's agent sees
    it and fetches the version from a peer agent that has it (the capture's node
-   always does: its checkpoint keeps the version alive there).
+   does while it is in the cluster: its checkpoint keeps the version alive
+   there). The agent gives the restore up when it cannot get the version
+   (`internal/agent/bundle_versions.go`: `fetchBundle`, `peerDown`,
+   `agentMissingOn`, `restoreWithoutBundle`):
+   - **No node has it.** Every agent of the node's architecture is asked, a
+     down one too. Each either answers that it does not have the version, or
+     has been down for more than ten minutes (its node or its agent pod not
+     Ready) and does not serve it. This node's agent is listed, every Ready
+     node the agents run on has a listed agent, no agent is unplaced, and no
+     agent is being replaced. An agent that is terminating or on another
+     revision holds the answer back, except on a node down for more than ten
+     minutes, whose agent counts as absent when it does not serve the
+     version. When that still holds two minutes later, the agent blocks the
+     checkpoint, records the restore as not run (reason
+     `bundle_unavailable`) and deletes the placeholder, so its replacement
+     starts cold. For an instance, one rank's agent ends the group and
+     deletes all its placeholders.
+   - **No answer for 30 minutes.** Any other answer (a peer not answering for
+     now, an error, a node whose architecture cannot be read) may pass, and
+     the placeholder waits for the next try, each try bounded by the end of
+     the wait. A placeholder that has waited 30 minutes is given up the same
+     way.
+   - **When the checkpoint is blocked.** Only when the capture is at fault:
+     no peer served the version (one that served a copy this node could not
+     install shows it exists), and the capture record still names it.
+     Otherwise only the pod, or the instance's placeholders, is deleted, and
+     the replacement may restore again.
+
+   A companion, which starts without its version, is never given up this
+   way.
 6. **Unused versions are removed.** The checkpoint reaper deletes a version
    that is not current, not mounted by any pod on the node, not recorded by
    any checkpoint on the node, and older than an hour.

@@ -364,6 +364,7 @@ func (c *criuAutoRestorer) forgetPod(pod *corev1.Pod) {
 	c.companionFailures.Delete(pod.UID)
 	c.bundleWaitSince.Delete(pod.UID)
 	c.agentWaitSince.Delete(pod.UID)
+	c.forgetBundleWaits(pod.UID)
 	c.attempted.Delete("capture/" + string(pod.UID))
 	c.attempted.Delete("teardown-hold/" + string(pod.UID))
 	c.attempted.Delete("teardown/" + string(pod.UID))
