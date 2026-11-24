@@ -19,6 +19,7 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,10 @@ import (
 
 	"nvcf-cli/internal/logging"
 )
+
+// ErrInvalidStateFile reports a state file that was read but could not be
+// parsed. Callers can tell it apart from a file that could not be read.
+var ErrInvalidStateFile = errors.New("failed to parse state file")
 
 // SelfHostedAuth caches the admin token and the control-plane fingerprint the
 // token was minted for. Persisted alongside the rest of State so that re-runs
@@ -82,6 +87,13 @@ type State struct {
 	LastBaseURL   string `json:"lastBaseUrl,omitempty"`
 	LastInvokeURL string `json:"lastInvokeUrl,omitempty"`
 	LastAccount   string `json:"lastAccount,omitempty"`
+
+	// Route each saved API key was generated for: the account plus the URLs
+	// and Host overrides the key is sent to. init keeps a key only while its
+	// binding still matches the configuration.
+	APIKeyBinding            string `json:"apiKeyBinding,omitempty"`
+	NVCTAPIKeyBinding        string `json:"nvctApiKeyBinding,omitempty"`
+	EventLedgerAPIKeyBinding string `json:"eventLedgerApiKeyBinding,omitempty"`
 
 	// Self-hosted auth cache: admin token + control-plane fingerprint.
 	// nil when no self-hosted installation has been run, or when the
@@ -153,9 +165,14 @@ func (sm *StateManager) Load() error {
 		return fmt.Errorf("failed to read state file: %w", err)
 	}
 
-	if err := json.Unmarshal(data, sm.state); err != nil {
-		return fmt.Errorf("failed to parse state file: %w", err)
+	// Decode into a fresh State so fields absent from the file, such as keys
+	// another command cleared, do not survive from an earlier Load. Copy it
+	// into the existing State so callers holding GetState() see the reload.
+	var loaded State
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidStateFile, err)
 	}
+	*sm.state = loaded
 
 	return nil
 }
@@ -216,6 +233,13 @@ func (sm *StateManager) SetTokens(token, apiKey string, tokenExp, apiKeyExp time
 	sm.state.APIKeyExpiration = apiKeyExp
 }
 
+// SetAdminToken replaces only the admin token and its expiration. Saved API
+// keys, their expirations, and their bindings are left as loaded.
+func (sm *StateManager) SetAdminToken(token string, expiration time.Time) {
+	sm.state.Token = token
+	sm.state.TokenExpiration = expiration
+}
+
 // ClearTokens clears authentication tokens
 func (sm *StateManager) ClearTokens() {
 	sm.state.Token = ""
@@ -226,6 +250,9 @@ func (sm *StateManager) ClearTokens() {
 	sm.state.NVCTAPIKeyExpiration = time.Time{}
 	sm.state.EventLedgerAPIKey = ""
 	sm.state.EventLedgerAPIKeyExpiration = time.Time{}
+	sm.state.APIKeyBinding = ""
+	sm.state.NVCTAPIKeyBinding = ""
+	sm.state.EventLedgerAPIKeyBinding = ""
 }
 
 // SetConfig updates configuration settings
@@ -240,6 +267,20 @@ func (sm *StateManager) SetEndpoints(baseURL, invokeURL, account string) {
 	sm.state.LastBaseURL = baseURL
 	sm.state.LastInvokeURL = invokeURL
 	sm.state.LastAccount = account
+}
+
+// SetAPIKeyBindings records the route each saved API key was generated for.
+// An empty value leaves that key's binding unchanged.
+func (sm *StateManager) SetAPIKeyBindings(function, task, eventLedger string) {
+	if function != "" {
+		sm.state.APIKeyBinding = function
+	}
+	if task != "" {
+		sm.state.NVCTAPIKeyBinding = task
+	}
+	if eventLedger != "" {
+		sm.state.EventLedgerAPIKeyBinding = eventLedger
+	}
 }
 
 // IsTokenValid checks if the current token is still valid
@@ -298,6 +339,7 @@ func (sm *StateManager) SetNVCTAPIKey(key string, expiration time.Time) {
 func (sm *StateManager) ClearNVCTAPIKey() {
 	sm.state.NVCTAPIKey = ""
 	sm.state.NVCTAPIKeyExpiration = time.Time{}
+	sm.state.NVCTAPIKeyBinding = ""
 }
 
 // HasNVCTAPIKey reports whether an NVCT API key is stored.
@@ -315,6 +357,7 @@ func (sm *StateManager) SetEventLedgerAPIKey(key string, expiration time.Time) {
 func (sm *StateManager) ClearEventLedgerAPIKey() {
 	sm.state.EventLedgerAPIKey = ""
 	sm.state.EventLedgerAPIKeyExpiration = time.Time{}
+	sm.state.EventLedgerAPIKeyBinding = ""
 }
 
 // PrintStatus prints the current state in a human-readable format

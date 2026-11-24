@@ -51,7 +51,7 @@ Full subcommand list. Always pair with [flags.md](flags.md) for global flags and
 
 ## Tasks
 
-Task commands require `NVCF_API_KEY` set to a task-scoped key and `NVCF_BASE_NVCT_URL` set to the NVCT gateway endpoint. In a fresh session, read `nvctApiKey` from `~/.nvcf-cli.state` and inject it as `NVCF_API_KEY` without logging the value; check `nvctApiKeyExpiration` first and regenerate with `api-key generate --for task --validate` if expired. Run `api-key generate --for task` after `init` to mint a new key.
+Task commands require a task key and the NVCT gateway endpoint, set as `base_nvct_url` in the CLI config or `NVCF_BASE_NVCT_URL`. The CLI reads the task key from `NVCF_NVCT_API_KEY`, or from `nvctApiKey` in the CLI state that `api-key generate` writes. It never uses `NVCF_API_KEY` or the admin token for task commands. If no task key is set, or the saved key has expired, task commands stop with "no valid task API key configured". Check `nvctApiKeyExpiration` in the state and regenerate with `api-key generate --for task --validate` if it is missing or expired. `NVCF_NVCT_API_KEY` takes precedence over the saved key and is sent without an expiration check, so an invalid or expired value fails with an authentication error from the server. Unset or replace it after regenerating.
 
 | Command | Purpose | Notes |
 |---|---|---|
@@ -92,7 +92,7 @@ Attach an endpoint with `--logs-telemetry-id`, `--metrics-telemetry-id`, or `--t
 
 | Command | Purpose | Notes |
 |---|---|---|
-| `init` | Mint admin token from API Keys via public api gateway | Idempotent; writes `~/.nvcf-cli.state`; clears saved function state and all API keys (function and task) |
+| `init` | Mint admin token from API Keys via public api gateway | Idempotent; writes `~/.nvcf-cli.state`; clears saved function state; keeps each saved API key whose account, URL, and Host override are unchanged since `api-key generate`, and drops the others. Keys saved by a release that did not record these values are dropped once; run `api-key generate` again |
 | `status` | Show CLI state (token, last endpoints, function context) | Distinct from `self-hosted status` |
 | `api-key generate [--for function\|task\|event-ledger] [--description=…] [--expires-in=…]` | Mint API keys | Default (no `--for`): generates a function key, a task key and an Event Ledger key; `--for function`, `--for task` or `--for event-ledger` generates one only; `--scopes` requires `--for` |
 | `api-key generate --validate` | Mint and immediately validate each generated key | Validates each key against its correct audience (NVCF for function keys, NVCT for task keys) |

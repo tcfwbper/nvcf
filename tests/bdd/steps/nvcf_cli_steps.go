@@ -44,6 +44,7 @@ const vanityRouteNotFoundError = "Error: failed to invoke function: API error 40
 
 func registerNVCFCLISteps(ctx *godog.ScenarioContext, sc *ScenarioContext) {
 	ctx.Step(`^I use NVCF CLI config "([^"]*)"$`, sc.iUseNVCFCLIConfig)
+	ctx.Step(`^I successfully initialize the NVCF CLI$`, sc.iSuccessfullyInitializeNVCFCLI)
 	ctx.Step(`^I successfully create function "([^"]*)" from image "([^"]*)" with CLI options:$`, sc.iSuccessfullyCreateFunction)
 	ctx.Step(`^I successfully create function "([^"]*)" from Helm chart "([^"]*)" with CLI options:$`, sc.iSuccessfullyCreateHelmFunction)
 	ctx.Step(`^I successfully deploy the function selected by NVCF CLI with options:$`, sc.iSuccessfullyDeploySelectedFunction)
@@ -104,6 +105,13 @@ func (sc *ScenarioContext) iSuccessfullyGenerateEventLedgerAPIKey(ctx context.Co
 
 func (sc *ScenarioContext) iSuccessfullyGenerateTaskAPIKey(ctx context.Context, table *godog.Table) error {
 	return sc.generateAPIKey(ctx, "task", table)
+}
+
+// iSuccessfullyInitializeNVCFCLI runs init for the selected config. init prints
+// the admin token, so stdout is dropped to keep it out of the command logs; the
+// CLI saves the token in its own state.
+func (sc *ScenarioContext) iSuccessfullyInitializeNVCFCLI(ctx context.Context) error {
+	return sc.runNVCFCLISuppressingStdout(ctx, "init")
 }
 
 // generateAPIKey runs api-key generate for one service. The CLI prints the key,

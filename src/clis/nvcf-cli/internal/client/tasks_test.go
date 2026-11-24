@@ -20,6 +20,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -37,8 +38,8 @@ func newNVCTTestClient(srv *httptest.Server) *Client {
 			BaseHTTPURL: "http://nvcf.invalid",
 			BaseNVCTURL: srv.URL,
 		},
-		httpClient: srv.Client(),
-		baseURL:    "http://nvcf.invalid",
+		nvctHTTPClient: srv.Client(),
+		baseURL:        "http://nvcf.invalid",
 	}
 }
 
@@ -113,12 +114,14 @@ func TestMakeNVCTRequestUsesNVCTClient(t *testing.T) {
 	}
 }
 
-func TestMakeNVCTRequestFallsBackToDefaultClient(t *testing.T) {
-	var gotAuth string
+// TestMakeNVCTRequestRequiresTaskAPIKey verifies that a task request without a
+// task key fails before sending anything, instead of falling back to the
+// function client and its credentials.
+func TestMakeNVCTRequestRequiresTaskAPIKey(t *testing.T) {
+	called := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
+		called = true
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"tasks":[]}`))
 	}))
 	defer srv.Close()
 
@@ -127,9 +130,12 @@ func TestMakeNVCTRequestFallsBackToDefaultClient(t *testing.T) {
 		httpClient: &http.Client{Transport: &BearerTokenTransport{Token: "nvcf-token"}},
 		// nvctHTTPClient is nil
 	}
-	_, _ = c.makeNVCTRequest(context.Background(), "GET", "/v1/nvct/tasks", nil)
-	if gotAuth != "Bearer nvcf-token" {
-		t.Errorf("expected nvcf-token fallback in Authorization header, got %q", gotAuth)
+	_, err := c.makeNVCTRequest(context.Background(), "GET", "/v1/nvct/tasks", nil)
+	if !errors.Is(err, errNoTaskAPIKey) {
+		t.Fatalf("expected errNoTaskAPIKey, got %v", err)
+	}
+	if called {
+		t.Error("task endpoint received a request without a task API key")
 	}
 }
 
@@ -145,8 +151,8 @@ func TestMakeNVCTRequestSetsHostHeaderOverride(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{
-		config:     &Config{BaseNVCTURL: srv.URL, NVCTHost: "tasks.example.com"},
-		httpClient: srv.Client(),
+		config:         &Config{BaseNVCTURL: srv.URL, NVCTHost: "tasks.example.com"},
+		nvctHTTPClient: srv.Client(),
 	}
 	_, _ = c.makeNVCTRequest(context.Background(), "GET", "/v1/nvct/tasks", nil)
 	if gotHost != "tasks.example.com" {
@@ -166,8 +172,8 @@ func TestMakeNVCTRequestNoHostOverride(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{
-		config:     &Config{BaseNVCTURL: srv.URL},
-		httpClient: srv.Client(),
+		config:         &Config{BaseNVCTURL: srv.URL},
+		nvctHTTPClient: srv.Client(),
 	}
 	_, _ = c.makeNVCTRequest(context.Background(), "GET", "/v1/nvct/tasks", nil)
 	if wantHost := strings.TrimPrefix(srv.URL, "http://"); gotHost != wantHost {
@@ -179,7 +185,7 @@ func TestCreateTaskValidation(t *testing.T) {
 	c := newNVCTTestClient(httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("server should not be invoked when validation fails: %s %s", r.Method, r.URL.Path)
 	})))
-	defer c.httpClient.CloseIdleConnections()
+	defer c.nvctHTTPClient.CloseIdleConnections()
 
 	cases := []struct {
 		name string

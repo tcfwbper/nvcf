@@ -122,6 +122,7 @@ go_test(
         "function_invoke_test.go",
         "function_llm_model_test.go",
         "function_request_priority_test.go",
+        "init_test.go",
         "main_test.go",
         "registry_test.go",
         "root_test.go",

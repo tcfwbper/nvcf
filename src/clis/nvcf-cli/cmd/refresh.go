@@ -86,8 +86,13 @@ func runRefresh(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to extract admin token from API response")
 	}
 
-	// Update only the token, preserve function state
-	sm.SetTokens(token, currentState.APIKey, expiration, currentState.APIKeyExpiration)
+	// Re-read state after the token request so a change another command made
+	// meanwhile, such as api-key clear, is not overwritten. Then update only
+	// the admin token and preserve everything else.
+	if err := sm.Load(); err != nil {
+		return fmt.Errorf("failed to reload state before saving the admin token: %w", err)
+	}
+	sm.SetAdminToken(token, expiration)
 	sm.SetConfig("", config.KubeconfigPath, config.ClusterMode)
 
 	// Set endpoints - use cluster account if available, otherwise default

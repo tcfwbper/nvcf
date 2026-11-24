@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -235,12 +236,16 @@ type PaginationOptions struct {
 // NVCT request helper
 // ============================================================================
 
-// makeNVCTRequest sends an authenticated request to the NVCT base URL using the
-// shared HTTP client (which already injects the bearer token).
+// makeNVCTRequest sends a request to the NVCT base URL authenticated with the
+// task API key only. It never falls back to the function client, which would
+// send the function API key or the admin token to base_nvct_url.
 func (c *Client) makeNVCTRequest(ctx context.Context, method, endpoint string, body interface{}) (*http.Response, error) {
 	base := c.config.BaseNVCTURL
 	if base == "" {
 		return nil, fmt.Errorf("NVCT base URL is not configured (set base_nvct_url in config or NVCF_BASE_NVCT_URL)")
+	}
+	if c.nvctHTTPClient == nil {
+		return nil, errNoTaskAPIKey
 	}
 
 	var reqBody io.Reader
@@ -270,12 +275,10 @@ func (c *Client) makeNVCTRequest(ctx context.Context, method, endpoint string, b
 		req.Host = c.config.NVCTHost
 	}
 
-	httpClient := c.httpClient
-	if c.nvctHTTPClient != nil {
-		httpClient = c.nvctHTTPClient
-	}
-	return httpClient.Do(req)
+	return c.nvctHTTPClient.Do(req)
 }
+
+var errNoTaskAPIKey = errors.New("no valid task API key configured, run 'nvcf-cli api-key generate --for task' or set NVCF_NVCT_API_KEY")
 
 func decodeNVCT[T any](resp *http.Response) (*T, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

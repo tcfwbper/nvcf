@@ -246,3 +246,34 @@ func TestEventLedgerAPIKey_SetAndClearTokens(t *testing.T) {
 	assert.Empty(t, sm.GetState().EventLedgerAPIKey)
 	assert.True(t, sm.GetState().EventLedgerAPIKeyExpiration.IsZero())
 }
+
+// Load must replace fields that the file no longer has, such as a key another
+// command cleared, and must update the State that callers already hold.
+func TestLoad_ReplacesContentsInPlace(t *testing.T) {
+	sm := newTestStateManager(t)
+	sm.SetTokens("admin", "function-key", time.Time{}, time.Time{})
+	sm.SetAPIKeyBindings("function-binding", "", "")
+	held := sm.GetState()
+
+	other := &StateManager{statePath: sm.statePath, state: &State{}}
+	other.SetTokens("admin-2", "", time.Time{}, time.Time{})
+	require.NoError(t, other.Save())
+
+	require.NoError(t, sm.Load())
+
+	assert.Same(t, held, sm.GetState(), "Load must keep the State pointer callers hold")
+	assert.Equal(t, "admin-2", held.Token)
+	assert.Empty(t, held.APIKey, "a key absent from the file must not survive Load")
+	assert.Empty(t, held.APIKeyBinding)
+}
+
+// A file that fails to parse leaves the loaded State unchanged.
+func TestLoad_KeepsStateWhenFileIsInvalid(t *testing.T) {
+	sm := newTestStateManager(t)
+	sm.SetTokens("admin", "function-key", time.Time{}, time.Time{})
+	require.NoError(t, os.WriteFile(sm.statePath, []byte("{not json"), 0o600))
+
+	require.Error(t, sm.Load())
+
+	assert.Equal(t, "function-key", sm.GetState().APIKey)
+}

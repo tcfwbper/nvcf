@@ -342,6 +342,38 @@ func TestVanityGatewayInvocationDoesNotRetryOtherErrors(t *testing.T) {
 	}
 }
 
+func TestNVCFCLIInitSuppressesAdminTokenStdout(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	t.Setenv("NVCF_CLI", "nvcf-cli")
+	sc.NVCFCLIConfig = "config.yaml"
+	fake.result = harness.Result{ExitCode: 0}
+
+	if err := sc.iSuccessfullyInitializeNVCFCLI(context.Background()); err != nil {
+		t.Fatalf("initialize NVCF CLI: %v", err)
+	}
+	if len(fake.runs) != 1 {
+		t.Fatalf("runs = %+v, want one command", fake.runs)
+	}
+	command := fake.runs[0].command
+	for _, expected := range []string{"/bin/sh -c", `exec "$@" >/dev/null`, "nvcf-cli --config config.yaml init"} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("command = %q, want %q", command, expected)
+		}
+	}
+}
+
+func TestNVCFCLIInitFailsOnNonZeroExit(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	t.Setenv("NVCF_CLI", "nvcf-cli")
+	sc.NVCFCLIConfig = "config.yaml"
+	fake.result = harness.Result{ExitCode: 1}
+
+	err := sc.iSuccessfullyInitializeNVCFCLI(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exit code = 1, want 0") {
+		t.Fatalf("error = %v, want exit-zero assertion failure", err)
+	}
+}
+
 func TestFunctionAPIKeyGenerationSuppressesSecretBearingStdout(t *testing.T) {
 	sc, fake := newScenarioContext(t)
 	t.Setenv("NVCF_CLI", "nvcf-cli")

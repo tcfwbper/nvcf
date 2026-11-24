@@ -158,6 +158,31 @@ func init() {
 	apikeyClearAllCmd.Flags().BoolVar(&clearForce, "force", false, "Skip confirmation prompt")
 }
 
+// A saved API key is bound to the account and to the route it is sent to:
+// the URLs and Host overrides its client uses. init keeps a key only while
+// that binding still matches, so a key is never sent to another deployment.
+func functionKeyBinding(c *client.Config) string {
+	return keyBinding(c.ClientID, c.BaseHTTPURL, c.APIHost, c.BaseInvokeURL, c.InvokeHost, c.BaseGRPCURL)
+}
+
+func taskKeyBinding(c *client.Config) string {
+	return keyBinding(c.ClientID, c.BaseNVCTURL, c.NVCTHost)
+}
+
+func eventLedgerKeyBinding(c *client.Config) string {
+	return keyBinding(c.ClientID, resolveEventLedgerURL(c.BaseHTTPURL), viper.GetString("event_ledger_host"))
+}
+
+// keyBinding ignores trailing slashes: the clients trim them before building
+// request URLs, so they do not change where a key is sent.
+func keyBinding(parts ...string) string {
+	trimmed := make([]string, len(parts))
+	for i, p := range parts {
+		trimmed[i] = strings.TrimRight(p, "/")
+	}
+	return strings.Join(trimmed, "|")
+}
+
 func runAPIKeyGenerate(cmd *cobra.Command, args []string) error {
 	// Load state
 	if err := LoadStateForCurrentCommand(); err != nil {
@@ -221,6 +246,7 @@ func runAPIKeyGenerate(cmd *cobra.Command, args []string) error {
 		}
 		currentState := sm.GetState()
 		sm.SetTokens(currentState.Token, functionKey, currentState.TokenExpiration, expirationTime)
+		sm.SetAPIKeyBindings(functionKeyBinding(config), "", "")
 		generated = append(generated, generatedKey{Service: "function", Key: functionKey, Scopes: effectiveScopes})
 		// Persist immediately so a later task-key failure cannot discard an
 		// already-minted function key.
@@ -249,6 +275,7 @@ func runAPIKeyGenerate(cmd *cobra.Command, args []string) error {
 			effectiveScopes = apikeys.DefaultNVCTScopes()
 		}
 		sm.SetNVCTAPIKey(taskKey, expirationTime)
+		sm.SetAPIKeyBindings("", taskKeyBinding(config), "")
 		generated = append(generated, generatedKey{Service: "task", Key: taskKey, Scopes: effectiveScopes})
 		if err := SaveStateForCurrentCommand(); err != nil {
 			logging.Warning("Failed to save task API key to state: %v", err)
@@ -275,6 +302,7 @@ func runAPIKeyGenerate(cmd *cobra.Command, args []string) error {
 			effectiveScopes = apikeys.DefaultEventLedgerScopes()
 		}
 		sm.SetEventLedgerAPIKey(eventLedgerKey, expirationTime)
+		sm.SetAPIKeyBindings("", "", eventLedgerKeyBinding(config))
 		generated = append(generated, generatedKey{Service: "event-ledger", Key: eventLedgerKey, Scopes: effectiveScopes})
 		if err := SaveStateForCurrentCommand(); err != nil {
 			logging.Warning("Failed to save Event Ledger API key to state: %v", err)
@@ -904,6 +932,7 @@ func hasSavedAPIKeys(s *state.State) bool {
 // and keeps the admin token.
 func clearSavedAPIKeys(s *state.State) {
 	SetCurrentTokens(s.Token, "", s.TokenExpiration, time.Time{})
+	s.APIKeyBinding = ""
 	sm := GetStateManagerForCurrentCommand()
 	sm.ClearNVCTAPIKey()
 	sm.ClearEventLedgerAPIKey()
