@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -153,8 +154,27 @@ func (a *Agent) groveInstanceCount(ctx context.Context, ns string, pods []corev1
 // share their companions. "" for a pod of no scaling group, or the only
 // instance of its namespace. err when that cannot be read yet: callers
 // that can try again later do; admission fails closed.
+//
+// A Dynamo rank of no scaling group (a single-node prefill or decode
+// worker, say) fails closed too: any other Dynamo GPU worker of another
+// controller in pods shares the namespace's etcd, NATS and frontend with
+// it, whatever labels Grove gave them. With no pods given (a check again
+// just before a hold, or before a restore) the namespace's pods are listed
+// now, so a worker that started since an earlier list is seen.
 func (a *Agent) sharedCompanionsReason(ctx context.Context, pod *corev1.Pod, pods []corev1.Pod) (string, error) {
 	if groveInstance(pod) == "" {
+		if webhook.DynamoComponent(pod) {
+			if pods == nil {
+				list, err := a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return "", fmt.Errorf("list the namespace's pods: %w", err)
+				}
+				pods = list.Items
+			}
+			if other := otherDynamoWorker(pod, pods); other != "" {
+				return fmt.Sprintf("the namespace also runs Dynamo worker %s of another instance, which shares the companions (etcd, NATS, frontend); a group capture or restore of one would stop or restore what the other uses", other), nil
+			}
+		}
 		return "", nil
 	}
 	n, err := a.groveInstanceCount(ctx, pod.Namespace, pods, pod)
@@ -322,4 +342,35 @@ func deleteCompanionUnlessClaimed(ctx context.Context, kc kubernetes.Interface, 
 		rv = cur.ResourceVersion
 	}
 	return err
+}
+
+// otherDynamoWorker names a Dynamo GPU worker in pods, not being deleted,
+// of another instance than pod's (sameInstance): it shares the
+// namespace's companions. "" when there is none.
+func otherDynamoWorker(pod *corev1.Pod, pods []corev1.Pod) string {
+	// An instance of one pod (a replica of a Deployment, whose replicas
+	// share their controller) has no other ranks.
+	_, size, ranked := podRank(pod, modelvolume.CacheOrdinalAnnotation, modelvolume.CacheGroupSizeAnnotation)
+	alone := ranked && size == 1
+	for i := range pods {
+		p := &pods[i]
+		if p.UID == pod.UID || p.DeletionTimestamp != nil || !webhook.DynamoComponent(p) || !requestsGPU(p) {
+			continue
+		}
+		if !alone && sameInstance(pod, p) {
+			continue // a rank of its own instance (LeaderWorkerSet group, controller)
+		}
+		return p.Name
+	}
+	return ""
+}
+
+// requestsGPU reports whether any of p's containers asks for a GPU.
+func requestsGPU(p *corev1.Pod) bool {
+	for i := range p.Spec.Containers {
+		if gpuRequestCount(&p.Spec.Containers[i]) > 0 {
+			return true
+		}
+	}
+	return false
 }

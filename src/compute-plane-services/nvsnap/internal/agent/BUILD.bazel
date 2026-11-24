@@ -286,6 +286,7 @@ go_test(
         "rootfs_wholerootfs_guard_test.go",
         "rootfsonly_integration_test.go",
         "session_owner_test.go",
+        "shared_companions_guard_test.go",
         "suspend_outcome_test.go",
         "tail_of_file_test.go",
         "tar_extract_test.go",
