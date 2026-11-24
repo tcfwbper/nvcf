@@ -22,6 +22,7 @@ import groupBy from "lodash-es/groupBy";
 import { BoxesIcon } from "lucide-react";
 import { StatPanelBoundary } from "~/components/StatPanel/StatPanelBoundary";
 import { getStatusLabel } from "~/features/clusters/components/StatusBadge";
+import { clusterIssueStatuses } from "~/features/clusters/constants";
 import { useGetClustersSuspense } from "~/generated/api/clusters/clusters";
 import type { GetClusterResponse } from "~/generated/model/getClusterResponse";
 import { GetClusterResponseStatus } from "~/generated/model/getClusterResponseStatus";
@@ -31,7 +32,7 @@ const clustersSelect = (clusters: GetClusterResponse[]) => {
 	const grouped = groupBy(clusters, (c) => {
 		if (c.status === GetClusterResponseStatus.READY)
 			return GetClusterResponseStatus.READY;
-		if (c.status === GetClusterResponseStatus.UNHEALTHY)
+		if (clusterIssueStatuses.some((s) => s === c.status))
 			return GetClusterResponseStatus.UNHEALTHY;
 		return GetClusterResponseStatus.NOT_READY;
 	});
@@ -90,12 +91,7 @@ function ClusterStatsPanelContent({ ncaId }: { ncaId: string }) {
 					<Anchor asChild>
 						<Link
 							search={{
-								filters: [
-									{
-										id: "status",
-										value: [getStatusLabel(GetClusterResponseStatus.UNHEALTHY)],
-									},
-								],
+								filters: [{ id: "status", value: { group: "issues" } }],
 							}}
 							to="/clusters"
 							viewTransition
@@ -117,7 +113,6 @@ function ClusterStatsPanelContent({ ncaId }: { ncaId: string }) {
 										value: [
 											getStatusLabel(GetClusterResponseStatus.NOT_READY),
 											getStatusLabel(GetClusterResponseStatus.CORDON),
-											getStatusLabel(GetClusterResponseStatus.CORDON_AND_DRAIN),
 										],
 									},
 								],

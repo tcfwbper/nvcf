@@ -17,4 +17,17 @@
 
 import { GetClusterResponseStatus } from "~/generated/model/getClusterResponseStatus";
 
-export const clusterStatuses = Object.values(GetClusterResponseStatus);
+/** Statuses SIS and ICMS emit. `PAUSED`, `DELETED`, and `FAILED` are in the spec but never sent. */
+export const clusterStatuses = [
+	GetClusterResponseStatus.READY,
+	GetClusterResponseStatus.CORDON,
+	GetClusterResponseStatus.CORDON_AND_DRAIN,
+	GetClusterResponseStatus.NOT_READY,
+	GetClusterResponseStatus.UNHEALTHY,
+	GetClusterResponseStatus.ABANDONED,
+];
+
+export const clusterIssueStatuses = [
+	GetClusterResponseStatus.UNHEALTHY,
+	GetClusterResponseStatus.ABANDONED,
+];

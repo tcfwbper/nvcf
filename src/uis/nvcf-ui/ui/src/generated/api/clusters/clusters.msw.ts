@@ -136,20 +136,15 @@ export const getGetClustersResponseMock = (): GetClusterResponse[] =>
 		nvcaVersion: (() => `3.0.${faker.number.int({ min: 0, max: 5 })}`)(),
 		clusterId: (() => faker.string.uuid())(),
 		clusterGroupId: (() => faker.string.uuid())(),
-		status: faker.helpers.arrayElement([
+		status: (() =>
 			faker.helpers.arrayElement([
 				"READY",
-				"PAUSED",
-				"FAILED",
-				"ABANDONED",
-				"NOT_READY",
-				"UNHEALTHY",
-				"DELETED",
 				"CORDON",
 				"CORDON_AND_DRAIN",
-			] as const),
-			undefined,
-		]),
+				"NOT_READY",
+				"UNHEALTHY",
+				"ABANDONED",
+			]))(),
 		clusterSource: faker.helpers.arrayElement([
 			faker.string.alpha({ length: { min: 10, max: 20 } }),
 			undefined,
@@ -354,20 +349,15 @@ export const getGetClusterForNcaIdAndClusterIdResponseMock = (
 	nvcaVersion: (() => `3.0.${faker.number.int({ min: 0, max: 5 })}`)(),
 	clusterId: (() => faker.string.uuid())(),
 	clusterGroupId: (() => faker.string.uuid())(),
-	status: faker.helpers.arrayElement([
+	status: (() =>
 		faker.helpers.arrayElement([
 			"READY",
-			"PAUSED",
-			"FAILED",
-			"ABANDONED",
-			"NOT_READY",
-			"UNHEALTHY",
-			"DELETED",
 			"CORDON",
 			"CORDON_AND_DRAIN",
-		] as const),
-		undefined,
-	]),
+			"NOT_READY",
+			"UNHEALTHY",
+			"ABANDONED",
+		]))(),
 	clusterSource: faker.helpers.arrayElement([
 		faker.string.alpha({ length: { min: 10, max: 20 } }),
 		undefined,

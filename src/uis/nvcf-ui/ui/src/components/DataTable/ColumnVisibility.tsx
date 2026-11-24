@@ -40,7 +40,7 @@ export function ColumnVisibility() {
 	}));
 
 	return (
-		<Dropdown items={items}>
+		<Dropdown items={items} size="small">
 			<Columns3 size="1em" />
 			Columns
 		</Dropdown>

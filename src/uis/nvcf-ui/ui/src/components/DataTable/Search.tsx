@@ -24,11 +24,13 @@ import { useDataTable } from "./DataTableContext";
 interface SearchProps {
 	placeholder?: string;
 	debounceMs?: number;
+	className?: string;
 }
 
 export function Search({
 	placeholder = "Search...",
 	debounceMs = 300,
+	className,
 }: SearchProps) {
 	const table = useDataTable("Search");
 	const [value, setValue] = useState(
@@ -44,6 +46,7 @@ export function Search({
 
 	return (
 		<TextInput
+			className={className}
 			dismissible={value.length > 0}
 			onDismiss={() => {
 				setValue("");

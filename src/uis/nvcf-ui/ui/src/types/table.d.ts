@@ -15,12 +15,14 @@
  * limitations under the License.
  */
 
-import "@tanstack/react-table";
+import type { FilterFn, RowData } from "@tanstack/react-table";
+import type { ColumnGroup } from "~/components/DataTable/utils/groups";
 
 declare module "@tanstack/react-table" {
 	interface ColumnMeta<TData extends RowData, TValue> {
 		filterVariant?: "single-select" | "multi-select";
 		filterOptions?: { label: string; value: string }[];
+		groups?: ColumnGroup[];
 		sortType?: "text" | "date" | "number";
 		sortLabels?: { asc: string; desc: string };
 	}

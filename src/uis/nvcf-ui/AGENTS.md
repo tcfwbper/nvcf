@@ -46,6 +46,7 @@ Run `task verify` before finishing. CI runs the equivalent Bazel targets.
 | `add-feature` | New pages and features, where code goes, the completion checklist |
 | `routing` | Route files, loaders, search and path params, navigation, official TanStack skills |
 | `testing` | Vitest, Testing Library, MSW, and how to render pages and components |
+| `datatable` | List tables: columns, toolbars, filter dropdowns, group pills, URL state |
 | `codegen` | OpenAPI specs, `task generate`, MSW scenarios |
 | `run` | Starting the dev server |
 | `kaizen-ui` | KUI components, layout, and styling |

@@ -16,6 +16,7 @@
  */
 
 import type { FilterFn, RowData } from "@tanstack/react-table";
+import { castArray } from "lodash-es";
 
 const includesValue: FilterFn<RowData> = (
 	row,
@@ -41,7 +42,13 @@ const includesValue: FilterFn<RowData> = (
 includesValue.autoRemove = (val) =>
 	val === undefined || val === null || val === "";
 
+/** True when the cell, or any element of an array cell, is in `selected`. Compares as strings. */
+export function matchesSelection(cellValue: unknown, selected: unknown[]) {
+	return castArray(cellValue).some((v) => selected.includes(String(v)));
+}
+
 const multiSelect: FilterFn<RowData> = (row, columnId, filterValue) =>
-	Array.isArray(filterValue) && filterValue.includes(row.getValue(columnId));
+	Array.isArray(filterValue) &&
+	matchesSelection(row.getValue(columnId), filterValue);
 
 export const filterFns = { includesValue, multiSelect };

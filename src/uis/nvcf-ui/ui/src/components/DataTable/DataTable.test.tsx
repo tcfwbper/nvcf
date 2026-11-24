@@ -94,6 +94,9 @@ const columns: ColumnDef<TestRow, unknown>[] = [
 	},
 ];
 
+const columnIds = ["name", "status", "region", "invocations", "createdAt"];
+const columnLabels = ["Name", "Status", "Region", "Invocations", "Created"];
+
 function columnCells(headerName: string) {
 	const table = within(screen.getByRole("table"));
 	const headers = table.getAllByRole("columnheader");
@@ -113,7 +116,7 @@ function renderTable(data: TestRow[] = defaultData) {
 				<DataTable.Search />
 				<DataTable.ItemCount label="item" />
 				<DataTable.Sort />
-				<DataTable.Filters />
+				<DataTable.FilterMenu />
 				<DataTable.ColumnVisibility />
 			</DataTable.Toolbar>
 			<DataTable.ActiveFilters />
@@ -180,6 +183,65 @@ describe("DataTable", () => {
 			expect(screen.getByRole("list")).toBeInTheDocument();
 			expect(screen.getAllByRole("listitem")).toHaveLength(3);
 		});
+
+		it("shows the no-columns state and restores every column", async () => {
+			const user = userEvent.setup();
+			renderTable();
+
+			for (const label of columnLabels) {
+				await user.click(screen.getByRole("menuitemcheckbox", { name: label }));
+			}
+
+			await waitFor(() => {
+				expect(screen.getByText("No columns selected")).toBeInTheDocument();
+			});
+			expect(screen.queryByRole("table")).not.toBeInTheDocument();
+
+			await user.click(
+				screen.getByRole("button", { name: /Show all columns/ }),
+			);
+
+			await waitFor(() => {
+				expect(screen.getByRole("table")).toBeInTheDocument();
+			});
+			for (const label of columnLabels) {
+				expect(
+					screen.getByRole("columnheader", { name: new RegExp(label) }),
+				).toBeInTheDocument();
+			}
+			expect(
+				screen.getByRole("cell", { name: "llm-gateway" }),
+			).toBeInTheDocument();
+		});
+
+		it("keeps renderContent output when every column is hidden", () => {
+			render(
+				<DataTable
+					columns={columns}
+					data={defaultData}
+					reactTableOptions={{
+						state: {
+							columnVisibility: Object.fromEntries(
+								columnIds.map((id) => [id, false]),
+							),
+						},
+					}}
+				>
+					<DataTable.Content<TestRow>
+						renderContent={({ rows }) => (
+							<ul>
+								{rows.map((row) => (
+									<li key={row.id}>{row.original.name}</li>
+								))}
+							</ul>
+						)}
+					/>
+				</DataTable>,
+			);
+
+			expect(screen.getAllByRole("listitem")).toHaveLength(3);
+			expect(screen.queryByText("No columns selected")).not.toBeInTheDocument();
+		});
 	});
 
 	describe("Search", () => {
@@ -198,7 +260,7 @@ describe("DataTable", () => {
 				expect(
 					screen.queryByRole("cell", { name: "speech-to-text" }),
 				).not.toBeInTheDocument();
-				expect(screen.getByText("1 item")).toBeInTheDocument();
+				expect(screen.getByText("1 of 3 items")).toBeInTheDocument();
 			});
 
 			await user.clear(screen.getByRole("textbox"));
@@ -290,7 +352,7 @@ describe("DataTable", () => {
 			renderTable();
 
 			await user.click(
-				screen.getByRole("menuitemcheckbox", { name: "Active" }),
+				screen.getByRole("menuitemcheckbox", { name: /^Active/ }),
 			);
 			await waitFor(() => {
 				expect(
@@ -302,11 +364,11 @@ describe("DataTable", () => {
 				expect(
 					screen.queryByRole("cell", { name: "image-gen" }),
 				).not.toBeInTheDocument();
-				expect(screen.getByText("2 items")).toBeInTheDocument();
+				expect(screen.getByText("2 of 3 items")).toBeInTheDocument();
 			});
 
 			await user.click(
-				screen.getAllByRole("menuitemcheckbox", { name: "Inactive" })[1],
+				screen.getByRole("menuitemcheckbox", { name: /^Inactive/ }),
 			);
 			await waitFor(() => {
 				expect(
@@ -326,7 +388,7 @@ describe("DataTable", () => {
 			const user = userEvent.setup();
 			renderTable();
 
-			await user.click(screen.getByRole("menuitemradio", { name: "US East" }));
+			await user.click(screen.getByRole("menuitemradio", { name: /^US East/ }));
 			await waitFor(() => {
 				expect(
 					screen.getByRole("cell", { name: "llm-gateway" }),
@@ -337,12 +399,10 @@ describe("DataTable", () => {
 				expect(
 					screen.queryByRole("cell", { name: "image-gen" }),
 				).not.toBeInTheDocument();
-				expect(screen.getByText("2 items")).toBeInTheDocument();
+				expect(screen.getByText("2 of 3 items")).toBeInTheDocument();
 			});
 
-			await user.click(
-				screen.getAllByRole("menuitemradio", { name: "US West" })[1],
-			);
+			await user.click(screen.getByRole("menuitemradio", { name: /^US West/ }));
 			await waitFor(() => {
 				expect(
 					screen.queryByRole("cell", { name: "llm-gateway" }),
@@ -353,7 +413,7 @@ describe("DataTable", () => {
 				expect(
 					screen.queryByRole("cell", { name: "speech-to-text" }),
 				).not.toBeInTheDocument();
-				expect(screen.getByText("1 item")).toBeInTheDocument();
+				expect(screen.getByText("1 of 3 items")).toBeInTheDocument();
 			});
 		});
 	});
@@ -396,10 +456,10 @@ describe("DataTable", () => {
 			renderTable();
 
 			await user.click(
-				screen.getByRole("menuitemcheckbox", { name: "Active" }),
+				screen.getByRole("menuitemcheckbox", { name: /^Active/ }),
 			);
 			await user.click(
-				screen.getAllByRole("menuitemcheckbox", { name: "Inactive" })[0],
+				screen.getByRole("menuitemcheckbox", { name: /^Inactive/ }),
 			);
 			await waitFor(() => {
 				expect(
@@ -409,7 +469,7 @@ describe("DataTable", () => {
 				).toBeInTheDocument();
 			});
 
-			await user.click(screen.getByRole("button", { name: "Clear Filters" }));
+			await user.click(screen.getByRole("button", { name: "Clear filters" }));
 			await waitFor(() => {
 				expect(
 					screen.queryByText(

@@ -20,12 +20,18 @@ import { GetClusterResponseStatus } from "~/generated/model/getClusterResponseSt
 import { getStatusLabel } from "./StatusBadge";
 
 describe("getStatusLabel", () => {
-	it("surfaces UNHEALTHY as the friendlier 'Error' label", () => {
-		// Non-obvious mapping: the status enum is UNHEALTHY but users see "Error".
-		expect(getStatusLabel(GetClusterResponseStatus.UNHEALTHY)).toBe("Error");
+	it.each([
+		[GetClusterResponseStatus.READY, "Ready"],
+		[GetClusterResponseStatus.CORDON, "Maintenance"],
+		[GetClusterResponseStatus.CORDON_AND_DRAIN, "Maintenance"],
+		[GetClusterResponseStatus.NOT_READY, "Pending"],
+		[GetClusterResponseStatus.UNHEALTHY, "No Contact"],
+		[GetClusterResponseStatus.ABANDONED, "Unavailable"],
+	])("labels %s as %s", (status, label) => {
+		expect(getStatusLabel(status)).toBe(label);
 	});
 
 	it("falls back to a title-cased status when there is no override", () => {
-		expect(getStatusLabel(GetClusterResponseStatus.READY)).toBe("Ready");
+		expect(getStatusLabel(GetClusterResponseStatus.PAUSED)).toBe("Paused");
 	});
 });

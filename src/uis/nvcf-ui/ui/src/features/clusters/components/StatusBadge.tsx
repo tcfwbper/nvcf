@@ -17,12 +17,15 @@
 
 import { Badge, type BadgeProps } from "@nvidia/foundations-react-core";
 import {
+	ChevronsDown,
+	ChevronsUp,
 	CircleCheck,
+	CircleDashed,
 	CircleMinus,
 	CirclePause,
 	CircleX,
+	OctagonX,
 	Trash2,
-	Wrench,
 } from "lucide-react";
 import type { ComponentType } from "react";
 import type { GetClusterResponse } from "~/generated/model/getClusterResponse";
@@ -40,21 +43,35 @@ const statusConfig: Record<
 	StatusConfig
 > = {
 	[GetClusterResponseStatus.READY]: { color: "green", icon: CircleCheck },
+	[GetClusterResponseStatus.CORDON]: {
+		color: "blue",
+		icon: ChevronsUp,
+		label: "Maintenance",
+	},
+	[GetClusterResponseStatus.CORDON_AND_DRAIN]: {
+		color: "blue",
+		icon: ChevronsUp,
+		label: "Maintenance",
+	},
+	[GetClusterResponseStatus.NOT_READY]: {
+		color: "gray",
+		icon: CircleDashed,
+		label: "Pending",
+	},
+	[GetClusterResponseStatus.UNHEALTHY]: {
+		color: "purple",
+		icon: ChevronsDown,
+		label: "No Contact",
+	},
+	[GetClusterResponseStatus.ABANDONED]: {
+		color: "red",
+		icon: OctagonX,
+		label: "Unavailable",
+	},
+	// Not emitted by SIS or ICMS; kept so an unexpected value still renders.
 	[GetClusterResponseStatus.PAUSED]: { color: "blue", icon: CirclePause },
 	[GetClusterResponseStatus.FAILED]: { color: "red", icon: CircleX },
-	[GetClusterResponseStatus.ABANDONED]: { color: "red", icon: CircleX },
-	[GetClusterResponseStatus.NOT_READY]: { color: "gray", icon: CircleMinus },
-	[GetClusterResponseStatus.UNHEALTHY]: {
-		color: "red",
-		icon: CircleX,
-		label: "Error",
-	},
 	[GetClusterResponseStatus.DELETED]: { color: "gray", icon: Trash2 },
-	[GetClusterResponseStatus.CORDON]: { color: "purple", icon: Wrench },
-	[GetClusterResponseStatus.CORDON_AND_DRAIN]: {
-		color: "purple",
-		icon: Wrench,
-	},
 };
 
 const fallbackConfig: StatusConfig = { color: "gray", icon: CircleMinus };

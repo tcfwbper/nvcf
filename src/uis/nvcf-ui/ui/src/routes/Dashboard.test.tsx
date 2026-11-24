@@ -93,13 +93,20 @@ describe("Dashboard", () => {
 							clusterName: "c3",
 							status: GetClusterResponseStatus.UNHEALTHY,
 						},
+						{
+							clusterName: "c4",
+							status: GetClusterResponseStatus.ABANDONED,
+						},
 					]),
 				);
 				render();
 				const readyLink = await screen.findByRole("link", { name: "Ready" });
 				expect(readyLink.previousElementSibling).toHaveTextContent("2");
 				const errorLink = screen.getByRole("link", { name: "Error" });
-				expect(errorLink.previousElementSibling).toHaveTextContent("1");
+				expect(errorLink.previousElementSibling).toHaveTextContent("2");
+				expect(
+					decodeURIComponent(errorLink.getAttribute("href") ?? ""),
+				).toContain('{"id":"status","value":{"group":"issues"}}');
 			});
 		});
 

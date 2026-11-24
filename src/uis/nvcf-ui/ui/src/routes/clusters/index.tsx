@@ -18,6 +18,7 @@
 import { Anchor, PageHeader, Tag } from "@nvidia/foundations-react-core";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { createColumnHelper } from "@tanstack/react-table";
+import { uniq } from "lodash-es";
 import { Boxes } from "lucide-react";
 import { DataTable } from "~/components/DataTable";
 import { baseTableSearchSchema } from "~/components/DataTable/utils/tableSearchSchema";
@@ -27,7 +28,10 @@ import {
 	getStatusLabel,
 	StatusBadge,
 } from "~/features/clusters/components/StatusBadge";
-import { clusterStatuses } from "~/features/clusters/constants";
+import {
+	clusterIssueStatuses,
+	clusterStatuses,
+} from "~/features/clusters/constants";
 import {
 	getGetClustersQueryOptions,
 	useGetClustersSuspense,
@@ -84,6 +88,9 @@ function ClustersListPending() {
 
 const columnHelper = createColumnHelper<GetClusterResponse>();
 
+const getGpuTypes = (cluster: GetClusterResponse) =>
+	uniq(cluster.gpus?.flatMap((gpu) => gpu.name) ?? []);
+
 const columns = [
 	columnHelper.accessor("clusterName", {
 		header: "Name",
@@ -109,37 +116,45 @@ const columns = [
 			id: "status",
 			cell: ({ row }) => <StatusBadge status={row.original.status} />,
 			header: "Status",
-			filterFn: "multiSelect",
 			meta: {
 				sortType: "text",
 				filterVariant: "multi-select",
-				filterOptions: clusterStatuses.map((s) => ({
-					label: getStatusLabel(s),
-					value: getStatusLabel(s),
-				})),
+				filterOptions: uniq(clusterStatuses.map(getStatusLabel)).map(
+					(label) => ({ label, value: label }),
+				),
+				groups: [
+					{ id: "all", label: "All" },
+					{
+						id: "issues",
+						label: "Issues",
+						values: clusterIssueStatuses.map(getStatusLabel),
+					},
+				],
 			},
 		},
 	),
 	columnHelper.accessor("region", {
 		header: "Region",
+		filterFn: "multiSelect",
+		meta: { filterVariant: "multi-select" },
 	}),
-	columnHelper.accessor(
-		(cluster) => [...new Set(cluster.gpus?.flatMap((gpu) => gpu.name))],
-		{
-			header: "GPU Types",
-			id: "gpuTypes",
-			cell: ({ getValue }) => (
-				<OverflowGroup kind="popover">
-					{getValue().map((gpu) => (
-						<Tag color="gray" key={gpu} kind="solid" readOnly>
-							{gpu}
-						</Tag>
-					))}
-				</OverflowGroup>
-			),
-			enableSorting: false,
-		},
-	),
+	columnHelper.accessor(getGpuTypes, {
+		header: "GPU Type",
+		id: "gpuTypes",
+		filterFn: "multiSelect",
+		getUniqueValues: getGpuTypes,
+		meta: { filterVariant: "multi-select" },
+		cell: ({ getValue }) => (
+			<OverflowGroup kind="popover">
+				{getValue().map((gpu) => (
+					<Tag color="gray" key={gpu} kind="solid" readOnly>
+						{gpu}
+					</Tag>
+				))}
+			</OverflowGroup>
+		),
+		enableSorting: false,
+	}),
 	columnHelper.accessor("nvcaVersion", {
 		header: "Agent Version",
 	}),
@@ -168,10 +183,22 @@ function ClustersList() {
 				reactTableOptions={tableUrlState}
 			>
 				<DataTable.Toolbar>
-					<DataTable.Filters />
-					<DataTable.ItemCount label="Cluster" />
-					<DataTable.Search placeholder="Search clusters..." />
-					<DataTable.ColumnVisibility />
+					<div className="flex items-center gap-6">
+						<DataTable.Search
+							className="w-64"
+							placeholder="Search clusters..."
+						/>
+						<DataTable.GroupFilter />
+					</div>
+				</DataTable.Toolbar>
+				<DataTable.Toolbar>
+					<div className="flex items-center gap-4">
+						<DataTable.Filters />
+					</div>
+					<div className="flex items-center gap-4">
+						<DataTable.ItemCount label="Cluster" />
+						<DataTable.ColumnVisibility />
+					</div>
 				</DataTable.Toolbar>
 				<DataTable.ActiveFilters />
 				<DataTable.Content />

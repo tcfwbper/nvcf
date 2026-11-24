@@ -15,10 +15,15 @@
  * limitations under the License.
  */
 
-import { Button, Dropdown, Group, Tag } from "@nvidia/foundations-react-core";
+import { Button, Tag } from "@nvidia/foundations-react-core";
 import { X } from "lucide-react";
 import { useDataTable } from "./DataTableContext";
-import { buildFilterItems, getColumnLabel } from "./utils";
+import { getColumnLabel } from "./utils";
+import {
+	getSelectedValues,
+	resetSelections,
+	withSelected,
+} from "./utils/groups";
 
 export function ActiveFilters() {
 	const table = useDataTable("ActiveFilters");
@@ -33,44 +38,42 @@ export function ActiveFilters() {
 		const { filterVariant, filterOptions = [] } = column.columnDef.meta ?? {};
 		if (!filterVariant) return [];
 
-		const columnName = getColumnLabel(column);
+		const selected = getSelectedValues(column);
+		if (selected.length === 0) return [];
 
 		const resolveLabel = (value: string) =>
 			filterOptions.find((o) => o.value === value)?.label ?? value;
+		const label = getColumnLabel(column);
+		const displayValue = selected.map(resolveLabel).join(", ");
 
-		const displayValue = Array.isArray(columnFilter.value)
-			? (columnFilter.value as string[]).map(resolveLabel).join(", ")
-			: resolveLabel(columnFilter.value as string);
-
-		return [{ id: columnFilter.id, column, columnName, displayValue }];
+		return [{ column, label, displayValue }];
 	});
+
+	if (activeFilters.length === 0) return null;
 
 	return (
 		<div className="flex flex-wrap items-center gap-2">
-			{activeFilters.map((activeFilter) => (
-				<Group key={activeFilter.id}>
-					<Dropdown
-						asChild
-						items={buildFilterItems(activeFilter.column, "active-filter")}
-					>
-						<Tag className="whitespace-nowrap" color="gray" kind="outline">
-							<b>{activeFilter.columnName}: </b>
-							{activeFilter.displayValue}
-						</Tag>
-					</Dropdown>
-					<Tag
-						aria-label="Clear filter"
-						color="gray"
-						kind="outline"
-						onClick={() => activeFilter.column.setFilterValue(undefined)}
-					>
-						<X size="1em" />
-					</Tag>
-				</Group>
+			{activeFilters.map(({ column, label, displayValue }) => (
+				<Tag
+					aria-label={`Remove ${label} filter: ${displayValue}`}
+					className="whitespace-nowrap"
+					color="gray"
+					key={column.id}
+					kind="outline"
+					onClick={() => column.setFilterValue(withSelected(undefined))}
+				>
+					<b>{label}: </b>
+					{displayValue}
+					<X size="1em" />
+				</Tag>
 			))}
-			<Button kind="tertiary" onClick={() => table.resetColumnFilters()}>
-				<X size="1em" />
-				Clear Filters
+			<Button
+				color="neutral"
+				kind="tertiary"
+				onClick={() => resetSelections(table)}
+				size="small"
+			>
+				Clear filters
 			</Button>
 		</div>
 	);

@@ -39,6 +39,8 @@ import {
 	ArrowUp,
 	ArrowUpDown,
 	CircleSlash,
+	Eye,
+	Lightbulb,
 	SearchX,
 } from "lucide-react";
 import { type CSSProperties, memo, type ReactNode, useMemo } from "react";
@@ -122,10 +124,32 @@ const MemoizedDataRows = memo(DataRows, (prev, next) => {
 	return prev.table.options.data === next.table.options.data;
 }) as typeof DataRows;
 
+function NoColumnsMessage() {
+	const table = useDataTable("Content");
+
+	return (
+		<StatusMessage
+			size="medium"
+			slotFooter={
+				<Button
+					kind="secondary"
+					onClick={() => table.toggleAllColumnsVisible(true)}
+				>
+					<Eye size="1em" /> Show all columns
+				</Button>
+			}
+			slotHeading="No columns selected"
+			slotMedia={<Lightbulb size={32} />}
+			slotSubheading="Choose at least one column to display this table"
+		/>
+	);
+}
+
 interface ContentProps<TData extends RowData> {
 	renderContent?: (props: { rows: Row<TData>[] }) => ReactNode;
 	emptyMessage?: ReactNode;
 	noResultsMessage?: ReactNode;
+	noColumnsMessage?: ReactNode;
 }
 
 export function Content<TData extends RowData>({
@@ -145,6 +169,7 @@ export function Content<TData extends RowData>({
 			slotSubheading="Try adjusting your search or filter criteria."
 		/>
 	),
+	noColumnsMessage = <NoColumnsMessage />,
 }: ContentProps<TData>) {
 	const table = useDataTable("Content");
 
@@ -161,6 +186,11 @@ export function Content<TData extends RowData>({
 	const hasData = table.getCoreRowModel().rows.length > 0;
 	const hasFilteredResults = table.getFilteredRowModel().rows.length > 0;
 	const rows = table.getRowModel().rows;
+
+	// `renderContent` ignores column visibility, so it can't be blanked out.
+	if (!renderContent && table.getVisibleLeafColumns().length === 0) {
+		return <div className="py-8">{noColumnsMessage}</div>;
+	}
 
 	if (!hasData) {
 		return <div className="py-8">{emptyMessage}</div>;

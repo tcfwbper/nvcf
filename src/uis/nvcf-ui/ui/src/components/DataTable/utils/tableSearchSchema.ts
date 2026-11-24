@@ -29,7 +29,14 @@ export const baseTableSearchSchema = z.object({
 		.array(
 			z.object({
 				id: z.string(),
-				value: z.union([z.string(), z.array(z.string())]),
+				value: z.union([
+					z.string(),
+					z.array(z.string()),
+					z.object({
+						group: z.string().optional(),
+						selected: z.union([z.string(), z.array(z.string())]).optional(),
+					}),
+				]),
 			}),
 		)
 		.default([])

@@ -16,10 +16,13 @@
  */
 
 import { ActiveFilters } from "./ActiveFilters";
+import { ColumnFilter } from "./ColumnFilter";
 import { ColumnVisibility } from "./ColumnVisibility";
 import { Content } from "./Content";
 import { DataTable as DataTableRoot } from "./DataTable";
+import { FilterMenu } from "./FilterMenu";
 import { Filters } from "./Filters";
+import { GroupFilter } from "./GroupFilter";
 import { ItemCount } from "./ItemCount";
 import { Pagination } from "./Pagination";
 import { Search } from "./Search";
@@ -39,6 +42,9 @@ const DataTable = Object.assign(DataTableRoot, {
 	ItemCount,
 	Sort,
 	Filters,
+	FilterMenu,
+	ColumnFilter,
+	GroupFilter,
 	ActiveFilters,
 	ColumnVisibility,
 	Skeleton: DataTableSkeleton,
@@ -47,3 +53,4 @@ const DataTable = Object.assign(DataTableRoot, {
 });
 
 export { DataTable };
+export type { ColumnGroup } from "./utils/groups";

@@ -167,7 +167,7 @@ function FunctionsList() {
 				reactTableOptions={tableUrlState}
 			>
 				<DataTable.Toolbar>
-					<DataTable.Filters />
+					<DataTable.FilterMenu />
 					<DataTable.ItemCount label="Function" />
 					<DataTable.Search placeholder="Search functions..." />
 					<DataTable.Sort />

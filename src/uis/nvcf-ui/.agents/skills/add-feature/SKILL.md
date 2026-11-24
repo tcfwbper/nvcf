@@ -32,7 +32,8 @@ pages in `ui/src/routes/`, domain code in `ui/src/features/`, shared code in
      types) go in the feature: `components/`, `hooks/`, `types/`, and
      `constants.ts`, created only when needed.
    - Page scaffolding (heading, layout, composition, table columns, URL-state
-     wiring) goes in the route file.
+     wiring) goes in the route file. For list tables, use the `datatable`
+     skill.
    - Domain-agnostic code needed by several features graduates to shared code.
 5. Do not import one feature from another. Compose features in the route file.
 6. Add the route with the `routing` skill. Add a nav entry in

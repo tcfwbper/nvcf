@@ -16,6 +16,7 @@
  */
 
 import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { describe, expect, it } from "vitest";
 import { getGetClustersMockHandler } from "~/generated/api/clusters/clusters.msw";
@@ -51,6 +52,54 @@ describe("ClustersList", () => {
 		});
 
 		expect(await screen.findByText("No data")).toBeInTheDocument();
+	});
+
+	describe("status groups", () => {
+		const clusters = [
+			{ clusterName: "ready-1", status: GetClusterResponseStatus.READY },
+			{ clusterName: "cordon-1", status: GetClusterResponseStatus.CORDON },
+			{ clusterName: "lost-1", status: GetClusterResponseStatus.UNHEALTHY },
+			{ clusterName: "gone-1", status: GetClusterResponseStatus.ABANDONED },
+		];
+
+		it("narrows to No Contact and Unavailable clusters under Issues", async () => {
+			const user = userEvent.setup();
+			server.use(getGetClustersMockHandler(clusters));
+			renderWithRouter({ initialLocation: "/clusters" });
+
+			await user.click(
+				await screen.findByRole("button", { name: /Issues\s*2/ }),
+			);
+
+			expect(await screen.findByText("lost-1")).toBeInTheDocument();
+			expect(screen.getByText("gone-1")).toBeInTheDocument();
+			expect(screen.queryByText("ready-1")).not.toBeInTheDocument();
+			expect(screen.queryByText("cordon-1")).not.toBeInTheDocument();
+			expect(
+				screen.getByRole("menuitemcheckbox", { name: /^No Contact/ }),
+			).toBeInTheDocument();
+			expect(
+				screen.getByRole("menuitemcheckbox", { name: /^Unavailable/ }),
+			).toBeInTheDocument();
+			expect(
+				screen.queryByRole("menuitemcheckbox", { name: /^Ready/ }),
+			).not.toBeInTheDocument();
+		});
+
+		it("applies a status filter from a dashboard link", async () => {
+			server.use(getGetClustersMockHandler(clusters));
+			const filters = encodeURIComponent(
+				JSON.stringify([{ id: "status", value: ["Ready"] }]),
+			);
+			renderWithRouter({ initialLocation: `/clusters?filters=${filters}` });
+
+			expect(await screen.findByText("ready-1")).toBeInTheDocument();
+			expect(screen.queryByText("lost-1")).not.toBeInTheDocument();
+			expect(screen.getByRole("button", { name: /All/ })).toHaveAttribute(
+				"aria-pressed",
+				"true",
+			);
+		});
 	});
 
 	it("shows error state when the API fails", async () => {

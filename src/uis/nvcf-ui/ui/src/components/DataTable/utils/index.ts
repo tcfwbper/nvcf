@@ -17,4 +17,8 @@
 
 export { getColumnLabel } from "./columns";
 export { filterFns } from "./filter-fns";
-export { buildFilterItems } from "./filter-items";
+export {
+	buildFilterItems,
+	filterMenuClassName,
+	getColumnOptions,
+} from "./filter-items";

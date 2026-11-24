@@ -18,9 +18,18 @@
 import { Button, StatusMessage } from "@nvidia/foundations-react-core";
 import { type ErrorComponentProps, useRouter } from "@tanstack/react-router";
 import { AlertTriangleIcon } from "lucide-react";
+import { HttpError } from "~/lib/fetch";
+import { UnreachableServiceFallback } from "./UnreachableServiceFallback";
 
 export function RouteErrorFallback({ error }: ErrorComponentProps) {
 	const router = useRouter();
+
+	// The BFF answers 502 when it can't dial the upstream; an upstream's own
+	// 502 is proxied through verbatim. Both mean the service isn't responding.
+	if (error instanceof HttpError && error.status === 502) {
+		return <UnreachableServiceFallback onRetry={() => router.invalidate()} />;
+	}
+
 	// `error` is typed `unknown` because anything can be thrown, not just an
 	// Error. Narrow before reading `message` and fall back to the generic copy.
 	const message = error instanceof Error ? error.message : "";

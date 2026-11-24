@@ -18,6 +18,8 @@
 import {
 	type ColumnDef,
 	getCoreRowModel,
+	getFacetedRowModel,
+	getFacetedUniqueValues,
 	getFilteredRowModel,
 	getPaginationRowModel,
 	getSortedRowModel,
@@ -26,9 +28,10 @@ import {
 	type TableOptions,
 	useReactTable,
 } from "@tanstack/react-table";
-import type { ReactNode } from "react";
+import { type ReactNode, useMemo } from "react";
 import { DataTableProvider } from "./DataTableContext";
 import { filterFns } from "./utils";
+import { withColumnGroups } from "./utils/groups";
 
 interface DataTableProps<TData extends RowData> {
 	data: TData[];
@@ -44,9 +47,11 @@ export function DataTable<TData extends RowData>({
 	children,
 	reactTableOptions,
 }: DataTableProps<TData>) {
+	const groupedColumns = useMemo(() => withColumnGroups(columns), [columns]);
+
 	const table = useReactTable({
 		data,
-		columns,
+		columns: groupedColumns,
 		columnResizeMode: "onChange",
 		filterFns,
 		globalFilterFn: "includesValue",
@@ -55,6 +60,8 @@ export function DataTable<TData extends RowData>({
 		getPaginationRowModel: getPaginationRowModel(),
 		getSortedRowModel: getSortedRowModel(),
 		getFilteredRowModel: getFilteredRowModel(),
+		getFacetedRowModel: getFacetedRowModel(),
+		getFacetedUniqueValues: getFacetedUniqueValues(),
 		...reactTableOptions,
 	});
 

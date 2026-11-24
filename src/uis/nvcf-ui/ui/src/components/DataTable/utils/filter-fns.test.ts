@@ -65,6 +65,10 @@ describe("filterFns.includesValue", () => {
 });
 
 describe("filterFns.multiSelect", () => {
+	it("matches a non-string cell against its string option value", () => {
+		expect(filterFns.multiSelect(row(8), "gpus", ["8"], () => {})).toBe(true);
+	});
+
 	it("returns true when the row value is in the filter array", () => {
 		expect(
 			filterFns.multiSelect(
@@ -84,6 +88,15 @@ describe("filterFns.multiSelect", () => {
 				["active", "inactive"],
 				() => {},
 			),
+		).toBe(false);
+	});
+
+	it("matches an array cell when any element is selected", () => {
+		expect(
+			filterFns.multiSelect(row(["A100", "H100"]), "gpus", ["H100"], () => {}),
+		).toBe(true);
+		expect(
+			filterFns.multiSelect(row(["A100"]), "gpus", ["H100"], () => {}),
 		).toBe(false);
 	});
 

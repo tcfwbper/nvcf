@@ -15,30 +15,20 @@
  * limitations under the License.
  */
 
-import { Dropdown, type DropdownEntry } from "@nvidia/foundations-react-core";
-import { ListFilter } from "lucide-react";
+import { ColumnFilter } from "./ColumnFilter";
 import { useDataTable } from "./DataTableContext";
-import { buildFilterItems, getColumnLabel } from "./utils";
 
+/** One dropdown per column with a `filterVariant`, in column order. */
 export function Filters() {
 	const table = useDataTable("Filters");
-
-	const filterableColumns = table
-		.getAllColumns()
-		.filter((col) => col.columnDef.meta?.filterVariant);
-
-	if (filterableColumns.length === 0) return null;
-
-	const items: DropdownEntry[] = filterableColumns.map((col) => ({
-		kind: "sub",
-		children: getColumnLabel(col),
-		items: buildFilterItems(col, "filter"),
-	}));
-
 	return (
-		<Dropdown items={items}>
-			<ListFilter size="1em" />
-			Filter
-		</Dropdown>
+		<>
+			{table
+				.getAllLeafColumns()
+				.filter((column) => column.columnDef.meta?.filterVariant)
+				.map((column) => (
+					<ColumnFilter columnId={column.id} key={column.id} />
+				))}
+		</>
 	);
 }

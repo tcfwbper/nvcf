@@ -262,6 +262,16 @@ export default defineConfig({
 										"ap-south-1",
 										"ap-northeast-1",
 									]),
+								// PAUSED, DELETED, and FAILED are in the spec but SIS and ICMS never send them.
+								"/^status$/": () =>
+									faker.helpers.arrayElement([
+										"READY",
+										"CORDON",
+										"CORDON_AND_DRAIN",
+										"NOT_READY",
+										"UNHEALTHY",
+										"ABANDONED",
+									]),
 								"/k8sVersion/": () =>
 									`v1.${faker.number.int({ min: 29, max: 34 })}.${faker.number.int({ min: 0, max: 9 })}`,
 								"/nvcaVersion/": () =>
