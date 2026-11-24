@@ -33,7 +33,7 @@ was not re-checked against the code.
 | You are | Read, in order |
 |---|---|
 | New to nvsnap | [START-HERE](START-HERE.md), [glossary](GLOSSARY.md), [architecture](ARCHITECTURE.md), [gpushare](design/GPUSHARE.md) |
-| Installing or operating it | [Install](operate/INSTALL.md), [pull secrets](operate/PULL-SECRETS.md), [metrics and history](operate/METRICS.md), [runbook: alerts and following a restore](operate/RUNBOOK.md), the chart's [values](../deploy/helm/nvsnap/values.yaml), [reference](REFERENCE.md) |
+| Installing or operating it | [Install](operate/INSTALL.md), [pull secrets](operate/PULL-SECRETS.md), [metrics and history](operate/METRICS.md), [runbook: alerts and following a restore](operate/RUNBOOK.md), [supported workloads](operate/SUPPORTED-WORKLOADS.md), the chart's [values](../deploy/helm/nvsnap/values.yaml), [reference](REFERENCE.md) |
 | Changing the code | [Developing](operate/DEVELOPING.md), [architecture](ARCHITECTURE.md), the design note for the area you touch, [CONTRIBUTING](../CONTRIBUTING.md) |
 | Reviewing a claim or a number | [RESULTS](RESULTS.md), then [ARCHITECTURE §0](ARCHITECTURE.md#0-evidence-levels) for what each capability's evidence is |
 
@@ -61,6 +61,7 @@ was not re-checked against the code.
 | [PULL-SECRETS.md](operate/PULL-SECRETS.md) | Registry credentials for the agent and the pods it creates | Current, 2026-10-21 |
 | [METRICS.md](operate/METRICS.md) | The capture and restore history: metrics (scale-up, teardown, the cached captures), summary log lines, events, and how to keep them | Current, 2026-11-12 |
 | [RUNBOOK.md](operate/RUNBOOK.md) | What to do when each NvSnap alert fires, and how to follow one capture or restore with kubectl | Current, 2026-11-12 |
+| [SUPPORTED-WORKLOADS.md](operate/SUPPORTED-WORKLOADS.md) | Which multi-node engine shapes are captured and restored, which are refused, and the log line for each | Current, 2026-11-21 |
 | [DEVELOPING.md](operate/DEVELOPING.md) | Build, deploy, capture, validate, merge | Current, 2026-10-21 |
 | [Chart README](../deploy/helm/nvsnap/README.md) | What each chart template renders; chart development | Current, 2026-10-21 |
 
