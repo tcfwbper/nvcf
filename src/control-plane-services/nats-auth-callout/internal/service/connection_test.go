@@ -24,12 +24,18 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http/httptest"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -195,4 +201,46 @@ func TestUpdateConnectionStatus_ConcurrentUpdates_LeaveOneStatusSet(t *testing.T
 			t.Fatalf("%d statuses set after concurrent updates, want 1", set)
 		}
 	}
+}
+
+func TestConnectionOptions_TLSReconnectFailureUpdatesMetrics(t *testing.T) {
+	// Reuse Go's localhost test certificate for a real TLS-enabled NATS server.
+	https := httptest.NewTLSServer(nil)
+	certificate := https.TLS.Certificates[0]
+	root := https.Certificate()
+	https.Close()
+	natsServer := test.RunServer(&server.Options{
+		Host: "127.0.0.1", Port: -1,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12},
+	})
+	t.Cleanup(natsServer.Shutdown)
+
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	var rejectNext atomic.Bool
+	core, logs := observer.New(zapcore.DebugLevel)
+	s := &Service{logger: zap.New(core)}
+	counter := NATSConnectionEventsTotal.WithLabelValues(eventReconnectFailed, reasonTLS)
+	before := testutil.ToFloat64(counter)
+	nc, err := nats.Connect(natsServer.ClientURL(), append(s.connectionOptions(),
+		nats.ClientTLSConfig(nil, func() (*x509.CertPool, error) {
+			// Reject one reconnect handshake, then restore trust independently of callbacks.
+			if rejectNext.Swap(false) {
+				return x509.NewCertPool(), nil
+			}
+			return roots, nil
+		}),
+		nats.ReconnectWait(10*time.Millisecond),
+		nats.ReconnectJitter(0, 0),
+	)...)
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	rejectNext.Store(true)
+	require.NoError(t, nc.ForceReconnect())
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(counter) > before && nc.IsConnected() &&
+			logs.FilterMessage("NATS reconnect attempt failed").Len() > 0
+	}, 5*time.Second, 10*time.Millisecond, "TLS reconnect failure must update metrics, log, and recover")
+	require.NoError(t, nc.FlushTimeout(time.Second))
 }

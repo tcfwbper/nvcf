@@ -59,7 +59,10 @@ go_test(
     deps = [
         "//src/control-plane-services/nats-auth-callout/internal/plugins/types",
         "@com_github_nats_io_nats_go//:nats_go",
+        "@com_github_nats_io_nats_server_v2//server",
+        "@com_github_nats_io_nats_server_v2//test",
         "@com_github_prometheus_client_golang//prometheus/testutil",
+        "@com_github_stretchr_testify//require",
         "@org_uber_go_zap//:zap",
         "@org_uber_go_zap//zapcore",
         "@org_uber_go_zap//zaptest/observer",
