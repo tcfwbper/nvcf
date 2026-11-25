@@ -290,6 +290,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	}
 	cp = append(cp, newMetaPatcher(pod).annotation(CacheURIAnnotation, uri)...)
 	cp = append(cp, m.processConfigPatches(pod)...)
+	cp = append(cp, m.placeholderModelCachePatches(ctx, pod, cp)...)
 	log.WithFields(logrus.Fields{"checkpoint": id, "ordinal": ordinal, "size": size}).Info("CRIU group restore: pod admitted as its rank's restore placeholder")
 	admit(metrics.AdmitRestore, "")
 	return mergePatchPlan(withPIDReserve(pod, append(cp, vp...)))

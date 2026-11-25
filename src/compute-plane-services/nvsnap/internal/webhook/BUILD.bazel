@@ -86,6 +86,7 @@ go_test(
         "model_volume_test.go",
         "mutate_test.go",
         "node_model_cache_test.go",
+        "placeholder_model_cache_test.go",
         "process_config_test.go",
         "reader_steps_test.go",
         "request_metrics_test.go",

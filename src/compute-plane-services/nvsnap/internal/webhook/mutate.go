@@ -769,6 +769,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		}
 		plog.WithField("checkpoint", id).Info("CRIU restore: pod admitted as the restore placeholder")
 		cp = append(cp, m.processConfigPatches(pod)...)
+		cp = append(cp, m.placeholderModelCachePatches(ctx, pod, cp)...)
 		// Not injectPatches: a gpushare restore mounts the checkpoint's
 		// chunk store, not the pod's own empty one.
 		return mergePatchPlan(withPIDReserve(pod, append(cp, vp...))), nil
