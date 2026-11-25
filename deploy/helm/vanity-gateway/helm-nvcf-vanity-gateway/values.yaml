@@ -60,6 +60,12 @@ vanityGateway:
     shadowMaxConcurrent: 256
     # Maximum model API request body size in bytes (25 MiB). Must be positive.
     maxRequestSizeBytes: 26214400
+    # Maximum body size in bytes for model API requests forwarded as they
+    # arrive (routing fields in the first 64 KiB on a direct route). Unset
+    # means equal to maxRequestSizeBytes. When set, it must be at least
+    # maxRequestSizeBytes, and above it only when maxRequestSizeBytes is at
+    # least 65536. Requests the gateway reads in full keep maxRequestSizeBytes.
+    # maxStreamedRequestSizeBytes: 67108864
 
   mappingConfig:
     v2config:

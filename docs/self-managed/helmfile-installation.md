@@ -1176,6 +1176,28 @@ variable `MAX_REQUEST_SIZE_BYTES`. Invalid or non-positive values are rejected.
 The limit covers model API POST routes, including image endpoints. Generic
 vanity pass-through routes and private-model lookup response limits are unchanged.
 
+Requests the gateway forwards as they arrive can have a larger limit, because
+the gateway holds only their first 64 KiB. Set
+`addons.vanityGateway.config.maxStreamedRequestSizeBytes` to allow them more,
+for example 64 MiB while other requests keep 25 MiB:
+
+```yaml
+addons:
+  vanityGateway:
+    enabled: true
+    config:
+      maxStreamedRequestSizeBytes: 67108864
+```
+
+Unset, it equals `maxRequestSizeBytes`. It must be at least
+`maxRequestSizeBytes`, and above it only when `maxRequestSizeBytes` is at least
+65536; the gateway stops at startup otherwise. Multipart, LLM Gateway, shadowed
+and other requests the gateway reads in full keep `maxRequestSizeBytes`. The
+stack passes it to the chart's `vanityGateway.config.maxStreamedRequestSizeBytes`,
+which sets `MAX_STREAMED_REQUEST_SIZE_BYTES`. Set it only with a Vanity Gateway
+chart that has this key, and remove it before rolling the chart back to an
+older version.
+
 `helmfile apply` updates the gateway ConfigMap, but running pods keep the old
 environment until they restart. A change to pod resources, such as the memory
 limit, restarts them. Otherwise, restart them yourself:

@@ -110,23 +110,27 @@ func bufferedBodyRead(reason string) requestBodyMode {
 // readModelRequestBody reads the routing fields of a model request. On the
 // streamed path request.Body replays the scanned prefix followed by the unread
 // body and the returned body has no raw bytes. On the buffered path
-// request.Body holds the complete body, as before.
+// request.Body holds the complete body, as before. On a read error the mode
+// names the path that was reading the body, or is empty when the body was
+// rejected unread, and the body has the model the prefix named, if any.
 func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFUrl map[string]FunctionInfo) (openAIRequestBody, requestBodyMode, error) {
-	if request.Body != nil && d.requestBodyLimit > 0 && request.ContentLength > d.requestBodyLimit && !isShadowRequest(request) {
-		// The body cannot fit the route limit, so fail as reading it would,
-		// without reading or forwarding any of it, multipart included. Shadow
-		// replays are exempt: they never pass through the route limit, and
-		// rewriting their model can make them longer than the primary request.
-		_ = request.Body.Close()
-		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit})
-	}
 	decode := decodeOpenAIJSONBody
 	needStream := true
+	multipartBoundary, isMultipart := "", false
 	if isDecisionRoute(request) {
 		decode = decodeDecisionRequestBody
 		needStream = false
 	} else if contentType := parseOpenAIContentType(request.Header.Get(contentTypeHeader)); contentType.mediaType == contentTypeMultipartFormData {
-		body, err := extractOpenAIMultipartBody(request, contentType.boundary)
+		multipartBoundary, isMultipart = contentType.boundary, true
+	}
+	if limit, over := d.declaredLengthOverLimit(request, isMultipart); over {
+		// The body cannot fit any limit that can apply to it, so fail as
+		// reading it would, without reading or forwarding any of it.
+		abandonRequestBody(request)
+		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: limit})
+	}
+	if isMultipart {
+		body, err := extractOpenAIMultipartBody(request, multipartBoundary)
 		return body, bufferedBodyRead(requestBodyReasonMultipart), err
 	}
 	if request.Body == nil {
@@ -139,21 +143,95 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 	if err != nil {
 		_ = request.Body.Close()
 		releaseRequestBodyBuffer(prefix)
-		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", err)
+		// No path was chosen yet; only a buffered read can fail here.
+		return openAIRequestBody{}, requestBodyMode{mode: requestBodyModeBuffered}, fmt.Errorf("failed to read body: %w", err)
 	}
 	if complete {
 		return finishBufferedRequestBody(request, prefix, decode, requestBodyReasonComplete)
 	}
 
 	scan := scanRequestPrefix(prefix.B, needStream)
-	if scan.fallbackReason != "" {
-		return finishBufferedRequestBody(request, prefix, decode, scan.fallbackReason)
+	reason := scan.fallbackReason
+	if reason == "" {
+		reason = d.streamedRouteIneligibility(request, modelToNVCFUrl, scan.model)
 	}
-	if reason := d.streamedRouteIneligibility(request, modelToNVCFUrl, scan.model); reason != "" {
-		return finishBufferedRequestBody(request, prefix, decode, reason)
+	if reason != "" {
+		if d.declaredOverBufferedLimit(request) {
+			// Only a streamed request may pass the buffered limit, and the
+			// declared length already does, so reject before reading more.
+			abandonRequestBody(request)
+			releaseRequestBodyBuffer(prefix)
+			return openAIRequestBody{Model: scan.model}, bufferedBodyRead(reason), d.withFieldOrderHint(fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit}), reason, needStream)
+		}
+		body, mode, err := finishBufferedRequestBody(request, prefix, decode, reason)
+		if err != nil {
+			body.Model = scan.model
+		}
+		return body, mode, d.withFieldOrderHint(err, reason, needStream)
 	}
-	request.Body = newPrefixReplayBody(prefix, request.Body)
+	request.Body = newPrefixReplayBody(prefix, promoteRequestBody(request, d.streamedBodyLimit()))
 	return openAIRequestBody{Model: scan.model, Stream: scan.stream}, streamedBodyRead(), nil
+}
+
+// bodyLimitHintError adds a hint for the client to a body limit error.
+type bodyLimitHintError struct {
+	error
+	hint string
+}
+
+func (e *bodyLimitHintError) Unwrap() error { return e.error }
+
+// bodyLimitHint returns the hint added to err, or "".
+func bodyLimitHint(err error) string {
+	var hintErr *bodyLimitHintError
+	if errors.As(err, &hintErr) {
+		return hintErr.hint
+	}
+	return ""
+}
+
+// withFieldOrderHint adds a hint to a buffered limit error when a larger
+// streamed limit is set and the request took the buffered path only because
+// its routing fields were not in the prefix. The hint names those fields.
+func (d *ModelDirector) withFieldOrderHint(err error, reason string, needStream bool) error {
+	var maxBytesErr *http.MaxBytesError
+	if (reason != requestBodyReasonLateFields && reason != requestBodyReasonFieldsAbsent) ||
+		d.streamedBodyLimit() <= d.requestBodyLimit ||
+		!errors.As(err, &maxBytesErr) || maxBytesErr.Limit != d.requestBodyLimit {
+		return err
+	}
+	fields := "model and stream fields are"
+	if !needStream {
+		fields = "model field is"
+	}
+	return &bodyLimitHintError{error: err, hint: fmt.Sprintf("Bodies up to %d bytes can be accepted when the %s in the first %d bytes of the JSON body.", d.streamedBodyLimit(), fields, requestPrefixLimit)}
+}
+
+// streamedBodyLimit is the body limit for a request on the streamed path.
+func (d *ModelDirector) streamedBodyLimit() int64 {
+	return max(d.requestBodyLimit, d.streamedRequestBodyLimit)
+}
+
+// declaredOverBufferedLimit reports a primary request whose declared
+// Content-Length is over the buffered limit. Shadow replays are exempt: they
+// never pass through the route limit, and rewriting their model can make them
+// longer than the primary request.
+func (d *ModelDirector) declaredOverBufferedLimit(request *http.Request) bool {
+	return request.Body != nil && d.requestBodyLimit > 0 && request.ContentLength > d.requestBodyLimit && !isShadowRequest(request)
+}
+
+// declaredLengthOverLimit returns the limit a declared Content-Length is
+// over, when no path can accept the body: the buffered limit for multipart
+// bodies, which are always buffered, and the streamed limit otherwise.
+func (d *ModelDirector) declaredLengthOverLimit(request *http.Request, isMultipart bool) (int64, bool) {
+	if !d.declaredOverBufferedLimit(request) {
+		return 0, false
+	}
+	if isMultipart {
+		return d.requestBodyLimit, true
+	}
+	limit := d.streamedBodyLimit()
+	return limit, request.ContentLength > limit
 }
 
 // readRequestPrefix fills prefix with up to requestPrefixLimit bytes of body.
@@ -168,7 +246,9 @@ func readRequestPrefix(prefix *bytebufferpool.ByteBuffer, body io.Reader, conten
 		if len(prefix.B) == cap(prefix.B) {
 			grow := max(cap(prefix.B), requestPrefixMinRead)
 			if contentLength >= 0 && len(prefix.B) == 0 {
-				grow = int(min(contentLength+1, requestPrefixLimit))
+				// Clamp before adding one, so the largest declared length
+				// does not overflow.
+				grow = int(min(contentLength, requestPrefixLimit-1) + 1)
 			}
 			prefix.B = slices.Grow(prefix.B, min(grow, requestPrefixLimit-len(prefix.B)))
 		}
@@ -191,7 +271,7 @@ func readRequestPrefix(prefix *bytebufferpool.ByteBuffer, body io.Reader, conten
 func finishBufferedRequestBody(request *http.Request, prefix *bytebufferpool.ByteBuffer, decode func(*pooledRequestBody) (openAIRequestBody, error), reason string) (openAIRequestBody, requestBodyMode, error) {
 	bodyBytes, err := bufferRemainingRequestBody(request, prefix)
 	if err != nil {
-		return openAIRequestBody{}, requestBodyMode{}, err
+		return openAIRequestBody{}, bufferedBodyRead(reason), err
 	}
 	body, err := decode(bodyBytes)
 	return body, bufferedBodyRead(reason), err
@@ -633,7 +713,8 @@ var requestBodyModes = []requestBodyMode{
 }
 
 func setupRequestBodyMetrics() error {
-	counter, err := otel.GetMeterProvider().Meter(shadowMetricsScope).Int64Counter(
+	meter := otel.GetMeterProvider().Meter(shadowMetricsScope)
+	counter, err := meter.Int64Counter(
 		requestBodyMetricName,
 		otelmetric.WithDescription("Number of model API request bodies read, by streamed or buffered mode and the reason for it."),
 	)
@@ -644,7 +725,7 @@ func setupRequestBodyMetrics() error {
 	for _, mode := range requestBodyModes {
 		addRequestBodyRead(context.Background(), mode, 0)
 	}
-	return nil
+	return setupRequestBodyLargeMetrics(meter)
 }
 
 func addRequestBodyRead(ctx context.Context, mode requestBodyMode, count int64) {

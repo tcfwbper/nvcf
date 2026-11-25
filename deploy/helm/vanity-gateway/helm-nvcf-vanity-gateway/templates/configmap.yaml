@@ -30,6 +30,9 @@ data:
   AWS_REGION: {{ .Values.vanityGateway.config.awsRegion | quote }}
   SHADOW_MAX_CONCURRENT: {{ .Values.vanityGateway.config.shadowMaxConcurrent | quote }}
   MAX_REQUEST_SIZE_BYTES: {{ .Values.vanityGateway.config.maxRequestSizeBytes | int64 | quote }}
+  {{- with .Values.vanityGateway.config.maxStreamedRequestSizeBytes }}
+  MAX_STREAMED_REQUEST_SIZE_BYTES: {{ . | int64 | quote }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap

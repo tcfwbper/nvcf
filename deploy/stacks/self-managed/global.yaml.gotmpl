@@ -2398,6 +2398,10 @@ vanityGateway:
     awsRegion: {{ dig "addons" "vanityGateway" "config" "awsRegion" "" .Values | quote }}
     shadowMaxConcurrent: {{ dig "addons" "vanityGateway" "config" "shadowMaxConcurrent" 256 .Values }}
     maxRequestSizeBytes: {{ dig "addons" "vanityGateway" "config" "maxRequestSizeBytes" 26214400 .Values }}
+    {{- $vanityGatewayConfig := dig "addons" "vanityGateway" "config" dict .Values }}
+    {{- if hasKey $vanityGatewayConfig "maxStreamedRequestSizeBytes" }}
+    maxStreamedRequestSizeBytes: {{ $vanityGatewayConfig.maxStreamedRequestSizeBytes | toJson }}
+    {{- end }}
   mappingConfig:
     {{ dig "addons" "vanityGateway" "mappingConfig" (dict "v2config" (dict "openai" (dict) "vanity" (dict))) .Values | toYaml | nindent 4 | trim }}
   serviceMonitor:

@@ -54,6 +54,7 @@ Configuration is passed through environment variables.
 | `POD_IP` | No | Empty | Added to trace attributes as `host.ip`. |
 | `AWS_REGION` | No | Empty | Added to trace attributes as `host.dc`. |
 | `MAX_REQUEST_SIZE_BYTES` | No | `26214400` (25 MiB) | Maximum model API request body size in bytes. Explicit values must be positive integers. Invalid values stop startup. |
+| `MAX_STREAMED_REQUEST_SIZE_BYTES` | No | `MAX_REQUEST_SIZE_BYTES` | Maximum body size in bytes for model API requests on the streamed path. Explicit values must be positive integers, at least `MAX_REQUEST_SIZE_BYTES`, and above it only when `MAX_REQUEST_SIZE_BYTES` is at least 65536. Invalid values stop startup. |
 | `SHADOW_MAX_CONCURRENT` | No | `256` | Maximum concurrent shadow requests. Non-positive values use the default. |
 
 `PRIVATE_MODEL_NAME_REGEX_PATTERN` defaults to the value compiled into the
@@ -92,6 +93,24 @@ pass-through routes and private-model lookup response limits are unchanged.
 Existing logs, spans, and request metrics still record rejected requests.
 Changing the environment setting requires a process restart; mapping reloads
 retain the configured limit.
+
+`MAX_STREAMED_REQUEST_SIZE_BYTES` raises the limit only for requests on the
+streamed path, which holds a 64 KiB prefix whatever the body size. Unset, it
+equals `MAX_REQUEST_SIZE_BYTES` and nothing changes. Every request the gateway
+reads in full, including multipart, LLM Gateway, shadowed and late-field
+requests, keeps `MAX_REQUEST_SIZE_BYTES`. For example, keep the buffered limit
+at 25 MiB and allow 64 MiB streamed:
+
+```yaml
+vanityGateway:
+  config:
+    maxStreamedRequestSizeBytes: 67108864
+```
+
+The chart leaves this key unset. Set it only with a chart version that has
+it, and remove it before rolling the chart back to an older version. A larger
+streamed limit does not raise gateway memory per request, but it lets clients
+hold an upstream connection and backend for longer uploads.
 
 ## Configuration Sources
 
@@ -466,16 +485,20 @@ reads at most 64 KiB of a JSON body before it decides how to read the rest.
 
 ```mermaid
 flowchart TD
-  request[Model API request] --> limit{Content-Length over the route limit?}
-  limit -- yes --> rejected[Reject before reading the body]
-  limit -- no --> multipart{Multipart?}
-  multipart -- yes --> buffered[Buffered path: read the whole body, validate, route, forward]
-  multipart -- no --> prefix[Read up to 64 KiB]
+  request[Model API request] --> multipart{Multipart?}
+  multipart -- yes --> mplimit{Content-Length over the buffered limit?}
+  mplimit -- yes --> rejected[Reject before reading the body]
+  mplimit -- no --> buffered[Buffered path: read the whole body within the buffered limit, validate, route, forward]
+  multipart -- no --> limit{Content-Length over the streamed limit?}
+  limit -- yes --> rejected
+  limit -- no --> prefix[Read up to 64 KiB]
   prefix --> ended{Body ended?}
   ended -- yes --> buffered
   ended -- no --> fields{Routing fields in the prefix, and the route forwards the body unchanged?}
-  fields -- no --> buffered
-  fields -- yes --> streamed[Streamed path: route, forward the prefix, then the rest of the upload as it arrives]
+  fields -- no --> between{Content-Length over the buffered limit?}
+  between -- yes --> rejectedprefix[Reject after the prefix]
+  between -- no --> buffered
+  fields -- yes --> streamed[Streamed path: route, forward the prefix, then the rest of the upload as it arrives, within the streamed limit]
 ```
 
 - Buffered path: the gateway reads the complete body, decodes and validates it,
@@ -524,8 +547,45 @@ The buffered path is also used when:
 | The model has shadow targets | `shadow` |
 
 The buffered cases keep their existing error responses and error precedence.
-A request whose `Content-Length` exceeds the route limit gets the same
-too-large error as before, without the gateway reading its body first.
+
+Two limits apply. The buffered limit, `MAX_REQUEST_SIZE_BYTES`, bounds every
+read until the gateway chooses the streamed path. Only then is the rest of the
+upload allowed up to the streamed limit, `MAX_STREAMED_REQUEST_SIZE_BYTES`,
+with the prefix counted once. Any other read keeps the buffered limit. The
+too-large error names the limit that applied: `400` with `Please make sure
+your payload is below <limit> bytes in size.` on OpenAI routes, and `413` with
+`request body is too large (limit <limit> bytes)` on native routes. When the
+streamed limit is above the buffered limit and the request used the buffered
+path because of `late_fields` or `fields_absent`, the message ends with a hint,
+for example `Bodies up to 134217728 bytes can be accepted when the model and
+stream fields are in the first 65536 bytes of the JSON body.` On
+`/v1/decisions` and `/v1/systemone` it names only the model field. Other
+reasons, and equal limits, get no hint. The gateway rejects as early as the
+outcome is known:
+
+- A `Content-Length` over the streamed limit, or a multipart `Content-Length`
+  over the buffered limit, is rejected without reading the body.
+- A `Content-Length` between the two limits on a request that falls back to
+  the buffered path is rejected right after the prefix, with the buffered
+  limit, and nothing is forwarded.
+- These two rejections answer without reading the rest of the upload. On
+  HTTP/1.1 the response carries `Connection: close` and the gateway closes the
+  connection after it, so the client gets the error even if it waits for a
+  response before sending more.
+- A body of unknown length on the buffered path stops at the buffered limit.
+
+With the streamed limit unset, both limits are equal and requests are handled
+as before.
+
+The gateway accepts cleartext HTTP/2 with prior knowledge and through an
+HTTP/1.1 `Upgrade: h2c` request. An HTTP/1.1 request on any route that asks
+for `Upgrade: h2c` and has a body, a `Content-Length` above 0 or a chunked
+body, is served over HTTP/1.1 instead. The gateway removes `h2c` from
+`Upgrade`, the `HTTP2-Settings` header and the `Connection` tokens that name
+them before routing, so the body is read under the limits above, can take the
+streamed path, and the upgrade headers are not forwarded. A request without a
+body still upgrades to HTTP/2.
+
 For `functionType: LLM`, the LLM Gateway also buffers the rewritten body, so
 those requests are not expected to use less memory.
 
@@ -536,7 +596,7 @@ The buffered path rejects malformed JSON with `400` before dispatch.
 
 Failures after a streamed request is dispatched:
 
-- If an upload of unknown length passes the route body limit before the
+- If an upload of unknown length passes the streamed limit before the
   upstream responds, the gateway stops the upstream body and returns the same
   error as a limit reached before dispatch: `400` on OpenAI routes and `413` on
   native routes. The upstream receives an incomplete body, never a complete
@@ -550,6 +610,18 @@ Failures after a streamed request is dispatched:
 - If the upstream answers before reading the whole body, the client receives
   that response. The rest of the upload is not forwarded. A client that has
   stopped sending receives it when the 60-second limit ends its upload.
+
+Each primary request rejected for its body size is counted in
+`nvcf_ai_api_gateway_request_body_large_total` (see [Health and
+Metrics](#health-and-metrics)) and logged once at info level with the message
+`request body over the size limit rejected`. The log line has the request ID,
+the trace and span IDs when traced, the outcome, the size range, the limit, the
+declared `Content-Length` when the client sent one, the buffered reason when
+known, the model and function ID when the prefix named a routed model, and the
+client's User-Agent cut to its product and version, at most 64 characters. It
+has no body bytes and no other headers. The gateway reads no body bytes for
+this telemetry: it uses the declared length and what routing already knows at
+the rejection point, and the client's response is unchanged.
 
 ## Invoking OpenAI-compatible Endpoints
 
@@ -869,7 +941,8 @@ Requests must use `Content-Type: application/json`. A request without
 a `Content-Type` header is read as JSON, as on `/v1/chat/completions`; any
 other media type returns `415`. Vendor headers such as
 `TypeSafe-Danger-Zone-Images: true` reach the backend unchanged. Request bodies
-may be up to `MAX_REQUEST_SIZE_BYTES` (25 MiB by default).
+may be up to `MAX_REQUEST_SIZE_BYTES` (25 MiB by default), or up to
+`MAX_STREAMED_REQUEST_SIZE_BYTES` when they take the streamed path.
 
 ```shell
 source .env
@@ -1034,6 +1107,21 @@ request bodies read without error. The `mode` label is `streamed` or
 one of the buffered reasons in [Request Body Handling](#request-body-handling).
 All label combinations are emitted at zero on startup. The request span records
 `request.body.mode` and `request.body.reason`. Shadow replays are not counted.
+
+`nvcf_ai_api_gateway_request_body_large_total` counts primary model API
+requests rejected because the body is over its limit, and streamed requests
+whose body ended above the buffered limit. The `outcome` label is
+`rejected_unread` when the declared `Content-Length` is over the limit and no
+body byte is read, `rejected_buffered` when the body passes the buffered limit
+while the gateway reads it in full or a declared length between the limits
+falls back to the buffered path, `rejected_streamed` when it passes the
+streamed limit after a streamed request was dispatched, and
+`streamed_complete` when a streamed request body reached its end above the
+buffered limit, counted once per request. The `size` label is the declared
+`Content-Length` range: `le_32MiB`, `le_64MiB`, `le_128MiB`, `gt_128MiB`, or
+`unknown` when the client sent no `Content-Length`. Ranges do not overlap, so a
+40 MiB body counts only as `le_64MiB`. All label combinations are emitted at
+zero on startup. Shadow replays are not counted.
 
 `nvcf_ai_api_gateway_private_model_lookups_total` counts private model access
 lookups. The `result` label is `authorized`, `unauthenticated`, `forbidden`,

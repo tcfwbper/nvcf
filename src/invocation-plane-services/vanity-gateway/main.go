@@ -93,16 +93,18 @@ func loadConfig(cmd *cobra.Command, cfgFile string) (gateway.Config, error) {
 	cmd.Flags().VisitAll(func(flag *pflag.Flag) {
 		v.MustBindEnv(flag.Name)
 	})
-	if value, set := os.LookupEnv("MAX_REQUEST_SIZE_BYTES"); set && value == "" {
-		return gateway.Config{}, fmt.Errorf("MAX_REQUEST_SIZE_BYTES must be a positive integer in bytes")
-	}
-	if v.IsSet("MAX_REQUEST_SIZE_BYTES") {
-		limit, err := strconv.ParseInt(v.GetString("MAX_REQUEST_SIZE_BYTES"), 10, 64)
-		if err != nil {
-			return gateway.Config{}, fmt.Errorf("MAX_REQUEST_SIZE_BYTES must be a positive integer in bytes: %w", err)
+	for _, name := range []string{"MAX_REQUEST_SIZE_BYTES", "MAX_STREAMED_REQUEST_SIZE_BYTES"} {
+		if value, set := os.LookupEnv(name); set && value == "" {
+			return gateway.Config{}, fmt.Errorf("%s must be a positive integer in bytes", name)
 		}
-		// The config decoder reads a string with a leading zero as octal.
-		v.Set("MAX_REQUEST_SIZE_BYTES", limit)
+		if v.IsSet(name) {
+			limit, err := strconv.ParseInt(v.GetString(name), 10, 64)
+			if err != nil {
+				return gateway.Config{}, fmt.Errorf("%s must be a positive integer in bytes: %w", name, err)
+			}
+			// The config decoder reads a string with a leading zero as octal.
+			v.Set(name, limit)
+		}
 	}
 	c := gateway.Config{}
 	if err := v.Unmarshal(&c); err != nil {

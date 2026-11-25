@@ -592,6 +592,10 @@ addons:
       llmGatewayEndpoint: http://llm-api-gateway.nvcf.svc.cluster.local:8080
       # Model API request body limit in bytes (25 MiB). Must be positive.
       maxRequestSizeBytes: 26214400
+      # Optional larger limit for model API requests forwarded as they arrive.
+      # Unset means equal to maxRequestSizeBytes. Set it only with a chart
+      # that has vanityGateway.config.maxStreamedRequestSizeBytes.
+      # maxStreamedRequestSizeBytes: 67108864
       # Empty by default because the Vanity Gateway chart does not create Vault
       # Agent injection. Set this only when another component mounts the secrets
       # file into the pod.

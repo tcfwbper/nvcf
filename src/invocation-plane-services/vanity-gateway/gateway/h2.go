@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -61,6 +62,10 @@ func buildRouter(mappings *config.GatewayConfig, serverConfig Config) (*router.S
 // handles this via WithPostLoadFunc on both initial load and reload).
 func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux, error) {
 	maxRequestSize, err := serverConfig.requestSizeLimit()
+	if err != nil {
+		return nil, err
+	}
+	maxStreamedRequestSize, err := serverConfig.streamedRequestSizeLimit()
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +117,7 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 		return nil, err
 	}
 	modelDirector.requestBodyLimit = maxRequestSize
+	modelDirector.streamedRequestBodyLimit = maxStreamedRequestSize
 	if serverConfig.NvcfControlPlaneEndpoint != "" {
 		modelDirector.privateModels, err = sharedPrivateModelAccess(serverConfig.NvcfControlPlaneEndpoint, transport)
 		if err != nil {
@@ -154,10 +160,66 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 func createHttp2Server(addr string, swappableRouter *router.SwappableRouter) *http.Server {
 	return &http.Server{
 		Addr: addr,
-		Handler: h2c.NewHandler(swappableRouter, &http2.Server{
+		Handler: ignoreH2CUpgradeWithBody(h2c.NewHandler(swappableRouter, &http2.Server{
 			MaxConcurrentStreams: math.MaxInt32,
-		}),
+		})),
 	}
+}
+
+// ignoreH2CUpgradeWithBody serves an HTTP/1 request that has a body and asks
+// for an h2c upgrade over HTTP/1.1, as a server may when it ignores Upgrade.
+// The h2c handler reads such a body in full before the router runs, so model
+// routes could neither bound nor stream it. Requests without a body still
+// upgrade, and HTTP/2 with prior knowledge is unchanged.
+func ignoreH2CUpgradeWithBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength != 0 && headerHasToken(r.Header, "Upgrade", "h2c") {
+			removeH2CUpgrade(r.Header)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// removeH2CUpgrade removes the h2c upgrade request from h: the h2c Upgrade
+// token, the HTTP2-Settings header and the Connection tokens that name them.
+// Other Upgrade tokens are kept.
+func removeH2CUpgrade(h http.Header) {
+	h.Del("HTTP2-Settings")
+	removeHeaderToken(h, "Connection", "HTTP2-Settings")
+	if removeHeaderToken(h, "Upgrade", "h2c") == 0 {
+		removeHeaderToken(h, "Connection", "Upgrade")
+	}
+}
+
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, t := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// removeHeaderToken drops token, ignoring case, from the comma-separated
+// values of name, deletes name when no token remains, and returns the number
+// of tokens left.
+func removeHeaderToken(h http.Header, name, token string) int {
+	var kept []string
+	for _, value := range h.Values(name) {
+		for _, t := range strings.Split(value, ",") {
+			if t = strings.TrimSpace(t); t != "" && !strings.EqualFold(t, token) {
+				kept = append(kept, t)
+			}
+		}
+	}
+	if len(kept) == 0 {
+		h.Del(name)
+		return 0
+	}
+	h.Set(name, strings.Join(kept, ", "))
+	return len(kept)
 }
 
 // general pass-through vanity domains
@@ -191,16 +253,16 @@ func registerVanity(hostRouter *middleware.HostRouter, mappings *config.GatewayC
 func registerModelAPIs(hostRouter *middleware.HostRouter, mappings *config.GatewayConfig, modelDirector *ModelDirector, healthManager *health.Health, serverTelemetry func(http.Handler) http.Handler, maxRequestSize int64) {
 	r := chi.NewRouter()
 	r.Use(serverTelemetry)
-	r.Method(http.MethodPost, "/v1/chat/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeChatCompletions)))
-	r.Method(http.MethodPost, "/v1/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeCompletions)))
-	r.Method(http.MethodPost, "/v1/embeddings", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeEmbeddings)))
-	r.Method(http.MethodPost, "/v1/messages", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeMessages)))
-	r.Method(http.MethodPost, decisionsPath, chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeDecisions)))
-	r.Method(http.MethodPost, systemOnePath, chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeSystemOne)))
-	r.Method(http.MethodPost, "/v1/responses", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeResponses)))
-	r.Method(http.MethodPost, "/v1/images/generations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageGenerations)))
-	r.Method(http.MethodPost, "/v1/images/edits", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageEdits)))
-	r.Method(http.MethodPost, "/v1/images/variations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageVariations)))
+	r.Method(http.MethodPost, "/v1/chat/completions", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeChatCompletions)))
+	r.Method(http.MethodPost, "/v1/completions", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeCompletions)))
+	r.Method(http.MethodPost, "/v1/embeddings", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeEmbeddings)))
+	r.Method(http.MethodPost, "/v1/messages", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeMessages)))
+	r.Method(http.MethodPost, decisionsPath, limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeDecisions)))
+	r.Method(http.MethodPost, systemOnePath, limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeSystemOne)))
+	r.Method(http.MethodPost, "/v1/responses", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeResponses)))
+	r.Method(http.MethodPost, "/v1/images/generations", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageGenerations)))
+	r.Method(http.MethodPost, "/v1/images/edits", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageEdits)))
+	r.Method(http.MethodPost, "/v1/images/variations", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageVariations)))
 	r.Get("/v1/models", modelDirector.ListModels)
 	r.Get("/v1/models/{model}", modelDirector.GetModel)
 	r.Get("/v1/models/{company}/{model}", modelDirector.GetModel)

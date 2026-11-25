@@ -139,6 +139,12 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 9223372036854775807
+            },
+            "maxStreamedRequestSizeBytes": {
+              "description": "Maximum body size in bytes for model API requests forwarded as they arrive. Unset or null means equal to maxRequestSizeBytes.",
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 9223372036854775807
             }
           },
           "required": ["maxRequestSizeBytes"],

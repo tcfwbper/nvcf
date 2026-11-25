@@ -193,13 +193,10 @@ func writeClientClosedRequest(writer http.ResponseWriter, request *http.Request,
 // before dispatch. The upstream sees an incomplete body, never a truncated
 // complete one.
 func writeRequestTooLargeAfterDispatch(writer http.ResponseWriter, request *http.Request, maxBytesErr *http.MaxBytesError) {
+	rejection := streamedRequestRejection(request)
+	rejection.outcome, rejection.limit = requestBodyRejectedStreamed, maxBytesErr.Limit
+	recordRequestBodyRejected(request, rejection)
 	markGatewayRejected(writer, request)
-	zap.L().Debug("request body exceeded limit after dispatch", append(
-		middleware.TraceFields(request.Context()),
-		zap.String("request_id", request.Header.Get(middleware.RequestIDHeader)),
-		zap.String("function_id", request.Header.Get("function-id")),
-		zap.Int64("limit_bytes", maxBytesErr.Limit),
-	)...)
 	// The client's route, not the outgoing path, picks the error shape, as it
 	// does when the limit is reached before dispatch.
 	if protocol := requestProtocol(request); protocol != nativeProtocolNone {
@@ -207,7 +204,7 @@ func writeRequestTooLargeAfterDispatch(writer http.ResponseWriter, request *http
 		writeNativeError(writer, request, status, kind, message)
 		return
 	}
-	writeOpenAIRequestTooLarge(writer, maxBytesErr)
+	writeOpenAIRequestTooLarge(writer, maxBytesErr, "")
 }
 
 func writeBadGatewayProblem(writer http.ResponseWriter, request *http.Request, err error) {

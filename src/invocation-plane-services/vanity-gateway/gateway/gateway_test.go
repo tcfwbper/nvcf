@@ -18,6 +18,7 @@ limitations under the License.
 package gateway
 
 import (
+	config "ai-api-gateway-service/gateway_config"
 	"testing"
 	"time"
 
@@ -51,5 +52,41 @@ func TestRequestSizeLimitRejectsNonPositiveConfig(t *testing.T) {
 		service, err := NewNVCFGateway(nil, cfg)
 		require.Nil(t, service)
 		require.ErrorContains(t, err, "MAX_REQUEST_SIZE_BYTES")
+	}
+}
+
+func TestStreamedRequestSizeLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		buffered *int64
+		streamed *int64
+		want     int64
+		wantErr  string
+	}{
+		{name: "unset follows the default buffered limit", want: defaultMaxRequestSize},
+		{name: "unset follows a set buffered limit", buffered: int64Ptr(1024), want: 1024},
+		{name: "equal to the buffered limit", buffered: int64Ptr(1024), streamed: int64Ptr(1024), want: 1024},
+		{name: "above the buffered limit", streamed: int64Ptr(64 << 20), want: 64 << 20},
+		{name: "above a buffered limit equal to the prefix size", buffered: int64Ptr(requestPrefixLimit), streamed: int64Ptr(requestPrefixLimit + 1), want: requestPrefixLimit + 1},
+		{name: "zero", streamed: int64Ptr(0), wantErr: "MAX_STREAMED_REQUEST_SIZE_BYTES must be a positive integer in bytes"},
+		{name: "negative", streamed: int64Ptr(-1), wantErr: "MAX_STREAMED_REQUEST_SIZE_BYTES must be a positive integer in bytes"},
+		{name: "below the buffered limit", streamed: int64Ptr(defaultMaxRequestSize - 1), wantErr: "MAX_STREAMED_REQUEST_SIZE_BYTES must not be below MAX_REQUEST_SIZE_BYTES"},
+		{name: "above a buffered limit under the prefix size", buffered: int64Ptr(requestPrefixLimit - 1), streamed: int64Ptr(requestPrefixLimit), wantErr: "MAX_STREAMED_REQUEST_SIZE_BYTES can exceed MAX_REQUEST_SIZE_BYTES only when MAX_REQUEST_SIZE_BYTES is at least 65536"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{MaxRequestSizeBytes: tc.buffered, MaxStreamedRequestSizeBytes: tc.streamed}
+			got, err := cfg.streamedRequestSizeLimit()
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				service, err := NewNVCFGateway(nil, cfg)
+				require.Nil(t, service)
+				require.ErrorContains(t, err, "MAX_STREAMED_REQUEST_SIZE_BYTES")
+				_, err = buildChiMux(&config.GatewayConfig{}, cfg)
+				require.ErrorContains(t, err, "MAX_STREAMED_REQUEST_SIZE_BYTES")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
 	}
 }

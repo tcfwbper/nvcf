@@ -89,6 +89,10 @@ type ModelDirector struct {
 	// Content-Length exceeds it is rejected before any body byte is read.
 	// Shadow replays are exempt. Zero means unknown.
 	requestBodyLimit int64
+	// streamedRequestBodyLimit is the body limit once a request takes the
+	// streamed path. It is at least requestBodyLimit. Zero means it equals
+	// requestBodyLimit.
+	streamedRequestBodyLimit int64
 
 	// Private models are listed only for callers whose API key may access the
 	// function version they route to. privateModels is nil when private model
@@ -821,6 +825,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 	}
 	body, bodyMode, err := d.readModelRequestBody(request, modelToNVCFUrl)
 	if err != nil {
+		recordBodyLimitBeforeDispatch(request, body, bodyMode, modelToNVCFUrl, err)
 		markGatewayRejected(writer, request)
 		if protocol := requestProtocol(request); protocol != nativeProtocolNone {
 			status, kind, message := requestReadFailure(protocol, err)
@@ -829,7 +834,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 		}
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeOpenAIRequestTooLarge(writer, maxBytesErr)
+			writeOpenAIRequestTooLarge(writer, maxBytesErr, bodyLimitHint(err))
 			return resolvedOpenAIRequest{}, true
 		}
 		if errors.Is(err, errInvalidJSONBody) {
@@ -871,6 +876,11 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 	}
 	middleware.SetPreUpstreamModel(request.Context(), nvcfUrl.publicModelName)
 	middleware.AddOpenAIRequestMetricAttributes(request.Context(), body.Model, nvcfUrl.functionId)
+	if bodyMode.mode == requestBodyModeStreamed {
+		// The body can still pass the limit after dispatch; the proxy error
+		// handler logs that with the route.
+		request = withStreamedRequestRoute(request, body.Model, nvcfUrl.functionId)
+	}
 
 	statusHandled := writeFunctionStatusError(writer, request, nvcfUrl.offlineMessage, nvcfUrl.eol, body.Model)
 	if statusHandled {
@@ -1121,15 +1131,20 @@ func (d *ModelDirector) proxyResolvedRequest(writer http.ResponseWriter, resolve
 
 // writeOpenAIRequestTooLarge writes the OpenAI-shaped response for a body
 // over the route limit. The forwarding path uses it too, when the limit is
-// reached after the request was dispatched but before any response.
-func writeOpenAIRequestTooLarge(writer http.ResponseWriter, maxBytesErr *http.MaxBytesError) {
+// reached after the request was dispatched but before any response. A
+// non-empty hint is appended to the message.
+func writeOpenAIRequestTooLarge(writer http.ResponseWriter, maxBytesErr *http.MaxBytesError, hint string) {
 	writer.WriteHeader(http.StatusBadRequest)
+	message := fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
+		"If larger assets are required please refer to our Assets API.", maxBytesErr.Limit)
+	if hint != "" {
+		message += " " + hint
+	}
 	errorMessage := OpenAIError{
 		Error: CustomOpenAIError{
-			Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
-				"If larger assets are required please refer to our Assets API.", maxBytesErr.Limit),
-			Type: "invalid_request_error",
-			Code: "invalid_image_format",
+			Message: message,
+			Type:    "invalid_request_error",
+			Code:    "invalid_image_format",
 		},
 	}
 	if err := json.NewEncoder(writer).Encode(errorMessage); err != nil {
@@ -1379,6 +1394,9 @@ func requestReadFailure(protocol nativeProtocol, err error) (int, string, string
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
 		status, kind, message = http.StatusRequestEntityTooLarge, "", fmt.Sprintf("request body is too large (limit %d bytes)", maxBytesErr.Limit)
+		if hint := bodyLimitHint(err); hint != "" {
+			message += ". " + hint
+		}
 	}
 	if errors.Is(err, errModelFieldMissing) {
 		kind, message = errKindInvalidRequest, "model field is required"

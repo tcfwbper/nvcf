@@ -113,6 +113,13 @@ func heapObjectBytes(sample []metrics.Sample) uint64 {
 // buffers.
 func profileRequestBodies(t testing.TB, scenario profileScenario, size, concurrency int) profileResult {
 	t.Helper()
+	return profileRequestBodiesWithLimits(t, scenario, size, concurrency, 64<<20, 64<<20)
+}
+
+// profileRequestBodiesWithLimits is profileRequestBodies with the buffered
+// and streamed body limits given.
+func profileRequestBodiesWithLimits(t testing.TB, scenario profileScenario, size, concurrency int, limit, streamedLimit int64) profileResult {
+	t.Helper()
 	var (
 		arrivedMu sync.Mutex
 		arrived   int
@@ -152,7 +159,7 @@ func profileRequestBodies(t testing.TB, scenario profileScenario, size, concurre
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
 	})
-	_, handler := newPrefixTestDirector(t, 64<<20, transport)
+	_, handler := newPrefixTestDirectorWithStreamedLimit(t, limit, streamedLimit, transport)
 
 	runtime.GC()
 	runtime.GC()
@@ -224,6 +231,12 @@ func TestRequestBodyLiveHeapStaysBoundedWhenStreamed(t *testing.T) {
 	// The buffered path holds each body until the upstream finishes reading
 	// it. Allow for buffer sizing differences below one body per request.
 	assert.GreaterOrEqual(t, buffered.liveHeapBytes, uint64(size*concurrency*3/4), "buffered live heap %s MiB", mib(buffered.liveHeapBytes))
+
+	// A streamed body four times the buffered limit passes under a larger
+	// streamed limit and keeps the same bound.
+	const bufferedLimit = size / 4
+	aboveBuffered := profileRequestBodiesWithLimits(t, profileScenarios[0], size, concurrency, bufferedLimit, 64<<20)
+	assert.Less(t, aboveBuffered.liveHeapBytes, uint64(size), "streamed above the buffered limit: live heap %s MiB", mib(aboveBuffered.liveHeapBytes))
 }
 
 // TestRequestBodyMemoryProfile prints allocation and heap measurements for

@@ -2433,3 +2433,42 @@ func TestStartupRejectsInvalidRequestSizeConfigFile(t *testing.T) {
 		})
 	}
 }
+
+func TestStartupReadsStreamedRequestSizeLimitAsDecimal(t *testing.T) {
+	t.Setenv("MAX_STREAMED_REQUEST_SIZE_BYTES", "067108864")
+	cmd := &cobra.Command{Use: "gateway"}
+	registerConfigFlags(cmd)
+	cfg, err := loadConfig(cmd, "")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.MaxStreamedRequestSizeBytes)
+	require.Equal(t, int64(67108864), *cfg.MaxStreamedRequestSizeBytes)
+}
+
+func TestStartupRejectsInvalidStreamedRequestSizeLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		buffered string
+		streamed string
+	}{
+		{"empty", "", ""},
+		{"zero", "", "0"},
+		{"negative", "", "-1"},
+		{"fraction", "", "1.5"},
+		{"unit suffix", "", "64MiB"},
+		{"not a number", "", "nope"},
+		{"int64 overflow", "", "9223372036854775808"},
+		{"below the default buffered limit", "", "26214399"},
+		{"below a set buffered limit", "67108864", "67108863"},
+		{"above a buffered limit under the prefix size", "1024", "2048"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.buffered != "" {
+				t.Setenv("MAX_REQUEST_SIZE_BYTES", tc.buffered)
+			}
+			t.Setenv("MAX_STREAMED_REQUEST_SIZE_BYTES", tc.streamed)
+			cmd := NewRootCommand(nil)
+			cmd.SetArgs(nil)
+			require.ErrorContains(t, cmd.Execute(), "MAX_STREAMED_REQUEST_SIZE_BYTES")
+		})
+	}
+}
