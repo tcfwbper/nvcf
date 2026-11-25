@@ -1,0 +1,32 @@
+---
+title: NVCF 1.1.1
+tags: [self-managed, compute-plane, observability]
+---
+
+## NVCF 1.1.1
+
+NVCF 1.1.1 is a patch release. It selects Self-Managed 1.1.9, Compute Plane
+1.1.1, and Observability 1.1.0. The
+[artifact manifest](../../docs/overview/manifest.md) records the selected
+artifacts. Download the product archive and checksums from the
+[NVCF 1.1.1 release](https://github.com/dsx-ai-factory/nvcf/releases/tag/nvcf/1.1.1),
+then follow [Consume an NVCF release](../../docs/overview/umbrella-releases.md).
+
+What is new:
+
+- Fixes the emSign CA issue (CVE-2026-111943).
+- Adds the optional worker callback proxy for multi-cluster installs. It is off
+  by default.
+- Moves OpenBao to a versioned JWT plugin lifecycle.
+- Includes high availability resilience improvements (HA phase 2).
+- Rebuilds component images with Go 1.26.10 and the patched CA bundle.
+
+NVCF 1.0.4 is the upgrade stop for every customer on a 1.0.x release. To reach
+NVCF 1.1.1, use the
+[1.0.4 to 1.1.1 upgrade](../../docs/overview/release-notes/1.0.4-to-1.1.1-upgrade.md)
+or, from NVCF 1.1.0, the
+[1.1.0 to 1.1.1 upgrade](../../docs/overview/release-notes/1.1.0-to-1.1.1-upgrade.md).
+
+Observability is supported on a single cluster and on the control-plane cluster
+of a split deployment. Collecting compute-plane metrics across clusters in a
+multi-cluster AWS deployment is experimental and has not been qualified.
