@@ -73,13 +73,26 @@ Labels:
   or install the bundle version its checkpoint recorded (the placeholder is
   deleted; its checkpoint is blocked, and the replacement starts cold, only
   when no node has the version: see
-  [VERSIONED-NODE-BUNDLE.md](../design/VERSIONED-NODE-BUNDLE.md)); and two
+  [VERSIONED-NODE-BUNDLE.md](../design/VERSIONED-NODE-BUNDLE.md)); and three
   that are the workload's own doing, not a fault of nvsnap's:
   `workload_exited` (the container's process had ended when its dump failed:
   it is gone, or a later process holds its pid; `internal/agent/checkpoint_v2.go`
   `dumpV2`, `workload_exited.go` `dumpFailure`) and `no_gpu_process` (a pod of
   a multi-node instance had no process on the GPU under the gpushare library
-  to capture).
+  to capture), and `modelexpress_version` (the workload loads its weights
+  through a ModelExpress older than 0.7, which cannot release its state for
+  a capture; it is not captured until it updates ModelExpress). A
+  `workload_exited` also covers a GPU tool that ended with the workload:
+  it runs in the workload's pid namespace, so the workload's exit kills it
+  (`workload_exited.go` `toolLostWorkload`). Two classes are of a capture
+  that left its workload running and broke it: `gpu_xid` (the node's kernel
+  logged Xid 137 on the workload's GPUs during the capture,
+  `internal/agent/kmsg.go`) and `resume_stalled` (the workload did not run
+  again after its resume, `internal/agent/resume_guard.go`). Today only the
+  API's leave-running captures run these checks. These captures are not
+  counted in `nvsnap_capture_outcomes_total`, so the two classes show up
+  in their errors and the agent's log only. They are nvsnap's doing, and
+  the capture alert does not exclude them.
 - `source`: where a checkpoint fetched to a node came from: `rails`, `peer`,
   `fsstore`, `volume` (`unknown` for a fetch that found no source). A
   checkpoint already on the node is no fetch.

@@ -110,9 +110,10 @@ groups:
   - name: nvsnap.captures
     rules:
       - alert: NvsnapCaptureFailed
-        # workload_exited and no_gpu_process are the workload's own doing
-        # (it ended during the capture, or had nothing on the GPU).
-        expr: sum by (outcome, reason, gpu, ranks) (increase(nvsnap_capture_outcomes_total{outcome=~"failed|gpushare-failed|unverified", reason!~"workload_exited|no_gpu_process"}[1h])) > 0
+        # workload_exited, no_gpu_process and modelexpress_version are the
+        # workload's own doing (it ended during the capture, had nothing on
+        # the GPU, or runs a ModelExpress older than 0.7).
+        expr: sum by (outcome, reason, gpu, ranks) (increase(nvsnap_capture_outcomes_total{outcome=~"failed|gpushare-failed|unverified", reason!~"workload_exited|no_gpu_process|modelexpress_version"}[1h])) > 0
         labels:
           severity: info
           service: nvsnap

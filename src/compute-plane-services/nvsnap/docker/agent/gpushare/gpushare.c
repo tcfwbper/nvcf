@@ -23,7 +23,11 @@ SPDX-License-Identifier: Apache-2.0
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <link.h>
 #include <linux/kcmp.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -668,7 +672,10 @@ static int peer_ok(int s, int pid)
     return 0;
 }
 
-/* One request/reply to another process's control thread. */
+/* One request/reply to another process's control thread. Each control
+ * thread serves one request at a time, so every step is bounded:
+ * SO_SNDTIMEO also bounds connect(), which otherwise waits forever once the
+ * peer's accept queue is full. */
 static int request(int pid, const char *txt, int fd_in, char *reply, size_t n, int *fd_out)
 {
     struct sockaddr_un a;
@@ -676,6 +683,7 @@ static int request(int pid, const char *txt, int fd_in, char *reply, size_t n, i
     int s = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     struct timeval tv = { 30, 0 };
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     int rc = (s >= 0 && connect(s, (struct sockaddr *)&a, len) == 0 && peer_ok(s, pid) &&
               msg_send(s, txt, fd_in) == 0 && msg_recv(s, reply, n, fd_out) == 0) ? 0 : -1;
     if (s >= 0) close(s);
@@ -857,6 +865,10 @@ static pthread_mutex_t sync_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sync_cv = PTHREAD_COND_INITIALIZER;
 static int sync_running, sync_done;
 static CUresult sync_res;
+/* Bumped when a launch passes a closed launch gate ("step") and returns:
+ * a sync started before then may not cover that launch. */
+static unsigned long launch_gen;
+static unsigned long sync_gen;  /* launch_gen when the running sync started */
 
 static void wc_thread_init(void);
 
@@ -873,7 +885,11 @@ static void *sync_main(void *arg)
     return arg;
 }
 
-static int timed_sync(int ms, CUresult *r)
+/* A finished result is used while no launch has gone through since its
+ * sync started ("poll"). fresh ("quiesce"): only a sync that starts now
+ * counts, since copies and memsets do not bump launch_gen; bumping it here
+ * makes an earlier result, or a sync still running, stale. */
+static int timed_sync(int ms, CUresult *r, int fresh)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -881,15 +897,22 @@ static int timed_sync(int ms, CUresult *r)
     ts.tv_nsec += (ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     pthread_mutex_lock(&sync_mu);
-    if (!sync_running) {
-        pthread_t t;
+    int done;
+    if (fresh) __atomic_add_fetch(&launch_gen, 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        if (!sync_running && !sync_done) {
+            pthread_t t;
+            sync_gen = __atomic_load_n(&launch_gen, __ATOMIC_SEQ_CST);
+            sync_running = pthread_create(&t, NULL, sync_main, NULL) == 0;
+            if (sync_running) pthread_detach(t);
+            else { sync_done = 1; sync_res = CUDA_ERROR_OPERATING_SYSTEM; }
+        }
+        while (!sync_done && pthread_cond_timedwait(&sync_cv, &sync_mu, &ts) == 0) {}
+        done = sync_done;
+        /* A launch went through after this sync started: sync again. */
+        if (!done || sync_gen == __atomic_load_n(&launch_gen, __ATOMIC_SEQ_CST)) break;
         sync_done = 0;
-        sync_running = pthread_create(&t, NULL, sync_main, NULL) == 0;
-        if (sync_running) pthread_detach(t);
-        else { sync_done = 1; sync_res = CUDA_ERROR_OPERATING_SYSTEM; }
     }
-    while (!sync_done && pthread_cond_timedwait(&sync_cv, &sync_mu, &ts) == 0) {}
-    int done = sync_done;
     if (done) { *r = sync_res; sync_done = 0; }
     pthread_mutex_unlock(&sync_mu);
     return done ? 0 : -1;
@@ -911,7 +934,7 @@ static int n_legacy;  /* imports through the driver's own CUDA IPC */
  * memory gate (copies, memsets, stream memory operations) and drains again.
  * Copies wait for the drain to finish before they are held: NCCL's proxy
  * thread issues copies that its kernels in flight need to complete. */
-struct gate { int closed, inflight; };
+struct gate { int closed, inflight, waiting, pass; };
 static struct gate lgate, mgate;
 static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gate_cv = PTHREAD_COND_INITIALIZER;
@@ -924,12 +947,26 @@ static void gate_enter(struct gate *g)
         if (!__atomic_load_n(&g->closed, __ATOMIC_SEQ_CST)) return;
         __atomic_sub_fetch(&g->inflight, 1, __ATOMIC_SEQ_CST);
         pthread_mutex_lock(&gate_mu);
-        while (g->closed) pthread_cond_wait(&gate_cv, &gate_mu);
+        g->waiting++;
+        while (g->closed && !g->pass) pthread_cond_wait(&gate_cv, &gate_mu);
+        g->waiting--;
+        if (g->closed) {  /* let through by "step" */
+            g->pass--;
+            __atomic_add_fetch(&g->inflight, 1, __ATOMIC_SEQ_CST);
+            pthread_mutex_unlock(&gate_mu);
+            return;
+        }
         pthread_mutex_unlock(&gate_mu);
     }
 }
 
-static void gate_exit(struct gate *g) { __atomic_sub_fetch(&g->inflight, 1, __ATOMIC_SEQ_CST); }
+static void gate_exit(struct gate *g)
+{
+    /* A launch that ran with the gate closed (let through, or already past
+     * it when it closed): a sync must start after it to cover it. */
+    if (__atomic_load_n(&g->closed, __ATOMIC_SEQ_CST)) __atomic_add_fetch(&launch_gen, 1, __ATOMIC_SEQ_CST);
+    __atomic_sub_fetch(&g->inflight, 1, __ATOMIC_SEQ_CST);
+}
 
 /* Close the gate and wait for calls already past it. */
 static int gate_close(struct gate *g, int ms)
@@ -939,13 +976,44 @@ static int gate_close(struct gate *g, int ms)
     return __atomic_load_n(&g->inflight, __ATOMIC_SEQ_CST) ? -1 : 0;
 }
 
-/* Open both gates. */
+static void ibv_unfence(void);
+
+/* Set for good by a "release" that NCCL's verbs refused after the fence
+ * (libnvsnap_ibv's nvsnap_ibv_doomed): every rank fenced, so the others
+ * may be destroying their queue pairs, and this one's are not re-created
+ * by a rollback (it released nothing). The process must not run again:
+ * its gates stay closed, and every command that would let it run answers
+ * DOOMED_REPLY (the tool's rollback fails, and the workload is replaced). */
+static int ibv_doomed_here;
+/* The last "quiesce" fenced NCCL's verbs, and nothing has let them run
+ * since (ibv_unfence) or released them. A "release" that then cannot even
+ * take the state lock leaves this process as one that refused its release
+ * after the fence (do_release). Only the control thread touches both. */
+static int ibv_fenced_here;
+#define DOOMED_REPLY "err this process refused its RDMA release after its peers were fenced; " \
+                     "it cannot run again (replace it)"
+
+/* mu held: 1 (reply set, mu released) once a release was refused so. */
+static int refuse_doomed(char *reply, size_t n)
+{
+    if (!ibv_doomed_here) return 0;
+    snprintf(reply, n, DOOMED_REPLY);
+    pthread_mutex_unlock(&mu);
+    return 1;
+}
+
+/* Open both gates, and NCCL's verbs if a "quiesce" left them held. Never
+ * after a refused release (ibv_doomed_here). */
 static void gate_open(void)
 {
+    if (ibv_doomed_here) return;
     pthread_mutex_lock(&gate_mu);
     lgate.closed = mgate.closed = 0;
+    lgate.pass = mgate.pass = 0;
+    __atomic_add_fetch(&launch_gen, 1, __ATOMIC_SEQ_CST);  /* syncs running now miss what launches next */
     pthread_cond_broadcast(&gate_cv);
     pthread_mutex_unlock(&gate_mu);
+    ibv_unfence();
 }
 
 static int held;  /* "resume hold" left the gates closed for "open" */
@@ -1116,19 +1184,267 @@ static void do_touch(char *reply, size_t n, const char *args)
                   (long long)w.tv_sec, w.tv_nsec / 1000000);
 }
 
+/* Catching up to a consistent point. Holding every rank's launches at
+ * one instant still catches ranks at different places: a rank ahead has
+ * launched a collective that waits for the same collective on a rank
+ * behind, which the gate holds, so no drain finishes. "hold" closes the
+ * launch gate (the memory gate stays open: NCCL's proxy copies serve the
+ * kernels in flight). "poll" says whether this process's GPU work has
+ * drained. "step", on a drained process, lets one held launch through.
+ * The tool steps the drained ranks while any rank is busy, one launch at
+ * a time, so the ranks behind catch up and none passes the ones ahead;
+ * once every rank has drained at once, "quiesce" finishes. */
+static void hold_launches(void)
+{
+    pthread_mutex_lock(&gate_mu);
+    __atomic_store_n(&lgate.closed, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&mgate.closed, 0, __ATOMIC_SEQ_CST);  /* after a "quiesce": back to holding launches only */
+    mgate.pass = 0;
+    pthread_cond_broadcast(&gate_cv);
+    pthread_mutex_unlock(&gate_mu);
+    ibv_unfence();  /* the kernels let through by "step" need NCCL's sends */
+}
+
+static void do_hold(char *reply, size_t n)
+{
+    if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
+    held = 0;  /* an "open" from a restore is no longer due */
+    hold_launches();
+    snprintf(reply, n, "ok held");
+    pthread_mutex_unlock(&mu);
+}
+
+/* Drained: no launch is in a launch call and a sync started after the
+ * last one finished within ms. -1 on a sync error (r). */
+static int drained(int ms, CUresult *r)
+{
+    *r = CUDA_SUCCESS;
+    /* A launch let through by "step" and not taken yet still goes to the
+     * GPU: not drained until it has. One taken moves its permit to the
+     * launches in flight under gate_mu: read both there, so one taken
+     * between two reads is not missed. With the permit gone no launch can
+     * pass the closed gate until the next "step", which needs the state
+     * lock the caller holds. */
+    pthread_mutex_lock(&gate_mu);
+    int busy = lgate.pass || __atomic_load_n(&lgate.inflight, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&gate_mu);
+    if (busy) return 0;
+    if (timed_sync(ms, r, 0) < 0) return 0;
+    return *r == CUDA_SUCCESS ? 1 : -1;
+}
+
+/* "poll": "ok idle <launches held>" or "ok busy". "step": the same, and
+ * on an idle process with launches held, lets one through and waits for
+ * its launch call to return: "ok stepped". */
+static void do_poll(char *reply, size_t n, int step)
+{
+    if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
+    CUresult r;
+    int d = lgate.closed ? drained(step ? 20 : 2, &r) : -2;
+    pthread_mutex_lock(&gate_mu);
+    int waiting = lgate.waiting;
+    if (d == 1 && step && waiting) lgate.pass = 1, pthread_cond_broadcast(&gate_cv);
+    pthread_mutex_unlock(&gate_mu);
+    pthread_mutex_unlock(&mu);
+    if (d == -2) snprintf(reply, n, "err not held");
+    else if (d < 0) snprintf(reply, n, "err synchronize: %s", errstr(r));
+    else if (!d) snprintf(reply, n, "ok busy");
+    else if (!step || !waiting) snprintf(reply, n, "ok idle %d", waiting);
+    else {
+        /* Wait for the launch to be taken and its call to return (it may
+         * block while the launch queue is full: then a poll says busy). */
+        for (int i = 0; i < 1000; i++) {
+            pthread_mutex_lock(&gate_mu);
+            int taken = !lgate.pass;
+            pthread_mutex_unlock(&gate_mu);
+            if (taken && !__atomic_load_n(&lgate.inflight, __ATOMIC_SEQ_CST)) break;
+            usleep(1000);
+        }
+        snprintf(reply, n, "ok stepped");
+    }
+}
+
+/* ── NCCL's verbs ─────────────────────────────────────────────────────
+ * With NCCL_IBVERBS_LIB naming libnvsnap_ibv.so, NCCL's RDMA devices,
+ * queue pairs and registrations are destroyed at "release" and created
+ * again at "load", on the NICs the process has then; "quiesce" first
+ * lets every send NCCL posted complete, and holds NCCL's verbs calls until
+ * "release" (or until the process runs again without one: ibv_unfence);
+ * "fabmap" adds their
+ * new numbers to the exchange and "remap" reconnects them (see
+ * nvsnap_ibv.c). */
+static struct {
+    int (*fence)(char *, size_t), (*suspend)(char *, size_t), (*restore)(char *, size_t), (*map)(FILE *);
+    int (*connect)(const char *, char *, size_t), (*count)(void), (*fds)(int *, int);
+    void (*open)(void);
+    int (*doomed)(void), (*doom_if_fenced)(void);
+} ibv;
+
+/* NCCL's RDMA devices open through libnvsnap_ibv (0: none, or not loaded). */
+static int ibv_devices(void);
+
+/* A "quiesce" leaves NCCL's verbs calls held until "release" (see
+ * nvsnap_ibv_fence): every path that lets the app run again without a
+ * release lets them run too. Nothing after a release (the library keeps
+ * them held until its objects are back). */
+static void ibv_unfence(void)
+{
+    if (ibv_doomed_here) return;
+    ibv_fenced_here = 0;
+    if (ibv_devices() > 0) ibv.open();
+}
+
+static int ibv_devices(void)
+{
+    if (!ibv.count) {
+        static pthread_once_t once = PTHREAD_ONCE_INIT;
+        pthread_once(&once, init_real_dlsym);  /* a pause can come first */
+        void *h = dlopen("libnvsnap_ibv.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) return 0;
+        *(void **)&ibv.fence = real_dlsym(h, "nvsnap_ibv_fence");
+        *(void **)&ibv.suspend = real_dlsym(h, "nvsnap_ibv_suspend");
+        *(void **)&ibv.restore = real_dlsym(h, "nvsnap_ibv_restore");
+        *(void **)&ibv.map = real_dlsym(h, "nvsnap_ibv_map");
+        *(void **)&ibv.connect = real_dlsym(h, "nvsnap_ibv_connect");
+        *(void **)&ibv.open = real_dlsym(h, "nvsnap_ibv_open");
+        if (!ibv.fence || !ibv.suspend || !ibv.restore || !ibv.map || !ibv.connect || !ibv.open) return 0;
+        /* Optional: without it, the pause checks count NCCL's files too. */
+        *(void **)&ibv.fds = real_dlsym(h, "nvsnap_ibv_fds");
+        /* Optional: without it, a refused release is not known to have
+         * come after the fence (an older library reopens NCCL's calls). */
+        *(void **)&ibv.doomed = real_dlsym(h, "nvsnap_ibv_doomed");
+        *(void **)&ibv.doom_if_fenced = real_dlsym(h, "nvsnap_ibv_doom_if_fenced");
+        *(void **)&ibv.count = real_dlsym(h, "nvsnap_ibv_count");
+        if (!ibv.count) return 0;
+    }
+    return ibv.count();
+}
+
+#ifndef GPUSHARE_RDMA_DIR
+#define GPUSHARE_RDMA_DIR "/dev/infiniband/"  /* the host tests name their own */
+#endif
+#ifndef GPUSHARE_RDMA_EVENT
+#define GPUSHARE_RDMA_EVENT "anon_inode:[infinibandevent]"  /* a verbs event file */
+#endif
+#ifndef GPUSHARE_PROC_SELF
+#define GPUSHARE_PROC_SELF "/proc/self"  /* the host tests name one that is not there */
+#endif
+
+/* RDMA device files this process has open (and verbs event files), and
+ * mappings of devices: the dump fails on any. nccl: leave out NCCL's own,
+ * which libnvsnap_ibv holds and "release" closes (nvsnap_ibv_fds): its open
+ * files, and mappings of the devices they are, which cannot be told from
+ * another user's. Another user's open file still counts, even on one of
+ * those devices. A mapping another user left of one of them after closing
+ * its file (rdma-core unmaps at close) is not seen here: the dump fails on
+ * it, and the capture rolls back as for any failed dump. */
+enum { RDMA_MAX_OWN = 64 };
+
+/* NCCL's files (nvsnap_ibv_fds) in own; 0 when there are none, or more
+ * than fit (cannot tell: count them all). */
+static int nccl_rdma_fds(int *own)
+{
+    if (ibv_devices() <= 0 || !ibv.fds) return 0;
+    int n = ibv.fds(own, RDMA_MAX_OWN);
+    return n < 0 || n > RDMA_MAX_OWN ? 0 : n;
+}
+
+/* rdma_files with the files in own[n_own] left out. -1 (errno set) when
+ * the file table or the mappings could not be read through, or a listed
+ * file could not be looked at (other than one closed meanwhile): the
+ * counts then prove nothing. */
+static int rdma_scan(int *open, int *mapped, const int *own, int n_own)
+{
+    enum { MAX_OWN = RDMA_MAX_OWN };
+    static const size_t dl = sizeof(GPUSHARE_RDMA_DIR) - 1;
+    int n_devs = 0;
+    char devs[MAX_OWN][128], p[300], l[256];
+    *open = *mapped = 0;
+    DIR *d = opendir(GPUSHARE_PROC_SELF "/fd");
+    if (!d) return -1;
+    errno = 0;
+    for (struct dirent *e; (e = readdir(d)); errno = 0) {
+        if (e->d_name[0] == '.') continue;  /* "." and ".." */
+        snprintf(p, sizeof(p), GPUSHARE_PROC_SELF "/fd/%s", e->d_name);
+        ssize_t k;
+        while ((k = readlink(p, l, sizeof(l) - 1)) < 0 && errno == EINTR) {}
+        if (k < 0 && errno == ENOENT) continue;  /* closed since it was listed */
+        if (k <= 0) {
+            int err = k < 0 ? errno : EIO;
+            closedir(d);
+            errno = err;
+            return -1;
+        }
+        l[k] = 0;
+        int dev = !strncmp(l, GPUSHARE_RDMA_DIR, dl);
+        if (!dev && strcmp(l, GPUSHARE_RDMA_EVENT)) continue;
+        int fd = atoi(e->d_name), mine = 0;
+        for (int i = 0; !mine && i < n_own; i++) mine = own[i] == fd;
+        if (!mine) { (*open)++; continue; }
+        if (!dev) continue;
+        int seen = (size_t)k >= sizeof(devs[0]);  /* too long to keep: its mappings count */
+        for (int i = 0; !seen && i < n_devs; i++) seen = !strcmp(devs[i], l);
+        if (!seen && n_devs < MAX_OWN) memcpy(devs[n_devs++], l, k + 1);
+    }
+    int e = errno;
+    closedir(d);
+    if (e) { errno = e; return -1; }
+    FILE *f = fopen(GPUSHARE_PROC_SELF "/maps", "re");
+    if (!f) return -1;
+    while (fgets(p, sizeof(p), f)) {
+        char *s = strstr(p, " " GPUSHARE_RDMA_DIR);
+        if (!s) continue;
+        s[strcspn(s, "\n")] = 0;
+        int mine = 0;
+        for (int i = 0; !mine && i < n_devs; i++) mine = !strcmp(devs[i], s + 1);
+        *mapped += !mine;
+    }
+    int bad = ferror(f);
+    fclose(f);
+    return bad ? (errno = EIO, -1) : 0;
+}
+
+/* -1 (errno set) when the scan could not finish: see rdma_scan. */
+static int rdma_files(int *open, int *mapped, int nccl)
+{
+    int own[RDMA_MAX_OWN], again[RDMA_MAX_OWN];
+    int n = nccl ? nccl_rdma_fds(own) : 0;
+    if (rdma_scan(open, mapped, own, n) < 0) return -1;
+    /* NCCL opened or closed a device meanwhile: a number in the list may
+     * have gone to another user. Count them all. */
+    if (n && (nccl_rdma_fds(again) != n || memcmp(own, again, n * sizeof(int))))
+        return rdma_scan(open, mapped, own, 0);
+    return 0;
+}
+
 /* Hold launches, drain GPU work, and check that "release" can drop every
  * shared mapping. Separate from "release" so that a busy or refusing
  * process leaves every process's mappings untouched. */
 static void do_quiesce(char *reply, size_t n)
 {
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     /* Busy: GPU work waits on work a gated thread has not launched yet
-     * (e.g. a peer's NCCL kernel). Reopen the gate; the tool retries. */
+     * (e.g. a peer's NCCL kernel). Reopen the gate; the tool retries. If
+     * "hold" held the launches, hold them again instead: the tool is
+     * catching the ranks up, and this one must not run ahead of its peers,
+     * which stay held. */
     held = 0;  /* an "open" from a restore is no longer due */
+    int holding = __atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST);
     CUresult r;
-    if (gate_close(&lgate, 2000) < 0 || timed_sync(2000, &r) < 0 ||
-        gate_close(&mgate, 2000) < 0 || timed_sync(2000, &r) < 0) {
-        gate_open();
+    /* Take back a "step" permit not used yet: no launch may pass the gate
+     * once quiesce has drained (one already let through counts as
+     * inflight, and gate_close waits for it). */
+    pthread_mutex_lock(&gate_mu);
+    lgate.closed = 1;
+    lgate.pass = mgate.pass = 0;
+    pthread_mutex_unlock(&gate_mu);
+    if (gate_close(&lgate, 2000) < 0 || timed_sync(2000, &r, 1) < 0 ||
+        gate_close(&mgate, 2000) < 0 || timed_sync(2000, &r, 1) < 0) {
+        if (holding) hold_launches();
+        else gate_open();
         snprintf(reply, n, "err busy (GPU work did not drain)");
         pthread_mutex_unlock(&mu);
         return;
@@ -1166,10 +1482,25 @@ static void do_quiesce(char *reply, size_t n)
         if (b->memh && b->memh_released && !(b->ucva = lmap_va(b->memh)))
             snprintf(reply, n, "err memory bound to a multicast object is neither held nor mapped");
     }
+    /* RDMA left in the process but NCCL's (which "release" closes) fails
+     * the dump after the workload has stopped: refuse here instead, while
+     * it can still run on. The pauses (mx, nixl) have dropped theirs. */
+    int ro, rm;
+    if (!reply[0] && rdma_files(&ro, &rm, 1) < 0)
+        snprintf(reply, n, "err cannot read this process's open files (%s): RDMA a dump cannot save was not "
+                 "looked for", strerror(errno));
+    else if (!reply[0] && (ro || rm))
+        snprintf(reply, n, "err %d RDMA device file(s) open, %d mapped, outside NCCL's verbs library: CRIU "
+                 "cannot dump them", ro, rm);
+    /* NCCL's sends complete while every peer still has its queue pairs. */
+    char fq[200];
+    if (!reply[0] && ibv_devices() > 0 && ibv.fence(fq, sizeof(fq)) < 0)
+        snprintf(reply, n, "err busy (NCCL verbs: %s)", fq + (strncmp(fq, "err ", 4) ? 0 : 4));
     if (reply[0]) gate_open();
     else {
         verify_log("quiesce");
         snprintf(reply, n, "ok quiesced");
+        ibv_fenced_here = ibv_devices() > 0;
     }
     pthread_mutex_unlock(&mu);
 }
@@ -1213,9 +1544,32 @@ static int void_export_copies(void)
  * host memory. */
 static void do_release(char *reply, size_t n, const char *args)
 {
-    if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (lock_ctl()) {
+        snprintf(reply, n, "err busy (state lock)");
+        /* After the fence, the other ranks release now: this one, which
+         * could not, must never run again (see ibv_doomed_here). Without
+         * the state lock: the library is told on its own (an older one,
+         * without the call, keeps the calls held as gpushare never opens
+         * them again). */
+        if (ibv_fenced_here && !ibv_doomed_here) {
+            if (ibv.doom_if_fenced) ibv.doom_if_fenced();
+            ibv_doomed_here = 1;
+            logf_("release: the state lock is busy after the fence: this process cannot run again");
+        }
+        return;
+    }
+    if (refuse_doomed(reply, n)) return;
     if (!gated) {
         snprintf(reply, n, "err not quiesced");
+        pthread_mutex_unlock(&mu);
+        return;
+    }
+    /* Before any memory goes: NCCL's registrations of it come first. */
+    if (ibv_devices() > 0 && ibv.suspend(reply, n) < 0) {
+        if (ibv.doomed && ibv.doomed()) {
+            ibv_doomed_here = 1;
+            logf_("release: NCCL's verbs refused after the fence (%s): this process cannot run again", reply);
+        }
         pthread_mutex_unlock(&mu);
         return;
     }
@@ -1503,9 +1857,14 @@ static void do_load(char *reply, size_t n, const char *cache_dir)
         for (int j = i; j < n_fexps; j++)
             if (!memcmp(fexps[j].fh.data, old.data, sizeof(old.data))) fexps[j].fh = nf;
     }
+    char rq[160] = "";
+    if (r == CUDA_SUCCESS && ibv_devices() > 0 && ibv.restore(rq, sizeof(rq)) < 0) {
+        snprintf(reply, n, "%s", rq);  /* GPU memory is back: NCCL's registrations of it now */
+        r = CUDA_ERROR_UNKNOWN;
+    }
     if (r == CUDA_SUCCESS)
-        snprintf(reply, n, "ok loaded %d allocation(s) (%zu MiB) in %.1fs: %zu MiB from cache, %zu MiB from store",
-                 nl, nb >> 20, secs() - t0, st_hit >> 20, st_miss >> 20);
+        snprintf(reply, n, "ok loaded %d allocation(s) (%zu MiB) in %.1fs: %zu MiB from cache, %zu MiB from store%s%s",
+                 nl, nb >> 20, secs() - t0, st_hit >> 20, st_miss >> 20, rq[0] ? "; NCCL verbs: " : "", rq + (rq[0] ? 3 : 0));
     pop_ctx(dev);
     pthread_mutex_unlock(&mu);
 }
@@ -1521,8 +1880,9 @@ static void do_fabmap(char *reply, size_t n, const char *path)
         hex_encode(pubs[i].cur.data, sizeof(pubs[i].cur.data), b);
         fprintf(fp, "%s %s\n", a, b);
     }
+    int nv = fp && ibv_devices() > 0 ? ibv.map(fp) : 0;  /* NCCL's queue pairs, keys and ports */
     if (!fp || fclose(fp)) snprintf(reply, n, "err write %.200s: %s", path, strerror(errno));
-    else snprintf(reply, n, "ok %d fabric handle(s)", n_pubs);
+    else snprintf(reply, n, "ok %d fabric handle(s), %d verbs line(s)", n_pubs, nv);
     pthread_mutex_unlock(&mu);
 }
 
@@ -1705,6 +2065,8 @@ static void do_remap(char *reply, size_t n, const char *fabmap_path)
              "%d host buffer(s) in %.2fs: host register %.2fs (%zu MiB; prefault %.1fs, waited %.1fs), "
              "import %.2fs here + %.2fs remote, map %.2fs, multicast %.2fs", nm, ngone, nmc, nh, secs() - t0, th,
              hb >> 20, tpr, tpf, tl, tr, tm, tmc);
+    if (ibv_devices() > 0 && ibv.connect(fabmap_path, rep, sizeof(rep)) < 0)
+        snprintf(reply, n, "%.*s", (int)n - 1, rep);
 out:
     stage_put();
     pop_ctx(dev);
@@ -1722,6 +2084,7 @@ static void do_resume(char *reply, size_t n, int hold)
     CUresult r = CUDA_SUCCESS;
     int nb = 0, nm = 0;
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     int dev = push_any_ctx();
     for (int i = 0; r == CUDA_SUCCESS && i < n_mcbinds; i++) {
         struct mcbind *b = &mcbinds[i];
@@ -1753,6 +2116,7 @@ static void do_resume(char *reply, size_t n, int hold)
         snprintf(reply, n, "ok resumed (%d multicast bind(s), %d multicast mapping(s))%s", nb, nm,
                  hold ? "; launches held until open" : "");
         held = hold;
+        ibv_unfence();  /* NCCL's verbs calls run again */
         if (!hold) gate_open();
     }
     pop_ctx(dev);
@@ -1763,6 +2127,7 @@ static void do_resume(char *reply, size_t n, int hold)
 static void do_open(char *reply, size_t n)
 {
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     if (held) {
         held = 0;
         gate_open();
@@ -1971,6 +2336,529 @@ static void do_ipcget(unsigned long long base, int s)
     msg_send(s, rep, -1);
 }
 
+/* A lease on "hold": the tool holds launches for up to its timeout plus a
+ * minute while the nodes catch up, and if it dies then (killed, OOM), the
+ * gates would stay closed until someone sends "resume". So "hold" takes a
+ * pidfd of the process that sent it, and when that process exits the gates
+ * open again. "resume hold lease" takes one with the held resume, before it
+ * answers: a tool that will send "open" itself (--sync-open) is then never
+ * without one while the launches are held, so that its death does not
+ * leave the gates closed for good. "lease" takes one alone. A sender
+ * already gone when its lease would be taken counts as exited. When no
+ * lease can be taken (its pid or pidfd cannot be had), no hold is left
+ * without one: the gates open (once the state lock is free), "hold" and
+ * "lease" answer an error, and "resume hold lease" answers that it let
+ * the launches through ("no lease"). "release" ends the lease (released memory must not be used
+ * until "resume"), and so do "resume" and "open". Only the control thread
+ * touches it. */
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434  /* the same on every architecture */
+#endif
+#ifndef GPUSHARE_PIDFD_OPEN  /* the host tests name their own */
+#define GPUSHARE_PIDFD_OPEN(pid) ((int)syscall(SYS_pidfd_open, (pid), 0))
+#endif
+static int lease_fd = -1;
+static pid_t lease_pid;
+/* The holder exited while the state lock was busy: the gates are reopened
+ * once the lock is free (ctl_main retries about every 3 s: a second's wait,
+ * then up to 2 s for the lock). A new "hold", a "release" that got past its
+ * checks, or a "resume" or "open" that succeeded takes over the gates and
+ * clears it. */
+static pid_t expiry_pid;
+
+static void lease_end(void)
+{
+    if (lease_fd >= 0) close(lease_fd);
+    lease_fd = -1;
+    lease_pid = 0;
+}
+
+static int lease_recover(void);
+
+/* Take the lease on the sender of s. 0 when it holds one (or was already
+ * gone: its exit is handled as a lease's); else -1, with why, and the
+ * gates are opened as if the sender had exited: no hold is left without a
+ * lease. */
+static int lease_take(int s, char *why, size_t n)
+{
+    struct ucred c = { .pid = -1 };
+    socklen_t l = sizeof(c);
+    int fd = -1, gone = 0;
+    if (getsockopt(s, SOL_SOCKET, SO_PEERCRED, &c, &l) != 0) {
+        snprintf(why, n, "SO_PEERCRED: %s", strerror(errno));
+        c.pid = -1;
+    } else if (lease_fd >= 0 && c.pid == lease_pid) {
+        return 0;
+    } else {
+        lease_end();
+        expiry_pid = 0;
+        fd = GPUSHARE_PIDFD_OPEN(c.pid);
+        gone = fd < 0 && errno == ESRCH;  /* the sender is already gone: as if it exited holding */
+        if (fd < 0 && !gone) snprintf(why, n, "pidfd_open: %s", strerror(errno));
+    }
+    if (fd >= 0) {
+        lease_fd = fd;
+        lease_pid = c.pid;
+        return 0;
+    }
+    if (!gone) logf_("hold: no lease on pid %d (%s): launches are not left held", c.pid, why);
+    expiry_pid = c.pid;
+    if (lease_recover() < 0)
+        logf_("hold: no lease on pid %d, and the state lock is busy: launches stay held until it is free (retrying)",
+              c.pid);
+    return gone ? 0 : -1;
+}
+
+/* After a command that left the launches held for its sender: take the
+ * sender's lease, or (none) say so in rep; resumed: the command resumed,
+ * which stands, else it fails. */
+static void lease_or_open(int s, char *rep, size_t n, int resumed)
+{
+    char why[128] = "";
+    if (lease_take(s, why, sizeof(why)) == 0) return;
+    if (resumed) {
+        size_t k = strlen(rep);
+        snprintf(rep + k, n - k, "; no lease (%s): launches let through", why);
+    } else {
+        snprintf(rep, n, "err no lease (%s): launches let through", why);
+    }
+}
+
+/* Reopen the gates after the holder's exit, once the state lock is free.
+ * Returns 0 when done, -1 while the lock stays busy (retried). */
+static int lease_recover(void)
+{
+    pid_t pid = expiry_pid;
+    if (!pid) return 0;
+    if (lock_ctl()) return -1;
+    if (ibv_doomed_here) {
+        logf_("hold: pid %d, which held the launches, exited: launches stay held (a release was refused after the "
+              "fence)", pid);
+    } else if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
+        gate_open();
+        logf_("hold: pid %d, which held the launches, exited: launches run again", pid);
+    }
+    expiry_pid = 0;
+    pthread_mutex_unlock(&mu);
+    return 0;
+}
+
+/* The process that held the launches exited. */
+static void lease_expired(void)
+{
+    expiry_pid = lease_pid;
+    lease_end();
+    if (lease_recover() < 0)
+        logf_("hold: pid %d exited, but the state lock is busy: launches stay held until it is free (retrying)",
+              expiry_pid);
+}
+
+/* ── ModelExpress ─────────────────────────────────────────────────────── */
+
+/* ModelExpress (a vLLM weight loader) serves the loaded weights to peers
+ * over NIXL/UCX, and holds RDMA state CRIU cannot dump (uverbs device files,
+ * memory registrations of the GPU memory "release" frees, queue pairs to
+ * peers). Its lifecycle module drops that state (pause_serving) and, once
+ * the weights are back, registers them again and republishes under a new
+ * worker id (resume_serving), but nothing in vLLM calls them. "mx pause"
+ * (before quiesce) and "mx resume" (after open) do, in this process's own
+ * Python. Not while launches are held: a Python thread waiting in the gate
+ * holds the GIL. Needs ModelExpress >= 0.7: earlier releases keep no load
+ * context once loaded, so there is nothing to pause. The reply counts the
+ * RDMA device files still open or mapped, and the pause fails on any:
+ * CRIU cannot dump them. NCCL's, through libnvsnap_ibv, are left out:
+ * "release", right after, closes them (rdma_files).
+ *
+ * "mx resume HOST": ModelExpress publishes MX_WORKER_HOST, else the
+ * address its sockets route from, as the address peers pull from. After a
+ * restore into another pod both are the captured pod's address, which the
+ * restored process keeps; only the caller knows the new one. HOST becomes
+ * MX_WORKER_HOST, which ModelExpress reads again on every publish. */
+static const char mx_py[] =
+    "def _nvsnap_mx(op, fd, host):\n"
+    "    import gc, os, sys\n"
+    "    try:\n"
+    "        if host:\n"
+    "            os.environ['MX_WORKER_HOST'] = host\n"
+    "        L = sys.modules.get('modelexpress.engines.vllm.loader')\n"
+    "        if L is None:\n"
+    "            rep = 'ok no ModelExpress loader'\n"
+    "        else:\n"
+    "            if not hasattr(L, '_loader_registry'):\n"
+    "                raise RuntimeError('needs ModelExpress >= 0.7 '\n"
+    "                                   '(earlier releases drop the load context after loading)')\n"
+    "            from modelexpress import lifecycle\n"
+    "            n = bad = 0\n"
+    "            for dev, ld in list(L._loader_registry.items()):\n"
+    "                ctx = getattr(ld, '_ctx', None)\n"
+    "                if ctx is None or not ctx.p2p_enabled:\n"
+    "                    continue\n"
+    "                if op == 'pause' and (ctx.nixl_manager or ctx.mx_client):\n"
+    "                    lifecycle.pause_serving(ctx)\n"
+    "                    L._nixl_managers.pop(dev, None)\n"
+    "                    n += 1\n"
+    "                elif op == 'resume' and ctx.nixl_manager is None:\n"
+    "                    lifecycle.resume_serving(ctx, None)\n"
+    "                    if ctx.nixl_manager is None:\n"
+    "                        bad += 1\n"
+    "                    else:\n"
+    "                        L._nixl_managers[dev] = ctx.nixl_manager\n"
+    "                        n += 1\n"
+    "            gc.collect()\n"
+    "            rep = ('err %d of %d not registered again (see the log)' % (bad, n + bad) if bad\n"
+    "                   else 'ok %sd %d ModelExpress worker(s)' % (op, n))\n"
+    "    except BaseException as e:\n"
+    "        rep = 'err %s: %s' % (type(e).__name__, e)\n"
+    "    os.write(fd, rep.encode()[:160])\n";
+
+static unsigned ucx_ver[3];
+static int ucx_loaded(void);
+
+/* Run fn(op, fd, host EXTRA) from src in this process's Python ("mx",
+ * "nixl"); EXTRA is more arguments, from this file only. */
+static void do_py(char *reply, size_t n, const char *src, size_t srclen, const char *fn, const char *op,
+                  const char *extra)
+{
+    int (*is_init)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "Py_IsInitialized");
+    int (*ensure)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "PyGILState_Ensure");
+    void (*release)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "PyGILState_Release");
+    int (*run)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "PyRun_SimpleString");
+    char out[320] = "err no result";
+    const char *host = !strncmp(op, "resume ", 7) ? op + 7 : "";
+    int p[2], fds, maps;
+    /* HOST goes into Python source: an IP address or DNS name only (a
+     * request is at most 255 bytes). */
+    if (strcmp(op, "pause") && strcmp(op, "resume") &&
+        (!*host || strlen(host) > 200 || host[strspn(host, "0123456789abcdefghijklmnopqrstuvwxyz"
+                                                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ.:-")])) {
+        snprintf(reply, n, "err unknown command"); return;
+    }
+    if (!is_init || !ensure || !release || !run || !is_init()) {
+        snprintf(out, sizeof(out), "ok no Python");
+    } else if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
+        snprintf(reply, n, "err launches are held: %s pause goes before quiesce, %s resume after open", fn, fn);
+        return;
+    } else if (pipe2(p, O_CLOEXEC) != 0) {
+        snprintf(reply, n, "err pipe: %s", strerror(errno));
+        return;
+    } else {
+        size_t len = srclen + 400;
+        char *code = malloc(len);
+        if (!code) { close(p[0]); close(p[1]); snprintf(reply, n, "err out of memory"); return; }
+        snprintf(code, len, "%s_nvsnap_%s('%s', %d, '%s'%s)\ndel _nvsnap_%s\n", src, fn,
+                 *op == 'p' ? "pause" : "resume", p[1], host, extra, fn);
+        int g = ensure();
+        int r = run(code);
+        release(g);
+        free(code);
+        close(p[1]);
+        ssize_t k = read(p[0], out, sizeof(out) - 1);
+        close(p[0]);
+        if (k > 0) out[k] = 0;
+        else if (r) snprintf(out, sizeof(out), "err Python raised (see stderr)");
+    }
+    int scanned = rdma_files(&fds, &maps, 1) == 0;
+    /* RDMA left after a pause (UCX outside ModelExpress, say) fails the
+     * dump: fail the pause instead. NCCL's is left to "release". A scan
+     * that could not finish proves nothing: that fails it too. */
+    if (*op == 'p' && !scanned && !strncmp(out, "ok ", 3))
+        snprintf(reply, n, "err cannot read this process's open files (%s): RDMA device files were not looked "
+                 "for (%s)", strerror(errno), out + 3);
+    else if (*op == 'p' && (fds || maps) && !strncmp(out, "ok ", 3))
+        snprintf(reply, n, "err %d RDMA device file(s) still open, %d mapped (%s): CRIU cannot dump them",
+                 fds, maps, out + 3);
+    else
+        snprintf(reply, n, "%s; %d RDMA device file(s) open, %d mapped", out, fds, maps);
+}
+
+/* ── NIXL KV transfer (vLLM disaggregated prefill/decode) ────────────── */
+
+/* vLLM's NixlConnector (pull mode) moves KV between prefill and decode
+ * engines over NIXL/UCX, and over RDMA holds what CRIU cannot dump. vLLM
+ * creates its NIXL agent once and has no call to drop it, so "nixl pause"
+ * does it from outside, through vLLM's own functions: in the engine-core
+ * process it stops taking new requests, waits (up to 60 s) until no KV
+ * transfer is in flight, stops the handshake listener and shuts down the
+ * connector on every TP worker (which frees the NIXL agent and its memory
+ * registrations); in a TP worker process it waits until the engine has
+ * done so. If that fails, or a worker still has RDMA device files open
+ * afterwards (other than NCCL's through libnvsnap_ibv, which "release"
+ * closes), the engine resumes. "nixl resume [HOST]"
+ * creates the connectors again on the same KV memory under a new engine
+ * id, so peers handshake with it afresh instead of using the queue pairs
+ * and keys they cached, restarts the listener (on HOST, the pod's new IP,
+ * when given) and takes requests again. Requests that reached a paused
+ * decode engine are prefilled locally if the pause outlasted a third of
+ * prefill's hold on their KV (kv_lease_duration): the prefill side may have
+ * reused those blocks. Only the pull connector with KV in GPU memory is
+ * handled. Not while launches are held, as for "mx". */
+static const char nixl_py[] =
+    "def _nvsnap_nixl(op, fd, host, ucx):\n"
+    "    import os, queue, sys, threading, time, uuid\n"
+    "\n"
+    "    def conn():\n"
+    "        st = sys.modules.get('vllm.distributed.kv_transfer.kv_transfer_state')\n"
+    "        if st is None or not st.has_kv_transfer_group():\n"
+    "            return None\n"
+    "        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import connector as m\n"
+    "        c = st.get_kv_transfer_group()\n"
+    "        if not isinstance(c, m.NixlBaseConnector):\n"
+    "            return None\n"
+    "        if not isinstance(c, m.NixlPullConnector):\n"
+    "            raise RuntimeError('%s is not handled, only NixlPullConnector' % type(c).__name__)\n"
+    "        return c\n"
+    "\n"
+    "    def w_busy(_w):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        w = get_kv_transfer_group().connector_worker\n"
+    "        return 0 if w is None else (len(w._recving_transfers) + len(w._reqs_to_send)\n"
+    "                                    + len(w._handshake_futures))\n"
+    "\n"
+    "    def w_release(_w):\n"
+    "        import gc\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        c = get_kv_transfer_group()\n"
+    "        w = c.connector_worker\n"
+    "        if w is None:\n"
+    "            return 0\n"
+    "        if w.use_host_buffer:\n"
+    "            raise RuntimeError('KV in a host buffer is not handled')\n"
+    "        c._nvsnap_kv, c._nvsnap_cls = w.device_kv_caches, type(w)\n"
+    "        try:\n"
+    "            w._handshake_initiation_executor.shutdown(wait=True)\n"
+    "            w._finish_shutdown()\n"
+    "        finally:\n"
+    "            # Dropped even after a failed shutdown, so every worker comes back\n"
+    "            # under the same new engine id; \"released\" is set only once the\n"
+    "            # agent is freed, which is what a waiting TP worker checks.\n"
+    "            c.connector_worker = None\n"
+    "            del w\n"
+    "            gc.collect()\n"
+    "            c._nvsnap_state = 'released'\n"
+    "        return 1\n"
+    "\n"
+    "    def w_rdma(_w, skip=True):\n"
+    "        # As rdma_files: NCCL's own, through libnvsnap_ibv, are left to\n"
+    "        # \"release\", which closes them.\n"
+    "        import ctypes\n"
+    "        d, own, devs, n, m = '" GPUSHARE_RDMA_DIR "', set(), set(), 0, 0\n"
+    "        def nccl_fds():\n"
+    "            try:\n"
+    "                a = (ctypes.c_int * 64)()\n"
+    "                k = ctypes.CDLL('libnvsnap_ibv.so', mode=os.RTLD_NOLOAD).nvsnap_ibv_fds(a, 64)\n"
+    "                return list(a[:k]) if 0 <= k <= 64 else []\n"
+    "            except (OSError, AttributeError):\n"
+    "                return []\n"
+    "        first = nccl_fds() if skip else []\n"
+    "        own = set(first)\n"
+    "        for f in os.listdir('/proc/self/fd'):\n"
+    "            try:\n"
+    "                t = os.readlink('/proc/self/fd/' + f)\n"
+    "            except OSError:\n"
+    "                continue\n"
+    "            if t.startswith(d) or t == '" GPUSHARE_RDMA_EVENT "':\n"
+    "                if int(f) not in own:\n"
+    "                    n += 1\n"
+    "                elif t.startswith(d):\n"
+    "                    devs.add(t)\n"
+    "        with open('/proc/self/maps') as fm:\n"
+    "            for l in fm:\n"
+    "                i = l.find(' ' + d)\n"
+    "                m += i >= 0 and l[i + 1:].rstrip('\\n') not in devs\n"
+    "        # NCCL opened or closed a device meanwhile: count them all.\n"
+    "        if own and nccl_fds() != first:\n"
+    "            return w_rdma(_w, False)\n"
+    "        return os.getpid(), n, m\n"
+    "\n"
+    "    def w_released(_w):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        return getattr(get_kv_transfer_group(), '_nvsnap_state', None) == 'released'\n"
+    "\n"
+    "    def w_resume(_w, engine_id):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        c = get_kv_transfer_group()\n"
+    "        if c.connector_worker is not None:  # never released: release it, so all match\n"
+    "            w_release(_w)\n"
+    "        c.kv_transfer_config.engine_id = c.engine_id = engine_id\n"
+    "        w = c._nvsnap_cls(c._vllm_config, engine_id, c.kv_cache_config)\n"
+    "        w.register_kv_caches(c._nvsnap_kv)\n"
+    "        c.connector_worker = w\n"
+    "        del c._nvsnap_kv, c._nvsnap_cls\n"
+    "        c._nvsnap_state = 'up'\n"
+    "        return 1\n"
+    "\n"
+    "    def engine():\n"
+    "        core = sys.modules.get('vllm.v1.engine.core')\n"
+    "        f = sys._current_frames().get(threading.main_thread().ident)\n"
+    "        while core is not None and f is not None:\n"
+    "            if isinstance(f.f_locals.get('self'), core.EngineCoreProc):\n"
+    "                return f.f_locals['self']\n"
+    "            f = f.f_back\n"
+    "        return None\n"
+    "\n"
+    "    # fn runs on the engine's main thread, at its next idle point. The\n"
+    "    # deadline is for the engine to get there: a call it has started\n"
+    "    # (claimed) runs to its end and is waited for, so nothing it does\n"
+    "    # (a release RPC) runs after this reports failure, and a rollback\n"
+    "    # queued next starts after it.\n"
+    "    def on_main(e, fn, timeout):\n"
+    "        from vllm.v1.engine import EngineCoreRequestType\n"
+    "        deadline = time.monotonic() + timeout\n"
+    "        while True:\n"
+    "            box, lock, st = queue.Queue(), threading.Lock(), ['queued']\n"
+    "\n"
+    "            def cb(_e=None):\n"
+    "                with lock:\n"
+    "                    if st[0] != 'queued':\n"
+    "                        return\n"
+    "                    st[0] = 'claimed'\n"
+    "                try:\n"
+    "                    box.put(fn(e))\n"
+    "                except BaseException as x:\n"
+    "                    box.put((True, x))\n"
+    "            e._idle_state_callbacks.append(cb)\n"
+    "            e.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))\n"
+    "            try:\n"
+    "                done, res = box.get(timeout=max(0.1, deadline - time.monotonic()))\n"
+    "            except queue.Empty:\n"
+    "                with lock:\n"
+    "                    claimed = st[0] == 'claimed'\n"
+    "                    if not claimed:\n"
+    "                        st[0] = 'cancelled'\n"
+    "                if not claimed:\n"
+    "                    raise TimeoutError('the engine did not go idle in %d s' % timeout)\n"
+    "                done, res = box.get()\n"
+    "            if isinstance(res, BaseException):\n"
+    "                raise res\n"
+    "            if done:\n"
+    "                return res\n"
+    "            if time.monotonic() > deadline:\n"
+    "                raise TimeoutError('KV transfers still in flight after %d s: %r' % (timeout, res))\n"
+    "            time.sleep(0.2)\n"
+    "\n"
+    "    def stop_listener(s):\n"
+    "        t = s._nixl_handshake_listener_t\n"
+    "        if t is not None:\n"
+    "            s._stop_event.set()\n"
+    "            t.join(5)\n"
+    "            if t.is_alive():\n"
+    "                raise RuntimeError('the NIXL handshake listener did not stop in 5 s')\n"
+    "            s._stop_event = threading.Event()\n"
+    "            s._nixl_handshake_listener_t = None\n"
+    "\n"
+    "    def e_resume(e):\n"
+    "        from vllm.v1.engine import EngineCoreRequestType\n"
+    "        from vllm.v1.request import RequestStatus\n"
+    "        st = e.__dict__.get('_nvsnap_nixl')  # dropped only once resumed: a failure can be retried\n"
+    "        if st is None:\n"
+    "            return True, 'not paused'\n"
+    "        kc = e.scheduler.get_kv_connector()\n"
+    "        s = kc.connector_scheduler\n"
+    "        new_id = None\n"
+    "        if any(e.model_executor.collective_rpc(w_released)):\n"
+    "            new_id = str(uuid.uuid4())\n"
+    "            e.model_executor.collective_rpc(w_resume, args=(new_id,))\n"
+    "            e.vllm_config.kv_transfer_config.engine_id = kc.engine_id = s.engine_id = new_id\n"
+    "        if host:\n"
+    "            s.side_channel_host = os.environ['VLLM_NIXL_SIDE_CHANNEL_HOST'] = host\n"
+    "        if new_id or host or s._nixl_handshake_listener_t is None:\n"
+    "            stop_listener(s)\n"
+    "            meta = {}\n"
+    "            for d in e.model_executor.get_kv_connector_handshake_metadata():\n"
+    "                meta.update(d or {})\n"
+    "            kc.set_xfer_handshake_metadata_pp_aware(meta)\n"
+    "        # Wall-clock time: the monotonic clock does not carry across a restore.\n"
+    "        n = 0\n"
+    "        if time.time() - st['at'] > s._kv_lease_duration / 3:\n"
+    "            for r in list(e.scheduler.requests.values()):\n"
+    "                p = r.kv_transfer_params\n"
+    "                if r.status == RequestStatus.WAITING and p and p.get('do_remote_prefill'):\n"
+    "                    p['do_remote_prefill'] = False\n"
+    "                    n += 1\n"
+    "        e.scheduler.set_pause_state(st['prev'])\n"
+    "        del e._nvsnap_nixl\n"
+    "        e.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))\n"
+    "        return True, ('resumed as engine %s, side channel %s:%s, %d request(s) prefilled here'\n"
+    "                      % (new_id or kc.engine_id, s.side_channel_host, s.side_channel_port, n))\n"
+    "\n"
+    "    # Restored into another pod, only UCX 1.22 reads its routes again (see\n"
+    "    # ucs_netlink_route_exists in gpushare.c): refuse the pause for another.\n"
+    "    def ucx_ok():\n"
+    "        if op == 'pause' and ucx and not ucx.startswith('1.22.'):\n"
+    "            raise RuntimeError('UCX %s is not 1.22: restored into another pod, it would keep the old '\n"
+    "                               'pod\\'s routes, and NIXL would reach no peer' % ucx)\n"
+    "        return ', UCX ' + ucx if op == 'pause' and ucx else ''\n"
+    "\n"
+    "    def run():\n"
+    "        e = engine()\n"
+    "        if e is None:\n"
+    "            c = conn()\n"
+    "            if c is None:\n"
+    "                return 'ok no NIXL KV connector'\n"
+    "            v = ucx_ok()\n"
+    "            pause = op == 'pause'\n"
+    "            deadline = time.monotonic() + 90\n"
+    "            while (getattr(c, '_nvsnap_state', None) == 'released') != pause:\n"
+    "                if time.monotonic() > deadline:\n"
+    "                    raise TimeoutError('the engine did not %s this worker\\'s NIXL connector'\n"
+    "                                       % ('release' if pause else 're-create'))\n"
+    "                time.sleep(0.2)\n"
+    "            return 'ok TP worker: NIXL connector %s%s' % ('released' if pause else 'up', v)\n"
+    "        kc = e.scheduler.get_kv_connector()\n"
+    "        m = sys.modules.get('vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector')\n"
+    "        if kc is None or m is None or not isinstance(kc, m.NixlBaseConnector):\n"
+    "            return 'ok no NIXL KV connector'\n"
+    "        if not isinstance(kc, m.NixlPullConnector):\n"
+    "            raise RuntimeError('%s is not handled, only NixlPullConnector' % type(kc).__name__)\n"
+    "        v = ucx_ok()\n"
+    "        if op == 'resume':\n"
+    "            return 'ok ' + on_main(e, e_resume, 60)\n"
+    "        st = e.__dict__.get('_nvsnap_nixl')\n"
+    "        if st is not None and st.get('paused'):\n"
+    "            return 'ok already paused'\n"
+    "        if st is not None:  # a failed pause whose rollback failed too: resume reconciles it\n"
+    "            raise RuntimeError('an earlier nixl pause did not finish and was not rolled back: '\n"
+    "                               'nixl resume first')\n"
+    "        from vllm.v1.core.sched.interface import PauseState\n"
+    "        prev = e.scheduler.pause_state\n"
+    "        e._nvsnap_nixl = {'prev': prev, 'at': time.time()}\n"
+    "        if prev == PauseState.UNPAUSED:\n"
+    "            e.scheduler.set_pause_state(PauseState.PAUSED_NEW)\n"
+    "\n"
+    "        def step(e):\n"
+    "            busy = e.model_executor.collective_rpc(w_busy)\n"
+    "            if any(busy):\n"
+    "                return False, busy\n"
+    "            stop_listener(e.scheduler.get_kv_connector().connector_scheduler)\n"
+    "            e._nvsnap_nixl['released'] = True\n"
+    "            n = sum(e.model_executor.collective_rpc(w_release))\n"
+    "            # RDMA left in any worker (but NCCL's, see w_rdma) would fail\n"
+    "            # the dump: fail here, so the engine resumes itself.\n"
+    "            left = [r for r in e.model_executor.collective_rpc(w_rdma) if r[1] or r[2]]\n"
+    "            if left:\n"
+    "                raise RuntimeError('RDMA device files still open after the release (pid, open, '\n"
+    "                                   'mapped): %s' % left)\n"
+    "            e._nvsnap_nixl['paused'] = True  # every worker released and checked\n"
+    "            return True, n\n"
+    "        try:\n"
+    "            n = on_main(e, step, 60)\n"
+    "        except BaseException:\n"
+    "            try:\n"
+    "                on_main(e, e_resume, 30)\n"
+    "            except BaseException:\n"
+    "                st = e.__dict__.get('_nvsnap_nixl')\n"
+    "                if st and not st.get('released'):  # nothing released: just unpause\n"
+    "                    del e._nvsnap_nixl\n"
+    "                    e.scheduler.set_pause_state(st['prev'])\n"
+    "            raise\n"
+    "        return 'ok engine paused, NIXL connector released on %d worker(s)%s' % (n, v)\n"
+    "\n"
+    "    try:\n"
+    "        rep = run()\n"
+    "    except BaseException as x:\n"
+    "        rep = 'err %s: %s' % (type(x).__name__, x)\n"
+    "    os.write(fd, rep.encode()[:300])\n";
+
 /* A reply's longest form ("ok remapped ...", do_remap) fits: the tool
  * reads at most GPUSHARE_REPLY_MAX bytes of it (nvsnap-gpu-suspend.c). */
 static void serve(int s)
@@ -1979,6 +2867,13 @@ static void serve(int s)
     int fd = -1;
     if (msg_recv(s, buf, sizeof(buf), &fd) < 0) return;
     if (!strcmp(buf, "quiesce")) { do_quiesce(rep, sizeof(rep)); msg_send(s, rep, -1); }
+    else if (!strcmp(buf, "hold")) {
+        do_hold(rep, sizeof(rep));
+        if (!strcmp(rep, "ok held")) lease_or_open(s, rep, sizeof(rep), 0);
+        msg_send(s, rep, -1);
+    }
+    else if (!strcmp(buf, "poll")) { do_poll(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
+    else if (!strcmp(buf, "step")) { do_poll(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "release")) { do_release(rep, sizeof(rep), NULL); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "release ", 8)) { do_release(rep, sizeof(rep), buf + 8); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "numa ", 5)) { do_numa(rep, sizeof(rep), buf + 5); msg_send(s, rep, -1); }
@@ -1990,15 +2885,50 @@ static void serve(int s)
     else if (!strncmp(buf, "touch ", 6)) { do_touch(rep, sizeof(rep), buf + 6); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "resume")) { do_resume(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "resume hold")) { do_resume(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
+    else if (!strcmp(buf, "resume hold lease")) {
+        /* The lease first: the sender's death after the reply still opens. */
+        do_resume(rep, sizeof(rep), 1);
+        if (!strncmp(rep, "ok", 2)) lease_or_open(s, rep, sizeof(rep), 1);
+        msg_send(s, rep, -1);
+    }
     else if (!strcmp(buf, "open")) { do_open(rep, sizeof(rep)); msg_send(s, rep, -1); }
+    else if (!strcmp(buf, "lease")) {
+        snprintf(rep, sizeof(rep), "ok leased");
+        lease_or_open(s, rep, sizeof(rep), 0);
+        msg_send(s, rep, -1);
+    }
+    else if (!strcmp(buf, "ibv")) { snprintf(rep, sizeof(rep), "ok ibv %d", ibv_devices()); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "mx ", 3)) { do_py(rep, sizeof(rep), mx_py, sizeof(mx_py), "mx", buf + 3, ""); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "nixl ", 5)) {
+        char ucx[32] = ", ''";
+        if (ucx_loaded()) snprintf(ucx, sizeof(ucx), ", '%u.%u.%u'", ucx_ver[0], ucx_ver[1], ucx_ver[2]);
+        do_py(rep, sizeof(rep), nixl_py, sizeof(nixl_py), "nixl", buf + 5, ucx);
+        msg_send(s, rep, -1);
+    }
     else if (!strncmp(buf, "export ", 7)) do_export(strtoull(buf + 7, NULL, 10), 0, s);
     else if (!strncmp(buf, "exportfab ", 10)) do_export(strtoull(buf + 10, NULL, 10), 1, s);
     else if (!strcmp(buf, "whose") && fd >= 0) do_whose(fd, s);
     else if (!strncmp(buf, "whosefab ", 9)) do_whosefab(buf + 9, s);
     else if (!strncmp(buf, "ipcget ", 7)) do_ipcget(strtoull(buf + 7, NULL, 10), s);
-    else msg_send(s, "err unknown command", -1);
+    else { snprintf(rep, sizeof(rep), "err unknown command"); msg_send(s, rep, -1); }
+    /* "release" ends the lease unless it refused before changing anything
+     * (busy state lock, not quiesced): reopening the gates over memory that
+     * may be partly released could corrupt it. "resume" ends it once it
+     * reopened the gates, or ("resume hold") left them for "open"; "open"
+     * only once it opened them ("ok not held" opened nothing). If one fails
+     * (a busy state lock), the holder's exit still reopens them. "hold",
+     * "lease" and "resume hold lease" took their lease above, before
+     * answering. */
+    if (((!strcmp(buf, "release") || !strncmp(buf, "release ", 8)) && strcmp(rep, "err busy (state lock)") &&
+         strcmp(rep, "err not quiesced")) ||
+             (!strncmp(buf, "resume", 6) && strcmp(buf, "resume hold lease") && !strncmp(rep, "ok", 2)) ||
+             (!strcmp(buf, "open") && !strcmp(rep, "ok opened"))) {
+        lease_end();
+        expiry_pid = 0;
+    }
     if (fd >= 0) close(fd);
-    if (strncmp(buf, "export", 6) && strncmp(buf, "whose", 5) && strncmp(buf, "ipcget", 6))
+    if (strncmp(buf, "export", 6) && strncmp(buf, "whose", 5) && strncmp(buf, "ipcget", 6) &&
+        strcmp(buf, "poll") && strcmp(buf, "step"))
         logf_("%s: %s", buf, rep);
 }
 
@@ -2050,6 +2980,12 @@ static void *ctl_main(void *arg)
 {
     wc_thread_init();
     for (;;) {
+        struct pollfd p[2] = { { listen_fd, POLLIN, 0 }, { lease_fd, POLLIN, 0 } };
+        int r = poll(p, 2, expiry_pid ? 1000 : -1);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (p[1].revents) lease_expired();
+        else if (expiry_pid && lease_recover() == 0) logf_("hold: the state lock is free again: launches run");
+        if (!p[0].revents) continue;
         int s = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if (s < 0) { if (errno == EINTR || errno == ECONNABORTED) continue; break; }
         if (peer_ok(s, 0)) serve(s);
@@ -2093,7 +3029,12 @@ static int find_exporter(const char *req, int fd, unsigned long long *key, int *
     while (!found && fgets(line, sizeof(line), fp)) {
         char *p = strstr(line, "@nvsnap-gpushare.");
         int pid;
-        if (!p || sscanf(p + 1, GPUSHARE_SOCK_FMT, &pid) != 1 || pid == me) continue;
+        unsigned long flags = 0;
+        /* Only the listening socket (__SO_ACCEPTCON): a connection to it
+         * shows its name too, and a peer that does not accept must cost one
+         * timeout, not one per queued connection. */
+        if (!p || sscanf(line, "%*s %*x %*x %lx", &flags) != 1 || !(flags & 0x10000)) continue;
+        if (sscanf(p + 1, GPUSHARE_SOCK_FMT, &pid) != 1 || pid == me) continue;
         snprintf(name, sizeof(name), GPUSHARE_SOCK_FMT, pid);
         if (strncmp(p + 1, name, strlen(name)) || (p[1 + strlen(name)] != '\n' && p[1 + strlen(name)] != 0))
             continue;
@@ -2106,6 +3047,210 @@ static int find_exporter(const char *req, int fd, unsigned long long *key, int *
     }
     fclose(fp);
     return found;
+}
+
+/* ── UCX route checks after a restore into another pod ───────────────── */
+
+/* UCX checks that a RoCE device can reach a peer against the routing
+ * table, which it reads once per process (ucs_netlink_init_routing_table_cache
+ * in UCX 1.22) and never again. A process restored into another pod keeps
+ * the old pod's table, in which the new pod's interfaces have no routes, so
+ * UCX finds no device that reaches anything (NIXL: NIXL_ERR_BACKEND). UCX's
+ * RoCE transport calls the three functions below in libucs through the
+ * dynamic linker, so they are defined here: while the process is in the
+ * network namespace it was in at the first call (when UCX read its table),
+ * they call UCX's; in another one, they read the routes again on each call
+ * and match them as UCX does: every table (policy rules, as in pods whose
+ * RoCE interfaces have their own tables, are ignored), longest prefix on the
+ * interface. Only for UCX 1.22, whose signatures these are; other versions
+ * keep UCX's table. */
+
+struct ucx_find { const char *stem; char path[512]; };
+
+static int ucx_find_cb(struct dl_phdr_info *info, size_t size, void *arg)
+{
+    struct ucx_find *f = arg;
+    const char *b = strrchr(info->dlpi_name, '/');
+    size_t n = strlen(f->stem);
+    (void)size;
+    b = b ? b + 1 : info->dlpi_name;
+    if (strncmp(b, f->stem, n) || (b[n] != '-' && b[n] != '.')) return 0;
+    snprintf(f->path, sizeof(f->path), "%s", info->dlpi_name);
+    return 1;
+}
+
+/* NAME in the loaded UCX library STEM ("libucs", "libucp"; NIXL bundles
+ * them as libucs-<hash>.so and loads them RTLD_LOCAL). */
+static void *ucx_sym(const char *stem, const char *name)
+{
+    struct ucx_find f = { stem, "" };
+    void *h, *p;
+    if (!real_dlsym) init_real_dlsym();
+    if (!dl_iterate_phdr(ucx_find_cb, &f) || !(h = dlopen(f.path, RTLD_LAZY | RTLD_NOLOAD))) return NULL;
+    p = real_dlsym(h, name);
+    dlclose(h);
+    return p;
+}
+
+/* 1 with the version of the UCX loaded in this process in ucx_ver; 0 if
+ * none is (yet). */
+static int ucx_loaded(void)
+{
+    static int found;
+    if (!__atomic_load_n(&found, __ATOMIC_ACQUIRE)) {
+        unsigned v[3];
+        void (*get)(unsigned *, unsigned *, unsigned *) =
+            (void (*)(unsigned *, unsigned *, unsigned *))ucx_sym("libucp", "ucp_get_version");
+        if (!get) return 0;
+        get(&v[0], &v[1], &v[2]);
+        memcpy(ucx_ver, v, sizeof(v));
+        __atomic_store_n(&found, 1, __ATOMIC_RELEASE);
+    }
+    return 1;
+}
+
+static int ucx_122(void) { return ucx_loaded() && ucx_ver[0] == 1 && ucx_ver[1] == 22; }
+
+static unsigned long first_netns;
+
+/* 1 when the kernel answers: the process left the network namespace UCX
+ * read its routes in. */
+static int kernel_routes(void)
+{
+    static int said;
+    unsigned long want = 0;
+    struct stat st;
+    if (stat("/proc/self/ns/net", &st)) return 0;
+    if (__atomic_compare_exchange_n(&first_netns, &want, (unsigned long)st.st_ino, 0, __ATOMIC_SEQ_CST,
+                                    __ATOMIC_SEQ_CST) || want == st.st_ino)
+        return 0;
+    int k = ucx_122();
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_SEQ_CST)) {
+        if (k) logf_("network namespace changed since UCX read its routes: UCX route checks read the routes again");
+        else logf_("network namespace changed since UCX read its routes, but UCX %u.%u.%u is not 1.22: "
+                   "UCX keeps the old routes, and RoCE peers may look unreachable", ucx_ver[0], ucx_ver[1], ucx_ver[2]);
+    }
+    return k;
+}
+
+struct rt { int oif, type, len, family; unsigned char dst[16]; };
+
+/* The routes of address family FAM in every table, as UCX reads them
+ * (RTM_GETROUTE dump; a route without an interface or a destination it
+ * needs is left out): each to EACH as it arrives, however many there are.
+ * Their count, -1, or RT_DUMP_INTR when the kernel marked the dump
+ * interrupted (NLM_F_DUMP_INTR: the tables changed during it, and a route
+ * may be missing): what went to EACH is then incomplete. */
+#define RT_DUMP_INTR (-2)
+static int rt_dump(int fam, void (*each)(const struct rt *, void *), void *arg)
+{
+    struct { struct nlmsghdr h; struct rtmsg r; } req = {
+        { NLMSG_LENGTH(sizeof(struct rtmsg)), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1, 0 },
+        { .rtm_family = (unsigned char)fam } };
+    char buf[16384] __attribute__((aligned(8)));
+    struct timeval tv = { 1, 0 };
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE), k = 0, done = 0, intr = 0;
+    if (fd < 0) return -1;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (send(fd, &req, req.h.nlmsg_len, 0) != (ssize_t)req.h.nlmsg_len) done = 1, k = -1;
+    while (!done) {
+        ssize_t got = recv(fd, buf, sizeof(buf), 0);
+        int left = (int)got;
+        if (got <= 0) { k = -1; break; }
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+            if (h->nlmsg_flags & NLM_F_DUMP_INTR) intr = 1;
+            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) {
+                if (h->nlmsg_type == NLMSG_ERROR) k = -1;
+                done = 1;
+                break;
+            }
+            if (h->nlmsg_type != RTM_NEWROUTE) continue;
+            struct rtmsg *m = NLMSG_DATA(h);
+            struct rt e = { -1, m->rtm_type, m->rtm_dst_len, m->rtm_family, { 0 } };
+            int alen = RTM_PAYLOAD(h), dst = 0;
+            for (struct rtattr *x = RTM_RTA(m); RTA_OK(x, alen); x = RTA_NEXT(x, alen)) {
+                if (x->rta_type == RTA_OIF && RTA_PAYLOAD(x) >= sizeof(int)) memcpy(&e.oif, RTA_DATA(x), sizeof(int));
+                else if (x->rta_type == RTA_DST && RTA_PAYLOAD(x) <= sizeof(e.dst)) {
+                    memcpy(e.dst, RTA_DATA(x), RTA_PAYLOAD(x));
+                    dst = 1;
+                }
+            }
+            if (e.oif != -1 && (!e.len || dst)) each(&e, arg), k++;
+        }
+    }
+    close(fd);
+    return k >= 0 && intr ? RT_DUMP_INTR : k;
+}
+
+struct rt_match { const unsigned char *a; int bits, oif, type, best, dev; };
+
+static void rt_match(const struct rt *e, void *arg)
+{
+    struct rt_match *q = arg;
+    int full = e->len / 8, rem = e->len % 8;
+    if ((q->oif >= 0 && e->oif != q->oif) || (q->type && e->type != q->type) || e->len > q->bits || e->len <= q->best)
+        return;
+    if (memcmp(q->a, e->dst, full) || (rem && ((q->a[full] ^ e->dst[full]) & (0xff << (8 - rem)) & 0xff))) return;
+    q->best = e->len;
+    q->dev = e->oif;
+}
+
+/* The longest prefix among the routes that hold SA, out of interface OIF
+ * (any when < 0) and of type TYPE (any when 0); its interface in *DEV.
+ * -1 if none, or if every dump was interrupted (read up to 3 times: a
+ * partial one could miss the longer prefix and name the wrong interface). */
+static int rt_len(const struct sockaddr *sa, int oif, int type, int *dev)
+{
+    struct rt_match q = {
+        sa->sa_family == AF_INET ? (const unsigned char *)&((const struct sockaddr_in *)sa)->sin_addr
+        : sa->sa_family == AF_INET6 ? (const unsigned char *)&((const struct sockaddr_in6 *)sa)->sin6_addr
+        : NULL,
+        sa->sa_family == AF_INET ? 32 : 128, oif, type, -1, -1 };
+    if (!q.a) return -1;
+    int k = RT_DUMP_INTR;
+    for (int i = 0; i < 3 && k == RT_DUMP_INTR; i++) {
+        q.best = q.dev = -1;
+        k = rt_dump(sa->sa_family, rt_match, &q);
+    }
+    if (k < 0) return -1;
+    if (q.best >= 0) *dev = q.dev;
+    return q.best;
+}
+
+int ucs_netlink_route_exists(int if_index, const struct sockaddr *sa_remote, int *netmask_len_p)
+{
+    static int (*real)(int, const struct sockaddr *, int *);
+    int len, dev;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(int, const struct sockaddr *, int *))ucx_sym("libucs", __func__);
+        return real ? real(if_index, sa_remote, netmask_len_p) : 0;
+    }
+    len = rt_len(sa_remote, if_index, 0, &dev);
+    if (netmask_len_p) *netmask_len_p = len;
+    return len > -1;
+}
+
+int ucs_netlink_is_best_route(int if_index, const struct sockaddr *sa_remote)
+{
+    static int (*real)(int, const struct sockaddr *);
+    int len, dev;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(int, const struct sockaddr *))ucx_sym("libucs", __func__);
+        return real ? real(if_index, sa_remote) : 0;
+    }
+    len = rt_len(sa_remote, if_index, 0, &dev);
+    return len > -1 && rt_len(sa_remote, -1, 0, &dev) == len;
+}
+
+int ucs_netlink_get_local_route_ndev_index(const struct sockaddr *sa_remote)
+{
+    static int (*real)(const struct sockaddr *);
+    int dev = -1;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(const struct sockaddr *))ucx_sym("libucs", __func__);
+        return real ? real(sa_remote) : -1;
+    }
+    return rt_len(sa_remote, -1, RTN_LOCAL, &dev) > -1 ? dev : -1;
 }
 
 /* ── Wrappers ─────────────────────────────────────────────────────────── */
@@ -3377,21 +4522,52 @@ GATED_M(cuStreamWaitValue32_v2, (CUstream st, CUdeviceptr a, cuuint32_t v, unsig
 GATED_M(cuStreamWaitValue64_v2, (CUstream st, CUdeviceptr a, cuuint64_t v, unsigned f), (st, a, v, f))
 GATED_M(cuStreamBatchMemOp_v2, (CUstream st, unsigned n, CUstreamBatchMemOpParams *p, unsigned f), (st, n, p, f))
 GATED_M(cuLaunchHostFunc, (CUstream st, CUhostFn fn, void *u), (st, fn, u))
+/* Batched copies (vLLM's KV block copies), managed-memory prefetches and
+ * stream-ordered allocations (flashinfer's top-k, PyTorch's cudaMallocAsync
+ * backend). cuda.h maps cuMemcpyBatchAsync and cuMemPrefetchAsync to _v2:
+ * GATED_G keeps the names of the CUDA 12 versions unexpanded. */
+GATED_G(mgate, cuMemcpyBatchAsync, (CUdeviceptr *d, CUdeviceptr *s, size_t *n, size_t c, CUmemcpyAttributes *a,
+        size_t *ai, size_t na, size_t *fail, CUstream st), (d, s, n, c, a, ai, na, fail, st))
+GATED_M(cuMemcpyBatchAsync_v2, (CUdeviceptr *d, CUdeviceptr *s, size_t *n, size_t c, CUmemcpyAttributes *a,
+        size_t *ai, size_t na, CUstream st), (d, s, n, c, a, ai, na, st))
+GATED_G(mgate, cuMemPrefetchAsync, (CUdeviceptr p, size_t n, CUdevice dev, CUstream st), (p, n, dev, st))
+GATED_M(cuMemPrefetchAsync_v2, (CUdeviceptr p, size_t n, CUmemLocation l, unsigned f, CUstream st), (p, n, l, f, st))
+GATED_M(cuMemAllocAsync, (CUdeviceptr *p, size_t n, CUstream st), (p, n, st))
+GATED_M(cuMemAllocFromPoolAsync, (CUdeviceptr *p, size_t n, CUmemoryPool pool, CUstream st), (p, n, pool, st))
+GATED_M(cuMemFreeAsync, (CUdeviceptr p, CUstream st), (p, st))
 
-static void *wrapper_for(const char *name, void *real);
+static void *wrapper_for(const char *name, void *real, int ver, cuuint64_t flags);
+
+/* A process that uses the GPU but allocates nothing itself (vLLM's engine
+ * core at TP > 1: its workers own the GPU memory) still needs a control
+ * socket for "nixl", which runs in its Python. Every CUDA user looks up
+ * driver entry points first. Only with NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1
+ * (set for workloads opted in to nixl): with a socket, such a process takes
+ * part in every suspend (hold, quiesce, release, load), where it is
+ * otherwise skipped. */
+static void ctl_on_cuda_use(void)
+{
+    static pid_t tried;  /* once per process: a failure is logged once */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVSNAP_GPUSHARE_CTL_ON_CUDA_USE"); on = e && *e == '1'; }
+    pid_t me = getpid();
+    if (on && __atomic_exchange_n(&tried, me, __ATOMIC_RELAXED) != me) start_ctl();
+}
 
 static CUresult w_gpa2(const char *sym, void **pfn, int ver, cuuint64_t flags,
                        CUdriverProcAddressQueryResult *st)
 {
     CUresult r = REAL(r_gpa2, "cuGetProcAddress_v2")(sym, pfn, ver, flags, st);
-    if (r == CUDA_SUCCESS && *pfn) *pfn = wrapper_for(sym, *pfn);
+    if (r == CUDA_SUCCESS && *pfn) *pfn = wrapper_for(sym, *pfn, ver, flags);
+    ctl_on_cuda_use();
     return r;
 }
 
 static CUresult w_gpa1(const char *sym, void **pfn, int ver, cuuint64_t flags)
 {
     CUresult r = REAL(r_gpa1, "cuGetProcAddress")(sym, pfn, ver, flags);
-    if (r == CUDA_SUCCESS && *pfn) *pfn = wrapper_for(sym, *pfn);
+    if (r == CUDA_SUCCESS && *pfn) *pfn = wrapper_for(sym, *pfn, ver, flags);
+    ctl_on_cuda_use();
     return r;
 }
 
@@ -3438,6 +4614,8 @@ static const struct { const char *name; void *wrapper; void **real; } hooks[] = 
     G(cuMemsetD2D8Async), G(cuMemsetD2D16Async), G(cuMemsetD2D32Async),
     G(cuStreamWriteValue32_v2), G(cuStreamWriteValue64_v2), G(cuStreamWaitValue32_v2),
     G(cuStreamWaitValue64_v2), G(cuStreamBatchMemOp_v2), G(cuLaunchHostFunc),
+    G(cuMemcpyBatchAsync), G(cuMemcpyBatchAsync_v2), G(cuMemPrefetchAsync), G(cuMemPrefetchAsync_v2),
+    G(cuMemAllocAsync), G(cuMemAllocFromPoolAsync), G(cuMemFreeAsync),
 #undef GD
 #undef G
 };
@@ -3449,10 +4627,28 @@ static void *bind_hook(size_t i, void *real)
     return hooks[i].wrapper;
 }
 
+/* Entry points whose unversioned name means another function, with other
+ * parameters, from a CUDA version on (cudaTypedefs.h): CUDA 13 dropped
+ * cuMemcpyBatchAsync's failIdx; 12.2 gave cuMemPrefetchAsync a location. */
+static const struct { const char *name; int ver; } v2_from[] = {
+    { "cuMemcpyBatchAsync", 13000 },
+    { "cuMemPrefetchAsync", 12020 },
+};
+
+static int hook_named(const char *name)
+{
+    for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); i++)
+        if (!strcmp(hooks[i].name, name)) return i;
+    return -1;
+}
+
 /* cuGetProcAddress takes unversioned names and returns the current
  * version ("cuMemAlloc" → cuMemAlloc_v2), or the _ptsz/_ptds variant for
- * per-thread default streams: match the hook by the function returned. */
-static void *wrapper_for(const char *name, void *real)
+ * per-thread default streams: match the hook by the function returned.
+ * A function at an address no hooked name exports gets the hook of what
+ * the lookup asked for (ver, flags; ver 0: dlsym, the exact name): never
+ * the exact name's by default, whose parameters may differ. */
+static void *wrapper_for(const char *name, void *real, int ver, cuuint64_t flags)
 {
     size_t len = strlen(name);
     int exact = -1;
@@ -3464,7 +4660,25 @@ static void *wrapper_for(const char *name, void *real)
                   !strcmp(suf, "_v2_ptsz") || !strcmp(suf, "_v2_ptds")) && real == cuda_sym(hooks[i].name))
             return bind_hook(i, real);
     }
-    return exact >= 0 ? bind_hook(exact, real) : real;
+    if (!ver || real == cuda_sym(name)) return exact >= 0 ? bind_hook(exact, real) : real;
+    /* The version: _v2 where the name changed meaning at ver, or where only
+     * a _v2 is hooked ("cuMemcpyHtoD" has meant cuMemcpyHtoD_v2 since CUDA
+     * 3.2); then the per-thread variant if asked for. */
+    int v2 = exact < 0;
+    for (size_t i = 0; i < sizeof(v2_from) / sizeof(v2_from[0]); i++)
+        if (!strcmp(name, v2_from[i].name) && ver >= v2_from[i].ver) v2 = 1;
+    int pt = !!(flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM), k = -1;
+    char want[96];
+    for (int j = 0; k < 0 && j < (pt ? 2 : 1); j++) {
+        snprintf(want, sizeof(want), "%s%s%s", name, v2 ? "_v2" : "", !pt ? "" : j ? "_ptds" : "_ptsz");
+        k = hook_named(want);
+    }
+    if (k >= 0) return bind_hook(k, real);
+    snprintf(want, sizeof(want), "%s_v2", name);
+    if (exact >= 0 || hook_named(want) >= 0)  /* hooked, but not that version or stream */
+        logf_("%s (CUDA %d, flags %#llx): no wrapper for that version; not gated", name, ver,
+              (unsigned long long)flags);
+    return real;
 }
 
 /* Exported entry points: direct callers (linked against libcuda) and
@@ -3502,11 +4716,22 @@ EXPORT(CUresult, cuCtxEnablePeerAccess, w_peer_on, (CUcontext c, unsigned f), (c
 EXPORT(CUresult, cuCtxDisablePeerAccess, w_peer_off, (CUcontext c), (c))
 EXPORT(CUresult, cuGetProcAddress_v2, w_gpa2, (const char *s, void **p, int v, cuuint64_t f, CUdriverProcAddressQueryResult *q), (s, p, v, f, q))
 
+/* glibc resolves RTLD_NEXT relative to the object that calls its dlsym, so
+ * that lookup is a tail call (-O2; musttail where the compiler has it): our
+ * caller's, not ours. A library after this one asking for the next
+ * definition of a function it interposes would otherwise get its own back.
+ * It is not wrapped: callers linking the driver reach the exports above,
+ * and an interposer after this library wants the driver's. */
 void *dlsym(void *handle, const char *name)
 {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, init_real_dlsym);
-    void *real = real_dlsym(handle, name);
-    if (real && name[0] == 'c' && name[1] == 'u') return wrapper_for(name, real);
-    return real;
+    if (handle != RTLD_NEXT && name[0] == 'c' && name[1] == 'u') {
+        void *real = real_dlsym(handle, name);
+        return real ? wrapper_for(name, real, 0, 0) : NULL;
+    }
+#if __has_attribute(musttail)
+    __attribute__((musttail))
+#endif
+    return real_dlsym(handle, name);
 }

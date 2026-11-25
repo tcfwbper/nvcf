@@ -469,6 +469,11 @@ type Mutator struct {
 	// GPUShareByDefault puts every GPU pod under the gpushare library
 	// unless it is annotated nvsnap.io/gpushare: "false" (CRIU clusters).
 	GPUShareByDefault bool
+	// GPUShareIBVByDefault treats every pod under the gpushare library as
+	// annotated nvsnap.io/gpushare-ibv: "true" unless it is annotated
+	// "false", so that a workload whose NCCL uses RDMA can be captured
+	// without a change to its pods (chart webhook.gpushareIBV).
+	GPUShareIBVByDefault bool
 	// CRIUCapture is set when the cluster captures with CRIU (agent
 	// captureMethod criu): a restore brings the whole process back, so the
 	// cachedir capture and its compile-cache set do not run, and GPU pods

@@ -652,6 +652,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	router.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/verdict", a.fabricVerdictHandler).Methods("PUT")
 	router.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/in", a.fabricInHandler).Methods("PUT")
 	router.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/unlock", a.fabricUnlockHandler).Methods("PUT")
+	router.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/open", a.fabricOpenHandler).Methods("PUT")
 	router.HandleFunc("/v1/gpushare/group-restore", a.groupRestoreHandler).Methods("POST")
 	router.HandleFunc("/v1/restore", a.restoreHandler).Methods("POST")
 	// Instance companions (criu_companion.go): a rank's connections, and

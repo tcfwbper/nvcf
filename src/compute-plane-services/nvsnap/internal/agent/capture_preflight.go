@@ -332,8 +332,32 @@ func rdmaDevices(procBase string, pid int) []string {
 	return devs
 }
 
+// ibvLibName is the verbs library a pod annotated nvsnap.io/gpushare-ibv
+// gives NCCL (webhook GPUShareIBVLibPath).
+const ibvLibName = "libnvsnap_ibv.so"
+
+// mapsIBVLib reports whether process pid has libnvsnap_ibv.so loaded.
+func mapsIBVLib(procBase string, pid int) bool {
+	b, err := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "maps"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) >= 6 && filepath.Base(f[5]) == ibvLibName {
+			return true
+		}
+	}
+	return false
+}
+
 // rdmaFindings blocks the capture of a container whose processes hold
-// RDMA devices, one finding per process, naming it and its devices.
+// RDMA devices, one finding per process, naming it and its devices. A
+// process whose NCCL takes its verbs from libnvsnap_ibv.so only warns:
+// the GPU suspend destroys NCCL's RDMA state and the restore creates it
+// again. Which of its device files are NCCL's cannot be told from here;
+// the process itself tells them apart (nvsnap_ibv_fds), and its "quiesce"
+// refuses RDMA left outside NCCL's (UCX, NIXL), before anything stops, so
+// the workload runs on (gpushare.c do_quiesce).
 func rdmaFindings(procBase, pod, container string, rdma map[int][]string) []PreflightFinding {
 	pids := make([]int, 0, len(rdma))
 	for pid := range rdma {
@@ -343,6 +367,12 @@ func rdmaFindings(procBase, pod, container string, rdma map[int][]string) []Pref
 	fs := make([]PreflightFinding, 0, len(pids))
 	for _, pid := range pids {
 		comm, _ := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "comm"))
+		if mapsIBVLib(procBase, pid) {
+			fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightWarn, Check: "rdma", PID: pid,
+				Detail: fmt.Sprintf("process %d (%s) holds RDMA devices %s through %s: NCCL's are released at the GPU suspend; RDMA anything else in it holds refuses the quiesce, and the workload runs on uncaptured",
+					pid, strings.TrimSpace(string(comm)), strings.Join(rdma[pid], ", "), ibvLibName)})
+			continue
+		}
 		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "rdma", PID: pid,
 			Detail: fmt.Sprintf("process %d (%s) holds RDMA devices %s: a checkpoint cannot save RDMA state (checkpoint-restore/criu#267); the workload has to release them before it is captured",
 				pid, strings.TrimSpace(string(comm)), strings.Join(rdma[pid], ", "))})

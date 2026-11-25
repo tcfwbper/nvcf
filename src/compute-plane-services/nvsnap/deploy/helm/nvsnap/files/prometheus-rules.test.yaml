@@ -105,6 +105,8 @@ tests:
     values: 0 1 1
   - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="failed",reason="no_gpu_process",gpu="GB300",ranks="2-4"}
     values: 0 1 1
+  - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="failed",reason="modelexpress_version",gpu="GB300",ranks="2-4"}
+    values: 0 1 1
   - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="captured",reason="",gpu="GB300",ranks="2-4"}
     values: 0 1 1
   - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="verified",reason="",gpu="GB300",ranks="2-4"}

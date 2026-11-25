@@ -33,11 +33,11 @@ for platform in ${PLATFORMS:-linux/amd64 linux/arm64}; do
     docker rm "$cid" >/dev/null
     docker run --rm --platform "$platform" -e MAX_GLIBC="$max_glibc" \
         -v "$root:/src:ro" -v "$hdr:/cuda/include:ro" "$builder" bash -ceu '
-        dnf -q -y install gcc make >/dev/null
+        dnf -q -y install gcc make rdma-core-devel >/dev/null
         # -B: copied-in local build outputs must not let make skip a compile.
         cp -r /src/docker/agent/gpushare /tmp/gpushare
         make -B -C /tmp/gpushare CUDA_INC=/cuda/include CFLAGS="-O2 -Wall -Wextra -Werror"
-        for bin in /tmp/gpushare/libnvsnap_gpushare.so /tmp/gpushare/nvsnap-gpu-suspend; do
+        for bin in /tmp/gpushare/libnvsnap_gpushare.so /tmp/gpushare/nvsnap-gpu-suspend /tmp/gpushare/libnvsnap_ibv.so; do
             need="$(objdump -T "$bin" | grep -o "GLIBC_[0-9.]*" | sed "s/GLIBC_//" | sort -V | tail -1)"
             if [ "$(printf "%s\n%s\n" "$need" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
                 echo "$bin needs glibc $need, newer than the documented $MAX_GLIBC" >&2

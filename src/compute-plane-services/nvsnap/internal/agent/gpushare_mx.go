@@ -9,7 +9,8 @@ package agent
 // (checkpoint-restore/criu#267), and registrations that would not survive
 // a restore anyway. The GPU tool's mx-pause has ModelExpress in each
 // process drop that state, and fails while any RDMA device is still held
-// (NCCL or NIXL KV over RDMA outside ModelExpress); mx-resume registers
+// (NIXL KV, or NCCL with its own verbs; NCCL's through the GPU library's
+// verbs, NCCL_IBVERBS_LIB, are closed at the suspend); mx-resume registers
 // the weights again and publishes them under a new worker id. A capture
 // pauses a ModelExpress worker right before its suspend, after the
 // instance is held and the capture claimed, so a skipped or retried
@@ -230,8 +231,8 @@ func mxPausable(procBase string, sessionHostPID int) map[int]bool {
 // releasedByMXPause turns the RDMA findings of the processes in pausable
 // (mxPausable) from blocking into information: the capture has
 // ModelExpress in them release their RDMA right before its suspend, and
-// fails there, before the instance is stopped, if any is still held (NCCL
-// or NIXL KV outside ModelExpress). RDMA of any other process still
+// fails there, before the instance is stopped, if any is still held (NIXL
+// KV, or NCCL with its own verbs). RDMA of any other process still
 // blocks: mx-pause does not check it, and the dump would fail on it.
 func releasedByMXPause(fs []PreflightFinding, pausable map[int]bool) []PreflightFinding {
 	out := make([]PreflightFinding, len(fs))

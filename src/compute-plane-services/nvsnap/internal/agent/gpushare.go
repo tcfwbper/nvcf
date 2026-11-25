@@ -418,9 +418,12 @@ func suspendFailure(err error) error {
 
 // gpushareResume restores the driver state of pids, loads their saved GPU
 // memory, re-creates the shared mappings and lets them run. gpuMap, when
-// set, maps the capture's GPUs onto the ones visible here.
-func gpushareResume(ctx context.Context, hostPID int, pids []int, gpuMap, fabricDir string, log *logrus.Entry) error {
-	_, err := gpushareResumeWithGPUsOf(ctx, hostPID, hostPID, pids, gpuMap, fabricDir, false, 0, log)
+// set, maps the capture's GPUs onto the ones visible here. syncOpen, with
+// fabricDir, holds their GPU launches until every node of the instance has
+// resumed, waiting at most syncOpen for the driver's verdict (--sync-open;
+// fabricOpener). Zero: they go through at once, as before.
+func gpushareResume(ctx context.Context, hostPID int, pids []int, gpuMap, fabricDir string, syncOpen time.Duration, log *logrus.Entry) error {
+	_, err := gpushareResumeWithGPUsOf(ctx, hostPID, hostPID, pids, gpuMap, fabricDir, false, syncOpen, 0, log)
 	return err
 }
 
@@ -433,7 +436,7 @@ func gpushareResume(ctx context.Context, hostPID int, pids []int, gpuMap, fabric
 // when set, is the CLOCK_MONOTONIC their dump recorded: the tool thaws them
 // only once their clocks have reached it (restore_clock_gpu.go); it
 // returns how long the tool waited for that.
-func gpushareResumeWithGPUsOf(ctx context.Context, hostPID, gpusPID int, pids []int, gpuMap, fabricDir string, holdGate bool, clockAt int64, log *logrus.Entry) (time.Duration, error) {
+func gpushareResumeWithGPUsOf(ctx context.Context, hostPID, gpusPID int, pids []int, gpuMap, fabricDir string, holdGate bool, syncOpen time.Duration, clockAt int64, log *logrus.Entry) (time.Duration, error) {
 	env := podGPUEnv(gpusPID)
 	if env == nil && gpusPID != hostPID {
 		// No UUIDs in NVIDIA_VISIBLE_DEVICES (GPUs given as device nodes,
@@ -447,14 +450,17 @@ func gpushareResumeWithGPUsOf(ctx context.Context, hostPID, gpusPID int, pids []
 		env = cudaVisibleEnv(gpus)
 	}
 	env = append(env, resumeDiagEnv()...)
-	args := gpushareResumeArgs(gpuMap, fabricDir, holdGate, clockAt, pids)
+	args := gpushareResumeArgs(gpuMap, fabricDir, holdGate, syncOpen, clockAt, pids)
 	t0 := time.Now()
-	out, err := gpushareToolEnv(ctx, hostPID, env, gpushareResumeDeadline, args...)
+	out, err := gpushareToolRun(ctx, hostPID, env, gpushareResumeDeadline, args...)
 	if err != nil {
 		return 0, err
 	}
 	log.WithFields(logrus.Fields{"pids": pids, "duration": time.Since(t0).Round(time.Millisecond).String()}).
 		Info("gpushare: resumed " + lastLines(out, 1))
+	if err := resumeOutputErr(out); err != nil {
+		return 0, err
+	}
 	// Each pid's remap reply: what it remapped, and where the time went
 	// (host register, imports, map, multicast).
 	for _, l := range remapReplies(out) {
@@ -526,8 +532,40 @@ func gpushareSuspendArgs(store, fabricDir string, pids []int) []string {
 	return append(append(args, "suspend"), intsToStrings(pids)...)
 }
 
-// gpushareResumeArgs builds the resume command line.
-func gpushareResumeArgs(gpuMap, fabricDir string, holdGate bool, clockAt int64, pids []int) []string {
+// gpushareSyncOpenWait is how long a node's tool waits, resumed in place
+// with its GPU launches held, for the driver's open verdict: the driver's
+// deadline (fabricOpenDeadline) and a minute, so that the driver, not the
+// tool, ends the wait unless the driver is gone. Then it opens anyway.
+const gpushareSyncOpenWait = fabricOpenDeadline + time.Minute
+
+// gpushareSyncOpenSupported reports whether the GPU tool (its binary's
+// text) has --sync-open; a tool from before it would take the option for
+// its command. "" (the text could not be read) is false.
+func gpushareSyncOpenSupported(toolText string) bool {
+	return strings.Contains(toolText, "--sync-open")
+}
+
+// openUnsyncedText is what the tool prints when it let a node's GPU
+// launches through before every node reported resumed: the driver answered
+// "abort", or did not answer in time (nvsnap-gpu-suspend.c, open_synced).
+const openUnsyncedText = "GPU launches let through before every node resumed"
+
+// resumeOutputErr fails a resume whose tool let the GPU launches through
+// before every node had resumed. The workload runs, its gates open: a
+// stalled resume (it may hang on memory another node had not bound yet),
+// not a source left suspended.
+func resumeOutputErr(out string) error {
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); strings.Contains(l, openUnsyncedText) {
+			return fmt.Errorf("%w: %s", errResumeStalled, l)
+		}
+	}
+	return nil
+}
+
+// gpushareResumeArgs builds the resume command line. syncOpen goes with
+// fabricDir only (see gpushareResume).
+func gpushareResumeArgs(gpuMap, fabricDir string, holdGate bool, syncOpen time.Duration, clockAt int64, pids []int) []string {
 	var args []string
 	if holdGate {
 		args = append(args, "--hold-gate")
@@ -540,6 +578,9 @@ func gpushareResumeArgs(gpuMap, fabricDir string, holdGate bool, clockAt int64, 
 	}
 	if fabricDir != "" {
 		args = append(args, "--fabric-map", fabricDir)
+		if syncOpen > 0 {
+			args = append(args, "--sync-open", strconv.FormatInt(syncOpen.Milliseconds(), 10))
+		}
 	}
 	return append(append(args, "resume"), intsToStrings(pids)...)
 }

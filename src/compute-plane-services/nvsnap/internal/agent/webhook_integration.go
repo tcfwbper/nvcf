@@ -72,6 +72,8 @@ type WebhookConfig struct {
 	// freeze is held out of service until its capture is settled
 	// (capture_hold.go).
 	CaptureHold bool
+	// GPUShareIBV is webhook.Mutator.GPUShareIBVByDefault.
+	GPUShareIBV bool
 
 	// CacheSalt is folded into every cache identity the webhook composes
 	// (rootfsonly.HashInputComposer.Salt). Bump it to start fresh captures
@@ -230,6 +232,9 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		// On a CRIU cluster every GPU pod runs under the gpushare library,
 		// which keeps GPU memory out of the CRIU image.
 		GPUShareByDefault: criuIsDefault(),
+		// NCCL in pods under the library takes its verbs from the bundled
+		// library, which releases its RDMA state around a capture.
+		GPUShareIBVByDefault: cfg.GPUShareIBV,
 		// nvsnap#202: restore-prep strategy. When "init-container",
 		// the webhook emits a nvsnap-mount-prep init container instead
 		// of doing the OverlayFS mount syscalls during admission.

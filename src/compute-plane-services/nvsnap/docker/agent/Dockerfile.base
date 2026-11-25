@@ -34,7 +34,7 @@ RUN gcc -O2 -o /src/nvsnap-cuda-checkpoint /src/nvsnap-cuda-checkpoint.c \
 # at the x86_64 target and cannot be read when building for arm64).
 FROM --platform=$BUILDPLATFORM nvidia/cuda:13.0.3-devel-ubuntu22.04 AS cuda-headers
 FROM rockylinux:8 AS gpushare-builder
-RUN dnf -y install gcc make && dnf clean all
+RUN dnf -y install gcc make rdma-core-devel && dnf clean all
 COPY --from=cuda-headers /usr/local/cuda/include/cuda.h /cuda/include/cuda.h
 COPY gpushare /src/gpushare
 RUN make -C /src/gpushare CUDA_INC=/cuda/include
@@ -198,7 +198,8 @@ COPY cuda-checkpoint-wrapper.sh /criu-bundle/cuda-checkpoint
 RUN chmod +x /criu-bundle/cuda-checkpoint
 
 # gpushare (see gpushare-builder above).
-COPY --from=gpushare-builder /src/gpushare/libnvsnap_gpushare.so /src/gpushare/nvsnap-gpu-suspend /criu-bundle/
+COPY --from=gpushare-builder /src/gpushare/libnvsnap_gpushare.so /src/gpushare/nvsnap-gpu-suspend \
+    /src/gpushare/libnvsnap_ibv.so /criu-bundle/
 
 # Make everything executable
 RUN chmod +x /criu-bundle/*

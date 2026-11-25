@@ -125,8 +125,8 @@ func finalOf(leaveRunning bool) dumpFinal {
 // resumeSource brings a source back after its dump, under the resume's own
 // deadline (gpushareResumeDeadline), not the capture's context: that may
 // have run out, which is often why the dump failed.
-func resumeSource(ctx context.Context, hostPID int, pids []int, fabricDir string, log *logrus.Entry) error {
-	return gpushareResume(context.WithoutCancel(ctx), hostPID, pids, "", fabricDir, log)
+func resumeSource(ctx context.Context, hostPID int, pids []int, fabricDir string, syncOpen time.Duration, log *logrus.Entry) error {
+	return gpushareResume(context.WithoutCancel(ctx), hostPID, pids, "", fabricDir, syncOpen, log)
 }
 
 // ownGPUShareStore makes the workload's chunk store (and the fabric
@@ -194,9 +194,11 @@ func sourceMustBeReplaced(err error) bool {
 }
 
 // sourceMustBeReplacedText is sourceMustBeReplaced on an error's text, as
-// it comes back from another node's agent.
+// it comes back from another node's agent; a source that exited while
+// suspended (markWorkloadExited) is replaced too.
 func sourceMustBeReplacedText(s string) bool {
-	return strings.Contains(s, errSourceLeftSuspended.Error()) || strings.Contains(s, errSourceLeftLocked.Error())
+	return strings.Contains(s, errSourceLeftSuspended.Error()) || strings.Contains(s, errSourceLeftLocked.Error()) ||
+		strings.Contains(s, errWorkloadExited.Error()) && strings.Contains(s, workloadExitedReplaced)
 }
 
 // runDump runs a CRIU dump (name args...) to its end, under its own
@@ -219,6 +221,9 @@ func runDump(ctx context.Context, deadline time.Duration, env []string, name str
 type dumpV2Opts struct {
 	LeaveRunning  bool
 	FabricSession string
+	// SyncOpen: the session's driver runs the open phase
+	// (CheckpointRequest.GPUShareSyncOpen).
+	SyncOpen bool
 	// Freeze, for a member of a group capture, returns once every member
 	// of the group is ready to be dumped (group_freeze.go); it runs right
 	// before criu starts, so the members stop together.
@@ -251,11 +256,14 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	// A dump that fails before CRIU has dumped the container, with the
 	// container's process ended, failed because the workload exited
 	// (workload_exited.go). Once CRIU has dumped it, the dump itself
-	// stopped the process, and a later failure is nvsnap's.
+	// stopped the process, and a later failure is nvsnap's; unless the
+	// dump left it running, when an end at any point is the workload's.
 	// A process already gone here is the workload's exit too.
 	initStart, initGone := initialStart(procBase, hostPID)
 	dumped := false
-	defer func() { retErr = dumpFailure(retErr, dumped, procBase, hostPID, initStart, initGone) }()
+	defer func() {
+		retErr = dumpFailure(retErr, stoppedByDump(dumped, leaveRunning), procBase, hostPID, initStart, initGone)
+	}()
 
 	// 1. The tools run from the node bundle mounted read-only in the
 	// container (bundle_tools.go), never from a copy in its filesystem. A
@@ -315,6 +323,12 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	var gsInfo *GPUShareInfo
 	var gpuMap string
 	var guard suspendGuard
+	// syncOpen: the source's in-place resume holds its GPU launches until
+	// every node has resumed (syncOpenFor).
+	var syncOpen time.Duration
+	// A leave-running capture watches the node's kernel log from before
+	// its suspend to after its resume (kmsg.go, resume_guard.go).
+	var faults *gpuFaultWatch
 	if fabricSession != "" && !gsOn {
 		return nil, errNoGPUProcess(fabricSession)
 	}
@@ -372,6 +386,11 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 				}
 			}()
 		}
+		if leaveRunning {
+			faults = startGPUFaultWatch(log)
+			defer faults.close()
+		}
+		syncOpen = syncOpenFor(leaveRunning, o.SyncOpen, fabric, tools.gpuToolText(), tools.version, log)
 		gm, suspended, serr := gpushareSuspend(ctx, hostPID, gsPIDs, fabricDir, log)
 		if suspended {
 			// The source is stopped with its GPU memory released from
@@ -379,7 +398,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			// settles it (settleSource); any return before the dump brings
 			// it back through the guard. Deferred after the fabric
 			// session's close, so it runs while the session is still open.
-			guard.arm(func() error { return resumeSource(ctx, hostPID, gsPIDs, fabricDir, log) }, func() {
+			guard.arm(func() error { return resumeSource(ctx, hostPID, gsPIDs, fabricDir, syncOpen, log) }, func() {
 				if o.PostDumpDir != "" {
 					markPostDumpFailed(o.PostDumpDir, log)
 				}
@@ -460,10 +479,20 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	}
 	guard.handOff()
 	resumeErr := settleSource(gsOn, leaveRunning, err != nil, func() error {
-		return resumeSource(ctx, hostPID, gsPIDs, fabricDir, log)
+		return resumeSource(ctx, hostPID, gsPIDs, fabricDir, syncOpen, log)
 	})
-	if err != nil || resumeErr != nil {
-		return nil, errors.Join(err, resumeErr)
+	// A workload left running is seen running again before the capture
+	// succeeds: no GPU fault in the kernel log over the capture, and every
+	// GPU process it suspended still there (resume_guard.go).
+	var resumed error
+	if leaveRunning && gsOn {
+		resumed = faults.check(driverGPUsDir, gpuMap, checkpointDir)
+		if resumed == nil && err == nil && resumeErr == nil {
+			resumed = membersAfterResume(procBase, targetHostPID, gsPIDs)
+		}
+	}
+	if err != nil || resumeErr != nil || resumed != nil {
+		return nil, errors.Join(resumed, err, resumeErr)
 	}
 	if gsOn {
 		closeFabric()
@@ -487,9 +516,44 @@ func settleSource(suspended, leaveRunning, dumpFailed bool, resume func() error)
 		return nil
 	}
 	if err := resume(); err != nil {
-		return fmt.Errorf("%w: resume after the dump: %w", errSourceLeftSuspended, err)
+		return resumeFailure("resume after the dump", err)
 	}
 	return nil
+}
+
+// syncOpenFor is the --sync-open of the source's resume: in place across
+// nodes, the resume holds the GPU launches until every node has resumed
+// (gpushare_fabric.go, fabricOpener). It declares that to the driver
+// (holdsOpen) before the suspend, so that the driver waits for this member.
+// Zero (no hold) on one node, for a dump that does not resume in place,
+// when the driver did not ask for it (driverOpens: a driver from before the
+// open phase never answers, and the hold would only delay the engine by
+// gpushareSyncOpenWait and fail the capture), and with a tool from before
+// --sync-open; the last two are logged.
+func syncOpenFor(leaveRunning, driverOpens bool, fabric *fabricSessionDir, toolText, bundle string, log *logrus.Entry) time.Duration {
+	if !leaveRunning || fabric == nil {
+		return 0
+	}
+	if !driverOpens {
+		log.Warn("gpushare: the fabric session's driver does not open the GPU launches once every node has resumed (an older agent); this node lets them through at its own resume")
+		return 0
+	}
+	if !gpushareSyncOpenSupported(toolText) {
+		log.Warnf("gpushare: the GPU tool of node bundle %s cannot hold the GPU launches until every node has resumed (no --sync-open); this node lets them through at its own resume", bundle)
+		return 0
+	}
+	fabric.holdsOpen.Store(true)
+	return gpushareSyncOpenWait
+}
+
+// resumeFailure is how a failed resume left the source: suspended, for the
+// caller to replace, unless the resume ran it again and only found it
+// stalled (its GPU launches let through before every node resumed).
+func resumeFailure(what string, err error) error {
+	if errors.Is(err, errResumeStalled) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return fmt.Errorf("%w: %s: %w", errSourceLeftSuspended, what, err)
 }
 
 // suspendGuard settles a source the capture suspended when the capture
@@ -524,7 +588,7 @@ func (g *suspendGuard) settle(err error) error {
 		abort()
 	}
 	if rerr := resume(); rerr != nil {
-		return errors.Join(err, fmt.Errorf("%w: resume after the capture failed before its dump: %w", errSourceLeftSuspended, rerr))
+		return errors.Join(err, resumeFailure("resume after the capture failed before its dump", rerr))
 	}
 	return err
 }

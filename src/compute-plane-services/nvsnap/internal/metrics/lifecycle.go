@@ -342,6 +342,23 @@ const (
 	// NoGPUProcessText: a multi-node instance's pod had no process on the
 	// GPU under the gpushare library to capture.
 	NoGPUProcessText = "no process of this pod runs on the gpu"
+	// ModelExpressVersionText: the workload loads its weights through a
+	// ModelExpress older than 0.7, which cannot release its state for a
+	// capture (the GPU tool's mx-pause refuses it). Not captured until
+	// the workload updates ModelExpress.
+	ModelExpressVersionText = "needs modelexpress >= 0.7"
+)
+
+// The texts Reason classes as a capture that broke the workload it left
+// running: nvsnap's doing, which the capture alert counts.
+const (
+	// GPUFaultText: the node's kernel reported a GPU fault (an NVLink
+	// Xid) on the workload's GPUs between the start of a leave-running
+	// capture and its resume (internal/agent/kmsg.go).
+	GPUFaultText = "the kernel reported a gpu fault during the capture"
+	// ResumeStalledText: a leave-running capture resumed the workload, but
+	// it stopped serving after (internal/agent/resume_guard.go).
+	ResumeStalledText = "the workload stopped making progress after resume"
 )
 
 // BundleUnavailableText starts the error of a restore that cannot run
@@ -359,12 +376,20 @@ func Reason(text string) string {
 	// (a peer's name may hold "mptcp" or "gpushare").
 	case strings.HasPrefix(t, BundleUnavailableText):
 		return "bundle_unavailable"
-	// The workload's own doing, checked first: the rest of the text is
+	// A GPU fault the capture raised, next: a workload that exited, or
+	// stopped, after one did so because of it.
+	case strings.Contains(t, GPUFaultText):
+		return "gpu_xid"
+	// The workload's own doing, checked next: the rest of the text is
 	// what the capture ran into because of it.
 	case strings.Contains(t, WorkloadExitedText):
 		return "workload_exited"
 	case strings.Contains(t, NoGPUProcessText):
 		return "no_gpu_process"
+	case strings.Contains(t, ModelExpressVersionText):
+		return "modelexpress_version"
+	case strings.Contains(t, ResumeStalledText):
+		return "resume_stalled"
 	case strings.Contains(t, "mptcp"):
 		return "mptcp"
 	case strings.Contains(t, "no nvsnap agent"):

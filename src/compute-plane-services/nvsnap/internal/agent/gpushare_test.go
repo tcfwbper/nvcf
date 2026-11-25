@@ -27,6 +27,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
 
@@ -365,5 +368,88 @@ func TestOpenHeldGPUOnUnlock(t *testing.T) {
 				t.Errorf("err = %v, want one containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// A leave-running group capture asks the tool to hold the GPU launches at
+// its resume until every node has resumed (resume --sync-open); only a tool
+// that has the option gets it.
+func TestGpushareSyncOpen_ArgsAndSupport(t *testing.T) {
+	got := gpushareResumeArgs("", "/s/.fabric-x", false, gpushareSyncOpenWait, 0, []int{7, 8})
+	want := []string{"--fabric-map", "/s/.fabric-x", "--sync-open", "180000", "resume", "7", "8"}
+	if !slices.Equal(got, want) {
+		t.Errorf("resume args = %v, want %v", got, want)
+	}
+	if got := gpushareResumeArgs("", "", false, gpushareSyncOpenWait, 0, []int{7}); slices.Contains(got, "--sync-open") {
+		t.Errorf("--sync-open without a fabric session: %v", got)
+	}
+	if got := gpushareResumeArgs("", "/f", false, 0, 0, []int{7}); slices.Contains(got, "--sync-open") {
+		t.Errorf("--sync-open when not asked: %v", got)
+	}
+	if slices.Contains(gpushareSuspendArgs("/s", "/f", []int{7}), "--sync-open") {
+		t.Error("the suspend carries --sync-open")
+	}
+	if toolVerb(want) != "resume" {
+		t.Errorf("toolVerb = %q", toolVerb(want))
+	}
+	if gpushareSyncOpenWait <= fabricOpenDeadline {
+		t.Errorf("the tool's own wait (%s) must outlast the driver's deadline (%s)", gpushareSyncOpenWait, fabricOpenDeadline)
+	}
+	if !gpushareSyncOpenSupported("--sync-open MS: (suspend, with --fabric-map) ...") {
+		t.Error("a tool with --sync-open")
+	}
+	for _, text := range []string{"--hold-gate --fabric-map DIR", ""} {
+		if gpushareSyncOpenSupported(text) {
+			t.Errorf("%q: reported as supported", text)
+		}
+	}
+}
+
+// The tool says when it let the launches through before every node
+// resumed; the resume then fails as stalled (the workload runs).
+func TestResumeOutputErr(t *testing.T) {
+	if err := resumeOutputErr("pid=7 open: ok opened\nsync-open: every node resumed: launches let through\n"); err != nil {
+		t.Errorf("synced open: %v", err)
+	}
+	if err := resumeOutputErr("thawed all pids\n"); err != nil {
+		t.Errorf("plain resume: %v", err)
+	}
+	line := "sync-open: the driver answered abort (a node did not resume); " + openUnsyncedText
+	err := resumeOutputErr("pid=7 open: ok opened\n" + line + "\nthawed all pids\n")
+	if !errors.Is(err, errResumeStalled) || !strings.Contains(err.Error(), line) {
+		t.Errorf("unsynced open: %v; want stalled with the tool's line", err)
+	}
+}
+
+// The source's in-place resume (resumeSource, the call the dump's
+// settlement makes) fails as stalled, not as left suspended, when its tool
+// let the launches through before every node resumed.
+func TestResumeSource_UnsyncedOpenIsStalled(t *testing.T) {
+	prev := gpushareToolRun
+	t.Cleanup(func() { gpushareToolRun = prev })
+	out := "thawed all pids\npid=7 open: ok opened\n"
+	var args []string
+	gpushareToolRun = func(_ context.Context, _ int, _ []string, _ time.Duration, a ...string) (string, error) {
+		args = a
+		return out, nil
+	}
+	log := logrus.NewEntry(logrus.New())
+	if err := resumeSource(t.Context(), 1, []int{7}, "/f", gpushareSyncOpenWait, log); err != nil {
+		t.Fatalf("synced resume: %v", err)
+	}
+	if want := []string{"--fabric-map", "/f", "--sync-open", "180000", "resume", "7"}; !slices.Equal(args, want) {
+		t.Errorf("resume args = %v, want %v", args, want)
+	}
+	out += "sync-open: no verdict in /f/o after 180000 ms; " + openUnsyncedText + "\n"
+	err := settleSource(true, true, false, func() error { return resumeSource(t.Context(), 1, []int{7}, "/f", gpushareSyncOpenWait, log) })
+	if !errors.Is(err, errResumeStalled) || errors.Is(err, errSourceLeftSuspended) || !strings.Contains(err.Error(), "no verdict") {
+		t.Fatalf("unsynced resume: %v; want stalled with the tool's line, not left suspended", err)
+	}
+	// The stop failed after the suspend: the resume goes through the
+	// holder, which opens at once and says so.
+	out = "sync-open: only after stop; " + openUnsyncedText + "\nresume requested (signal 10)\nthawed all pids\n"
+	err = settleSource(true, true, false, func() error { return resumeSource(t.Context(), 1, []int{7}, "/f", gpushareSyncOpenWait, log) })
+	if !errors.Is(err, errResumeStalled) || errors.Is(err, errSourceLeftSuspended) || !strings.Contains(err.Error(), "only after stop") {
+		t.Fatalf("resume through the holder: %v; want stalled, not left suspended", err)
 	}
 }

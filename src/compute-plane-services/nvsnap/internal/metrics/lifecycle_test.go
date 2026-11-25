@@ -110,6 +110,19 @@ func TestReason(t *testing.T) {
 		"CRIU dump failed (criu-v2): the workload exited during the capture: criu-v2 pid-namespace dump: exit status 1": "workload_exited",
 		"group checkpoint s1: 2 of 2 members failed: ns/p-0: 500 Internal Server Error: checkpoint failed: CRIU dump failed (criu-v2): " +
 			"gpushare: fabric session s1, but no process of this pod runs on the GPU under libnvsnap_gpushare.so": "no_gpu_process",
+		// As the agent wrote it on a GB300 cluster: the text also says RDMA.
+		"group checkpoint s8: 8 of 8 members failed: ns/w-0: 500 Internal Server Error: checkpoint failed: CRIU dump failed (criu-v2): " +
+			"gpushare: ModelExpress could not release the worker's RDMA state: nvsnap-gpu-suspend mx-pause: exit status 1: " +
+			"pid=995 mx pause: err RuntimeError: needs ModelExpress >= 0.7 (earlier releases drop the load context after loading)": "modelexpress_version",
+		// A leave-running group cycle whose resume raised NVLink errors.
+		"group checkpoint s2: 1 of 2 members failed: ns/a: 500 Internal Server Error: checkpoint failed: CRIU dump failed (criu-v2): " +
+			"the kernel reported a GPU fault during the capture: Xid 137 on 0008:06:00 (72 lines)": "gpu_xid",
+		// The fault comes first even when another member's workload then exited.
+		"group checkpoint s2: 2 of 2 members failed: ns/a: the workload exited during the capture; ns/b: " +
+			"the kernel reported a GPU fault during the capture: Xid 137 on 0008:06:00": "gpu_xid",
+		"group checkpoint s3: the workload stopped making progress after resume: ns/a: container engine restarted": "resume_stalled",
+		// Its text names gpushare too; the stall is the class.
+		"gpushare: the workload stopped making progress after resume: pid 811 of the gpushare members ended": "resume_stalled",
 	} {
 		if got := Reason(text); got != want {
 			t.Errorf("Reason(%q) = %q, want %q", text, got, want)

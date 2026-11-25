@@ -81,6 +81,7 @@ where the files column says.
 | `nvsnap.io/gpus` | `annGPUs` (internal/server/manifests.go) |  |
 | `nvsnap.io/gpushare` | `GPUShareAnnotation` (internal/webhook/gpushare.go) | Opts a pod in. |
 | `nvsnap.io/gpushare-fabric` | `GPUShareFabricAnnotation` (internal/webhook/gpushare.go) | Marks a pod whose GPU memory is shared with pods on other nodes over multi-node NVLink. |
+| `nvsnap.io/gpushare-ibv` | `GPUShareIBVAnnotation` (internal/webhook/gpushare.go) | ("true") sets NCCL_IBVERBS_LIB to libnvsnap_ibv.so in each GPU container that gets the gpushare library (nvsnap.io/gpushare, gpusharePatches) and does not set that variable in its env, so that a pod whose NCCL uses RDMA (IB or RoCE) can… |
 | `nvsnap.io/hash` | `HashAnnotation` (internal/election/election.go)<br>`HashLabel` (internal/election/election.go)<br>`stampedHashAnnotation` (internal/rootfsonly/watcher.go) | Carries the full cache hash the webhook composed at admission. |
 | `nvsnap.io/hash-short` | `labelHashShort` (internal/checkpointstore/promoter_shared.go) |  |
 | `nvsnap.io/inject` | `InjectLabel` (internal/webhook/mutate.go) | On a pod (or, via the registration's namespaceSelector, on its namespace) set to InjectDisabled opts the pod out of every nvsnap mutation. |
@@ -228,6 +229,7 @@ API is specified in [openapi.yaml](../internal/server/openapi.yaml).
 | `/v1/gpushare/fabric/{session}/{namespace}/{pod}/verdict` | PUT | `fabricVerdictHandler` |
 | `/v1/gpushare/fabric/{session}/{namespace}/{pod}/in` | PUT | `fabricInHandler` |
 | `/v1/gpushare/fabric/{session}/{namespace}/{pod}/unlock` | PUT | `fabricUnlockHandler` |
+| `/v1/gpushare/fabric/{session}/{namespace}/{pod}/open` | PUT | `fabricOpenHandler` |
 | `/v1/gpushare/group-restore` | POST | `groupRestoreHandler` |
 | `/v1/restore` | POST | `restoreHandler` |
 | `/v1/pods/{namespace}/{pod}/peers` | GET | `peersHandler`: Instance companions (criu_companion.go): a rank's connections, and the continue of a companion restored stopped. |

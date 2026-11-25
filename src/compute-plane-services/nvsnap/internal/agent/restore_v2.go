@@ -450,7 +450,7 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		toolPID = resumePID
 		// Run to its end under its own deadline: cut off by the agent
 		// stopping, it would leave the tree stopped without its GPU memory.
-		waited, err := gpushareResumeWithGPUsOf(context.WithoutCancel(ctx), resumePID, hostPID, gs.PIDs, gpuMap, fabricDir, holdGate, clockAt, log)
+		waited, err := gpushareResumeWithGPUsOf(context.WithoutCancel(ctx), resumePID, hostPID, gs.PIDs, gpuMap, fabricDir, holdGate, 0, clockAt, log)
 		clockWait = waited
 		if clockThroughGPU {
 			times.add("clock_wait", waited)

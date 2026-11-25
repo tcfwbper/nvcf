@@ -38,6 +38,22 @@ const (
 	// that memory as fabric handles, which a multi-node suspend can
 	// re-establish (see the agent's group checkpoint).
 	GPUShareFabricAnnotation = "nvsnap.io/gpushare-fabric"
+	// GPUShareIBVAnnotation ("true") sets NCCL_IBVERBS_LIB to
+	// libnvsnap_ibv.so in each GPU container that gets the gpushare library
+	// (nvsnap.io/gpushare, gpusharePatches) and does not set that variable
+	// in its env, so that a pod whose NCCL uses RDMA (IB or RoCE) can be
+	// captured: the library destroys NCCL's RDMA state before the checkpoint
+	// and creates it again after the restore (docs/design/GPUSHARE.md).
+	// "false" opts a pod out of Mutator.GPUShareIBVByDefault; unset follows
+	// it (off unless the chart sets webhook.gpushareIBV), except in a
+	// container whose envFrom may set the variable (admission does not read
+	// ConfigMaps or Secrets): only "true" overrides that. A container that
+	// already mounts something other than the selected node bundle at
+	// /nvsnap gets no path, annotated or not: a library that is not there
+	// would turn NCCL's RDMA off.
+	GPUShareIBVAnnotation = "nvsnap.io/gpushare-ibv"
+	// GPUShareIBVLibPath is that library, in the node bundle.
+	GPUShareIBVLibPath = nvsnapToolsMountPath + "/libnvsnap_ibv.so"
 	// GPUShareStorePath is where a GPU container sees its chunk store: a
 	// per-pod directory on the node's local checkpoint disk. A restore
 	// placeholder mounts the checkpoint's copy at the same path. It is a
@@ -56,6 +72,7 @@ const (
 	gpushareStoreVolume = "nvsnap-gpushare-store"
 	gpusharePodUIDEnv   = "NVSNAP_POD_UID"
 	gpushareFabricEnv   = "NVSNAP_GPUSHARE_FABRIC"
+	ncclIBVerbsLibEnv   = "NCCL_IBVERBS_LIB"
 )
 
 // gpushareMode reports whether a pod runs under the gpushare library and
@@ -93,6 +110,51 @@ func (m *Mutator) gpushareMode(ctx context.Context, pod *corev1.Pod) (wanted, fa
 		return true, true
 	}
 	return true, false
+}
+
+// gpushareIBV reports whether a pod under the library gets NCCL pointed at
+// the bundled verbs library: its nvsnap.io/gpushare-ibv annotation
+// (explicit), or GPUShareIBVByDefault when it has none.
+func (m *Mutator) gpushareIBV(pod *corev1.Pod) (on, explicit bool) {
+	switch pod.Annotations[GPUShareIBVAnnotation] {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	}
+	return m.GPUShareIBVByDefault, false
+}
+
+// envFromMaySet reports whether one of c's envFrom sources could set name:
+// admission does not read them, so any whose prefix starts name may.
+func envFromMaySet(c *corev1.Container, name string) bool {
+	for _, ef := range c.EnvFrom {
+		if strings.HasPrefix(name, ef.Prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// mountsBundle reports whether c's mount at nvsnapToolsMountPath is the
+// selected node bundle (a hostPath of bundleDir(BundleID), its root: no
+// subPath), which has libnvsnap_ibv.so; an older bundle, another volume or
+// a directory inside one may not.
+func (m *Mutator) mountsBundle(pod *corev1.Pod, c *corev1.Container) bool {
+	for _, vm := range c.VolumeMounts {
+		if vm.MountPath != nvsnapToolsMountPath {
+			continue
+		}
+		if vm.SubPath != "" || vm.SubPathExpr != "" {
+			return false
+		}
+		for _, v := range pod.Spec.Volumes {
+			if v.Name == vm.Name {
+				return v.HostPath != nil && v.HostPath.Path == m.bundleDir(m.BundleID)
+			}
+		}
+	}
+	return false
 }
 
 // runsToCompletion reports a pod that is not restarted when it exits: a
@@ -133,6 +195,7 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 	if !wanted {
 		return nil
 	}
+	ibv, ibvExplicit := m.gpushareIBV(pod)
 	gpuContainers := make([]int, 0, len(pod.Spec.Containers))
 	preloads := map[int]corev1.EnvVar{}
 	for i := range pod.Spec.Containers {
@@ -229,6 +292,19 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 		// A value the pod sets itself wins: it may switch fabric sharing off.
 		if fabric && !hasEnv(c, gpushareFabricEnv) {
 			vars = append(vars, corev1.EnvVar{Name: gpushareFabricEnv, Value: "1"})
+		}
+		// NCCL's own choice of verbs library wins: then its RDMA state stays
+		// as before, and a capture of the pod is refused. A choice an envFrom
+		// source may make wins over the default, not over the annotation.
+		// The path goes only where the bundle that has it is mounted.
+		if ibv && !hasEnv(c, ncclIBVerbsLibEnv) && (ibvExplicit || !envFromMaySet(c, ncclIBVerbsLibEnv)) {
+			if libMountedAt[i] && !m.mountsBundle(pod, c) {
+				m.logger().WithField("pod", pod.Namespace+"/"+pod.Name).WithField("container", c.Name).
+					Warn("gpushare: the container mounts something other than the node bundle at " + nvsnapToolsMountPath +
+						"; not pointing NCCL at " + GPUShareIBVLibPath + ", so a capture of it is refused if NCCL uses RDMA")
+			} else {
+				vars = append(vars, corev1.EnvVar{Name: ncclIBVerbsLibEnv, Value: GPUShareIBVLibPath})
+			}
 		}
 		patches = append(patches, setContainerEnv(i, c, vars)...)
 	}

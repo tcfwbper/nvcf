@@ -200,7 +200,7 @@ func TestRemapReplies(t *testing.T) {
 }
 
 func TestGPUShareResumeArgsClockAt(t *testing.T) {
-	got := strings.Join(gpushareResumeArgs("", "", true, 1234, []int{7}), " ")
+	got := strings.Join(gpushareResumeArgs("", "", true, 0, 1234, []int{7}), " ")
 	if got != "--hold-gate --clock-at 1234 resume 7" {
 		t.Errorf("args %q", got)
 	}

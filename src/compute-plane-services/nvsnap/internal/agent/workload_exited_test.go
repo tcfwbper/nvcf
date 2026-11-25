@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 )
@@ -187,5 +190,121 @@ func TestPIDNSDumpDone_MarkerFails(t *testing.T) {
 	}
 	if c, ok, err := readPIDNSMarker(dir); err != nil || !ok || !c.Subtree {
 		t.Errorf("marker read back: %+v %v %v", c, ok, err)
+	}
+}
+
+// writeStatState writes a stat for pid (started at 100) in state with
+// threads threads.
+func writeStatState(t *testing.T, procBase string, pid int, state string, threads int) {
+	t.Helper()
+	dir := filepath.Join(procBase, strconv.Itoa(pid))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stat := fmt.Sprintf("%d (vllm) %s 1 %d %d 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 %d 0 100 1000 10 18446744073709551615\n", pid, state, pid, pid, threads)
+	if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A workload's init that has exited but is not yet reaped (a zombie, all
+// its threads gone) has ended, though its stat still reads. A zombie
+// leader whose other threads still run has not.
+func TestProcessEnded_ExitingOrZombie(t *testing.T) {
+	proc := t.TempDir()
+	writeStatState(t, proc, 1, "S", 4)
+	writeStatState(t, proc, 2, "Z", 3) // the leader thread exited, the others run
+	writeStatState(t, proc, 3, "Z", 1)
+	writeStatState(t, proc, 4, "X", 1)
+	for pid, want := range map[int]bool{1: false, 2: false, 3: true, 4: true} {
+		if got := processEnded(proc, pid, 100); got != want {
+			t.Errorf("pid %d: ended %v, want %v", pid, got, want)
+		}
+	}
+}
+
+// signalKilled is a real *exec.ExitError of a process killed by SIGKILL.
+func signalKilled(t *testing.T) error {
+	t.Helper()
+	err := exec.CommandContext(t.Context(), "sh", "-c", "kill -9 $$").Run()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.Exited() {
+		t.Fatalf("no signal exit: %v", err)
+	}
+	return err
+}
+
+// The GPU tool runs in the workload's pid namespace: when the workload's
+// init exits, the kernel kills the tool with it. The suspend "did not
+// finish" then, but the workload exited: the error says that, not that it
+// could not be resumed, and does not lead with the tool. Its pods are still
+// replaced as before (one engine with its peers).
+func TestDumpFailure_ToolKilledWithTheWorkload(t *testing.T) {
+	proc := t.TempDir()
+	writeStatState(t, proc, 9, "Z", 1) // init exited, not yet reaped
+	te := &toolError{args: suspendArgs, err: signalKilled(t), out: "pid=811 hold: ok held\n"}
+	err := fmt.Errorf("gpushare suspend: %w", suspendFailure(te))
+	if !errors.Is(err, errSourceLeftSuspended) {
+		t.Fatalf("precondition: a killed suspend leaves the source suspended: %v", err)
+	}
+	got := dumpFailure(err, false, proc, 9, 100, false)
+	msg := got.Error()
+	if !errors.Is(got, errWorkloadExited) || !strings.HasPrefix(msg, errWorkloadExited.Error()) {
+		t.Fatalf("got %q, want it to lead with the workload's exit", msg)
+	}
+	if strings.Contains(msg, "could not be resumed") {
+		t.Errorf("says the workload could not be resumed: %q", msg)
+	}
+	if got := metrics.Reason("CRIU dump failed (criu-v2): " + msg); got != "workload_exited" {
+		t.Errorf("reason %q, want workload_exited", got)
+	}
+	if !sourceMustBeReplaced(got) || !sourceMustBeReplacedText("500: checkpoint failed: CRIU dump failed (criu-v2): "+msg) {
+		t.Error("the instance is no longer replaced")
+	}
+	// Not marked twice.
+	if again := dumpFailure(got, false, proc, 9, 100, false); again.Error() != msg {
+		t.Errorf("marked twice: %q", again.Error())
+	}
+}
+
+// The tool saw the workload's processes go ("no reply", a reset socket)
+// and exited 1 a moment before the workload's init ended: the failure waits
+// a little for the init, and is the workload's exit once it ended.
+func TestDumpFailure_WaitsForAnExitingWorkload(t *testing.T) {
+	old := workloadExitGrace
+	workloadExitGrace = 2 * time.Second
+	defer func() { workloadExitGrace = old }()
+	proc := t.TempDir()
+	writeStat(t, proc, 9, "vllm", 100)
+	lost := &toolError{args: suspendArgs, err: exitError(t),
+		out: "pid=811 poll: err no reply (Connection reset by peer)\ncatch-up: 0 launch(es) let through in 12 ms: failed\n"}
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_ = os.RemoveAll(filepath.Join(proc, "9"))
+	}()
+	if got := dumpFailure(fmt.Errorf("gpushare suspend: %w", lost), false, proc, 9, 100, false); !errors.Is(got, errWorkloadExited) {
+		t.Fatalf("got %v, want the workload's exit", got)
+	}
+
+	// A tool that failed for its own reasons is not waited on.
+	writeStat(t, proc, 10, "vllm", 100)
+	busy := &toolError{args: suspendArgs, err: exitError(t), out: quiesceNeverDrained(3)}
+	t0 := time.Now()
+	if got := dumpFailure(busy, false, proc, 10, 100, false); errors.Is(got, errWorkloadExited) {
+		t.Fatalf("a running workload marked exited: %v", got)
+	}
+	if d := time.Since(t0); d > time.Second {
+		t.Errorf("waited %s on a tool failure that does not involve the workload", d)
+	}
+}
+
+// A leave-running dump does not stop the workload: an init that ended after
+// it is the workload's exit, where after a dump that stops it, it is not.
+func TestStoppedByDump(t *testing.T) {
+	if stoppedByDump(true, true) {
+		t.Error("a leave-running dump counted as stopping the workload")
+	}
+	if !stoppedByDump(true, false) || stoppedByDump(false, false) {
+		t.Error("a dump that stops the workload, or none, misread")
 	}
 }

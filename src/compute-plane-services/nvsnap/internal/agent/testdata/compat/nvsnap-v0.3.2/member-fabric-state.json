@@ -1,0 +1,8 @@
+{
+  "vote": {
+    "attempt": 0,
+    "ok": true
+  },
+  "out": "aa bb\n",
+  "haveIn": true
+}

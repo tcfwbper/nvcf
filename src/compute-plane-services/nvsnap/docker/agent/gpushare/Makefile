@@ -4,13 +4,17 @@
 # libnvsnap_gpushare.so: LD_PRELOAD shim that releases and re-maps GPU memory
 # shared between processes around a CUDA checkpoint (see gpushare.h).
 # nvsnap-gpu-suspend: drives it and the CUDA checkpoint API.
-# Needs CUDA >= 13 headers (cuda.h: CUcheckpointGpuPair for --gpu-map).
+# libnvsnap_ibv.so: NCCL's verbs (NCCL_IBVERBS_LIB), destroyed before a
+# checkpoint and created again after it (nvsnap_ibv.c).
+# Needs CUDA >= 13 headers (cuda.h: CUcheckpointGpuPair for --gpu-map) and
+# the rdma-core headers (infiniband/verbs.h).
 
 CC ?= gcc
 CUDA_INC ?= /usr/local/cuda/include
+IBV_INC ?= /usr/include
 CFLAGS ?= -O2 -Wall -Wextra
 
-all: libnvsnap_gpushare.so nvsnap-gpu-suspend
+all: libnvsnap_gpushare.so nvsnap-gpu-suspend libnvsnap_ibv.so
 
 # Every function starts with no-ops (-fpatchable-function-entry): the library
 # hands its wrappers out for the driver's entry points, and a program that
@@ -25,10 +29,16 @@ GPUSHARE_ENTRY ?= -fpatchable-function-entry=4
 libnvsnap_gpushare.so: gpushare.c gpushare.h
 	$(CC) $(CFLAGS) $(GPUSHARE_ENTRY) -fPIC -shared -I. -I$(CUDA_INC) -o $@ gpushare.c -ldl -lpthread
 
+# Only NCCL loads it (dlopen, local): its verbs symbols, at the versions
+# NCCL asks for, never reach the process's other users of verbs.
+libnvsnap_ibv.so: nvsnap_ibv.c nvsnap_ibv.map
+	$(CC) $(CFLAGS) $(GPUSHARE_ENTRY) -fPIC -shared -fvisibility=hidden -I$(IBV_INC) -I$(CUDA_INC) \
+		-Wl,--version-script=nvsnap_ibv.map -Wl,-soname,libnvsnap_ibv.so -o $@ nvsnap_ibv.c -ldl -lpthread
+
 nvsnap-gpu-suspend: nvsnap-gpu-suspend.c gpushare.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_INC) -o $@ nvsnap-gpu-suspend.c -ldl -lpthread
 
 clean:
-	rm -f libnvsnap_gpushare.so nvsnap-gpu-suspend
+	rm -f libnvsnap_gpushare.so nvsnap-gpu-suspend libnvsnap_ibv.so
 
 .PHONY: all clean

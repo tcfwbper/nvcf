@@ -1,0 +1,8 @@
+{
+  "gpushareFabricSession": "s340218a39ad08c9d",
+  "gpushareGroupSize": 2,
+  "groupFreeze": true,
+  "leaveRunning": true,
+  "namespace": "ns",
+  "podName": "a"
+}

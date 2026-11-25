@@ -6,6 +6,8 @@
 # for nvsnap covers its Go code only, so without this job a change to the C
 # code is first compiled when the agent base image is built. Runs only when the
 # C code, its build or this workflow changes; no GPU is needed to compile.
+# On amd64 it also runs the host tests, which drive nvsnap-gpu-suspend against
+# fake ranks and a stub libcuda.
 
 name: nvsnap gpushare
 
@@ -51,3 +53,22 @@ jobs:
         env:
           PLATFORMS: ${{ matrix.platform }}
         run: src/compute-plane-services/nvsnap/scripts/check-gpushare-build.sh
+
+      - name: Host tests (no GPU)
+        if: matrix.platform == 'linux/amd64'
+        shell: bash
+        run: |
+          nvsnap=src/compute-plane-services/nvsnap
+          cuda="$(awk '/^FROM .* AS cuda-headers$/ { print $(NF-2) }' "$nvsnap/docker/agent/Dockerfile.base")"
+          hdr="$(mktemp -d)"
+          cid="$(docker create "$cuda")"
+          docker cp "$cid:/usr/local/cuda/include/cuda.h" "$hdr/cuda.h"
+          docker rm "$cid" >/dev/null
+          # test_ibv.py compiles against the rdma-core headers.
+          sudo apt-get install -y -q libibverbs-dev >/dev/null
+          # Every host test file runs, so a new one cannot be left out. A test
+          # that skips (no gcc or cuda.h) still exits 0: fail on it here.
+          for t in "$nvsnap"/tests/gpushare/host/test_*.py; do
+            CUDA_INC="$hdr" python3 -I "$t" 2>&1 | tee "$hdr/out"
+            if grep -q "skipped" "$hdr/out"; then echo "$t: host tests skipped" >&2; exit 1; fi
+          done

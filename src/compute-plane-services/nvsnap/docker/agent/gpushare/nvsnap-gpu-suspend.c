@@ -33,6 +33,33 @@ SPDX-License-Identifier: Apache-2.0
  *                 stop + CRIU restore, or full-save) it freezes every thread
  *                 except the restore thread itself, SIGCONTs, restores.
  *   open          After resume --hold-gate: let the pids' GPU launches through.
+ *   mx-pause      Before suspend: ModelExpress in each pid stops serving its
+ *                 weights to peers and drops its NIXL/RDMA state, which CRIU
+ *                 cannot dump. Each reply counts the RDMA device files the
+ *                 pid still has open or mapped; mx-pause fails while any
+ *                 are left (RDMA outside ModelExpress, too), but NCCL's
+ *                 through libnvsnap_ibv, which suspend releases. Needs
+ *                 ModelExpress >= 0.7: with an earlier one, mx-pause fails
+ *                 (the load context is gone, nothing to pause); upgrade it.
+ *                 When it fails, every pid is mx-resumed.
+ *   mx-resume     After open (or resume without --hold-gate): ModelExpress
+ *                 registers the weights again and republishes them. After a
+ *                 restore into another pod, pass --host with that pod's IP:
+ *                 the restored process still has the captured pod's address
+ *                 and would publish it, unreachable from other pods.
+ *   nixl-pause    Before suspend (after mx-pause, if both): vLLM's NIXL KV
+ *                 connector (disaggregated prefill/decode) in each pid stops:
+ *                 the engine takes no new requests, waits for KV transfers in
+ *                 flight, and drops its NIXL agent and RDMA state. Fails, as
+ *                 mx-pause does, while any RDMA device file is left other
+ *                 than NCCL's through libnvsnap_ibv (which suspend
+ *                 releases), or when the process's UCX is not 1.22
+ *                 (restored into another pod, it would keep the old pod's
+ *                 routes); then every pid is resumed. The reply names the
+ *                 UCX ("..., UCX 1.22.0").
+ *   nixl-resume   After open: the connectors come back under a new engine id
+ *                 and the engine takes requests again. --host as for
+ *                 mx-resume: the address decode engines reach it at.
  *   gpus [FILE]   Print (or write to FILE) the UUIDs of the GPUs visible here.
  *
  * --hold-gate (resume after stop + CRIU restore): the pids run, but their
@@ -41,6 +68,19 @@ SPDX-License-Identifier: Apache-2.0
  * writes to multicast memory (NCCL NVLS) that another node has not bound
  * again yet; those writes are lost and the kernels waiting for them spin.
  * A library that predates it resumes as without it.
+ * --sync-open MS (resume after stop, with --fabric-map; not with
+ * --hold-gate): the same for a resume in place, where no one else sends
+ * "open". The resume holds the launches, thaws, writes DIR/resumed
+ * ("<token>", its pid and round), and lets them through ("open") once DIR/o
+ * reads "<token> open": the driver writes it once every node has resumed.
+ * On "<token> abort" (a node failed to resume, or did not in time), or with
+ * no verdict after MS, it lets them through anyway and says "GPU launches
+ * let through before every node resumed": closed gates would wedge the
+ * workload for good, while an early launch only hangs it if a node has not
+ * bound its memory yet. It says so too when a process's library has no
+ * "resume hold lease", or could not take the lease (it opened at its
+ * resume: no hold is left without a lease). Without --sync-open the resume
+ * opens at once, as before.
  * --clock-at NS (resume after stop + CRIU restore): NS is the CLOCK_MONOTONIC
  * CRIU dumped. Thaw only once the pids' clock (in their time namespace) has
  * reached it, so that no thread sees its clock behind the dump, nor the
@@ -286,6 +326,7 @@ static int visible_gpus(CUuuid *out, int max)
  * library does not load or lacks an entry point.
  */
 static const char *libcuda_path = "libcuda.so.1";  /* --libcuda */
+static const char *mx_host;  /* --host (mx-resume, nixl-resume) */
 
 #define PROBE_BYTES (1 << 20)
 
@@ -356,6 +397,9 @@ static int probe(void)
 static const char *gpu_map_file;
 static const char *store_dir, *ckpt_dir, *cache_dir, *fabric_dir;
 static int hold_gate;  /* --hold-gate */
+static unsigned sync_open_ms;  /* --sync-open */
+static int sync_gate;  /* resume_unheld, with --sync-open: hold, then open_synced */
+static int held_fallback;  /* resume_held: processes resumed without the hold (see there) */
 static long long clock_at = -1;  /* --clock-at, ns */
 static int resume_held(const int *pids, int n);
 
@@ -655,19 +699,32 @@ static void thaw_all(struct frozen *fz, int n)
 
 /* ── Shared GPU memory (libnvsnap_gpushare control socket) ─────────────── */
 
-/* Send cmd to pid's control thread. Returns 1 if pid has none (it shares
- * no GPU memory), 0 on "ok", -2 on "busy" (retry), -3 if its library
- * predates cmd, -1 on error. */
-static int ctl(int pid, const char *cmd)
+/* Send cmd to pid's control thread; its reply goes to rep (if not NULL),
+ * and is printed unless quiet. Returns 1 if pid has none (it shares no GPU
+ * memory), 0 on "ok", -2 on "busy" (retry), -3 if its library predates
+ * cmd, -4 if no reply came within ms (0: cmd's own limit), -1 on error. */
+static int ctl_rep_ms(int pid, const char *cmd, char *out, size_t outlen, int quiet, int ms)
 {
     struct sockaddr_un a = { .sun_family = AF_UNIX };
     int n = snprintf(a.sun_path + 1, sizeof(a.sun_path) - 1, GPUSHARE_SOCK_FMT, pid);
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + n;
     int s = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (s < 0) return -1;
+    /* "release"/"load" move the saved GPU memory: allow for slow disks.
+     * "open" waits at most 2 s for the state lock: a pid silent for longer
+     * is stuck or dying, and the restore should fail now. The send timeout
+     * also bounds connect(), which waits while pid's accept queue is full. */
+    int slow = !strncmp(cmd, "release", 7) || !strncmp(cmd, "load", 4);
+    struct timeval tv = { slow ? 3600 : !strcmp(cmd, "open") ? 10 : 120, 0 };
+    if (ms > 0) tv.tv_sec = ms / 1000, tv.tv_usec = ms % 1000 * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(s, (struct sockaddr *)&a, len) != 0) {
+        int e = errno;
         close(s);
-        return 1;
+        if (e != EAGAIN) return 1;  /* no control socket */
+        printf("pid=%d %s: err control socket not accepting (%s)\n", pid, cmd, strerror(e));
+        return ms > 0 ? -4 : -1;
     }
     /* An abstract name can be bound by anyone in the network namespace:
      * talk only to pid itself (so this tool must run in its pid namespace). */
@@ -679,24 +736,40 @@ static int ctl(int pid, const char *cmd)
                pid, cmd, pid, pid, cl == sizeof(cr) ? cr.pid : -1);
         return -1;
     }
-    /* "release"/"load" move the saved GPU memory: allow for slow disks.
-     * "open" waits at most 2 s for the state lock: a pid silent for longer
-     * is stuck or dying, and the restore should fail now. */
-    int slow = !strncmp(cmd, "release", 7) || !strncmp(cmd, "load", 4);
-    struct timeval tv = { slow ? 3600 : !strcmp(cmd, "open") ? 10 : 120, 0 };
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     char rep[GPUSHARE_REPLY_MAX] = "err no reply (timeout)";
-    if (send(s, cmd, strlen(cmd) + 1, MSG_NOSIGNAL) < 0) snprintf(rep, sizeof(rep), "err send: %s", strerror(errno));
-    else {
+    int timed_out = 0;
+    if (send(s, cmd, strlen(cmd) + 1, MSG_NOSIGNAL) < 0) {
+        timed_out = errno == EAGAIN || errno == EWOULDBLOCK;
+        snprintf(rep, sizeof(rep), "err send: %s", strerror(errno));
+    } else {
         ssize_t r = recv(s, rep, sizeof(rep) - 1, 0);
         if (r > 0) rep[r] = 0;
-        else snprintf(rep, sizeof(rep), "err no reply (%s)", r < 0 ? strerror(errno) : "closed");
+        else timed_out = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+             snprintf(rep, sizeof(rep), "err no reply (%s)", r < 0 ? strerror(errno) : "closed");
     }
     close(s);
-    printf("pid=%d %s: %s\n", pid, cmd, rep);
+    if (!quiet || strncmp(rep, "ok", 2)) printf("pid=%d %s: %s\n", pid, cmd, rep);
+    if (out) snprintf(out, outlen, "%s", rep);
+    if (timed_out) return -4;
     if (!strncmp(rep, "err busy", 8)) return -2;
     if (!strcmp(rep, "err unknown command")) return -3;
     return strncmp(rep, "ok", 2) ? -1 : 0;
+}
+
+static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet)
+{
+    int r = ctl_rep_ms(pid, cmd, out, outlen, quiet, 0);
+    return r == -4 ? -1 : r;
+}
+
+static int ctl(int pid, const char *cmd) { return ctl_rep(pid, cmd, NULL, 0, 0); }
+
+/* Reopen every pid's gates after a failed or abandoned quiesce: each pid,
+ * even after one fails (ctl_all would stop there and leave the rest held).
+ * Failures are printed by ctl. */
+static void resume_all(const int *pids, int n)
+{
+    for (int i = 0; i < n; i++) ctl(pids[i], "resume");
 }
 
 /* Run cmd on every pid that shares GPU memory. Returns the first error
@@ -748,6 +821,8 @@ static int ctl_all_par(const int *pids, int n, const char *cmd)
  * its multicast groups) before any binds multicast memory, which blocks
  * until all devices have rejoined. "resume" reopens the launch gate. */
 static int fabric_exchange(const int *pids, int n, char *remap, size_t len);
+static int local_exchange(const int *pids, int n, char *remap, size_t len);
+static char local_dir[32];  /* local_exchange's directory, removed after "remap" */
 
 /* Tell every process the host NUMA node of each GPU it now has, by the
  * GPU's UUID and, with --gpu-map, by the UUID of the GPU it replaces:
@@ -814,21 +889,44 @@ static int remap_all(const int *pids, int n)
     }
     int r = ctl_all_par(pids, n, load);
     if (r >= 0 && fabric_dir) r = fabric_exchange(pids, n, remap, sizeof(remap));
+    else if (r >= 0) r = local_exchange(pids, n, remap, sizeof(remap));
     if (r >= 0) r = ctl_all(pids, n, remap);
-    if (r >= 0 && hold_gate) r = resume_held(pids, n);
+    if (local_dir[0]) {
+        char p[64];
+        snprintf(p, sizeof(p), "%s/out", local_dir);
+        unlink(p);
+        if (rmdir(local_dir) != 0) fprintf(stderr, "%s: %s (left behind)\n", local_dir, strerror(errno));
+        local_dir[0] = 0;
+    }
+    if (r >= 0 && (hold_gate || sync_gate)) r = resume_held(pids, n);
     else if (r >= 0) r = ctl_all(pids, n, "resume");
     if (r >= 0) resume_diag(pids, n);
     return r;
 }
 
 /* --hold-gate: "resume hold" each pid; a library that predates it resumes
- * and opens its gate at once, as before. */
+ * and opens its gate at once, as before ("open" comes later, from another
+ * process: no lease on this one). --sync-open: "resume hold lease", which
+ * takes this tool's lease on the held launches in the same request, so
+ * that they are never held without one: this tool's death opens them. A
+ * library without it, or one that could not take the lease ("no lease":
+ * it let the launches through), is resumed without the hold and counts as
+ * not synced (held_fallback). A separate "resume hold" then "lease" would
+ * leave the launches held with no lease between the two. */
 static int resume_held(const int *pids, int n)
 {
     int count = 0;
     for (int i = 0; i < n; i++) {
-        int r = ctl(pids[i], "resume hold");
-        if (r == -3) r = ctl(pids[i], "resume");
+        char rep[GPUSHARE_REPLY_MAX] = "";
+        int r;
+        if (sync_gate) {
+            r = ctl_rep(pids[i], "resume hold lease", rep, sizeof(rep), 0);
+            if (r == -3) r = ctl(pids[i], "resume"), held_fallback += r == 0;
+            else if (r == 0 && strstr(rep, "no lease")) held_fallback++;
+        } else {
+            r = ctl(pids[i], "resume hold");
+            if (r == -3) r = ctl(pids[i], "resume"), held_fallback += r == 0;
+        }
         if (r < 0) return r;
         count += r == 0;
     }
@@ -854,6 +952,36 @@ static int open_all(const int *pids, int n)
     free(j);
     free(t);
     return bad ? -1 : 0;
+}
+
+/* NCCL's verbs (libnvsnap_ibv.so): its queue pairs and keys have new
+ * numbers after "load", and their peers here need them. Without
+ * --fabric-map the peers are all among pids: merge their lists into a
+ * directory of the workload's user (they write their parts) and pass the
+ * merged list to "remap" at once. Nothing to do when no pid has NCCL's
+ * verbs open (an older library answers "err unknown command"). */
+static int local_exchange(const int *pids, int n, char *remap, size_t len)
+{
+    char rep[GPUSHARE_REPLY_MAX];
+    int any = 0;
+    for (int i = 0; i < n && !any; i++) {
+        int d = 0;
+        any = ctl_rep(pids[i], "ibv", rep, sizeof(rep), 1) == 0 && sscanf(rep, "ok ibv %d", &d) == 1 && d > 0;
+    }
+    if (!any) return 0;
+    char path[64];
+    struct stat st;
+    snprintf(local_dir, sizeof(local_dir), "/tmp/nvsnap-ibv-XXXXXX");
+    snprintf(path, sizeof(path), "/proc/%d", pids[0]);
+    if (!mkdtemp(local_dir) || stat(path, &st) != 0 || chown(local_dir, st.st_uid, st.st_gid) != 0) {
+        fprintf(stderr, "%s: %s\n", local_dir, strerror(errno));
+        return -1;
+    }
+    const char *saved = fabric_dir;
+    fabric_dir = local_dir;
+    int r = fabric_exchange(pids, n, remap, len);
+    fabric_dir = saved;
+    return r;
 }
 
 /* Multi-node NVLink: memory shared across nodes is imported by fabric
@@ -885,7 +1013,13 @@ static int fabric_exchange(const int *pids, int n, char *remap, size_t len)
         snprintf(name, sizeof(name), "out.%d", pids[i]);
         snprintf(part, sizeof(part), "%s/%s", fabric_dir, name);
         snprintf(cmd, sizeof(cmd), "fabmap %s", part);
-        if (ctl(pids[i], cmd) < 0) { fclose(o); close(dfd); return -1; }
+        if (ctl(pids[i], cmd) < 0) {
+            fclose(o);
+            unlinkat(dfd, name, 0);
+            unlinkat(dfd, "out.tmp", 0);
+            close(dfd);
+            return -1;
+        }
         int pfd = openat(dfd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         FILE *f = pfd < 0 ? NULL : fdopen(pfd, "r");
         if (!f && pfd >= 0) close(pfd);
@@ -894,9 +1028,14 @@ static int fabric_exchange(const int *pids, int n, char *remap, size_t len)
         unlinkat(dfd, name, 0);
     }
     int r = fclose(o) != 0 || renameat(dfd, "out.tmp", dfd, "out") != 0 ? -1 : 0;
-    if (r < 0) fprintf(stderr, "%s: %s\n", out, strerror(errno));
+    if (r < 0) fprintf(stderr, "%s: %s\n", out, strerror(errno)), unlinkat(dfd, "out.tmp", 0);
     close(dfd);
     if (r < 0) return -1;
+    if (fabric_dir == local_dir) {  /* local_exchange: every peer is here */
+        printf("verbs map: %d line(s) in %s\n", nh, out);
+        snprintf(remap, len, "remap %s", out);
+        return 0;
+    }
     printf("fabric map: %d handle(s) in %s; waiting for %s\n", nh, out, in);
     for (int t = 0; access(in, R_OK) != 0; t++) {
         if (t >= 6000) { fprintf(stderr, "no %s after 600 s\n", in); return -1; }
@@ -1049,9 +1188,12 @@ static void wait_clock(int pid)
 /* Resume without a holder: pids are CHECKPOINTED and possibly SIGSTOPped
  * (after stop + CRIU restore). Freeze everything but the restore threads,
  * SIGCONT, restore + unlock, thaw. */
+static int open_synced(const int *pids, int n);
+
 static int resume_unheld(const int *pids, int n)
 {
     if (load_api() < 0) return -1;
+    sync_gate = fabric_dir && sync_open_ms;
     long long d;
     if (clock_at >= 0 && clock_behind(pids[0], &d) < 0) return -1;
     struct frozen *fz = calloc(n, sizeof(*fz));
@@ -1077,6 +1219,13 @@ out:
         if (clock_at >= 0) wait_clock(pids[0]);  /* every pid is in one time namespace */
         thaw_all(fz, n);
         printf("thawed all pids\n");
+        /* --sync-open: the pids run, their launches held until every node
+         * has resumed. A pid that then fails to open is not CHECKPOINTED,
+         * but may be held for good: the resume fails. */
+        if (sync_gate && open_synced(pids, n) < 0) {
+            fprintf(stderr, "resumed, but not every pid's GPU launches were let through (open failed above)\n");
+            rc = -1;
+        }
     } else {
         /* Do not let CHECKPOINTED threads run: leave them stopped. */
         for (int i = 0; i < n; i++) kill(pids[i], SIGSTOP);
@@ -1103,31 +1252,219 @@ static void undo(const int *pids, int n, int locked, int shared)
  * collectives wait for the ranks other nodes hold. So each attempt to
  * quiesce is a vote: write DIR/q ("<attempt> ok" or "<attempt> busy") and
  * wait for DIR/d, written by whoever drives the nodes once every node has
- * voted: "<attempt> go" if all are quiesced, else "<attempt> retry".
- * Returns 1 for go, 0 for retry, -1 on timeout. */
-static int node_vote(int attempt, int quiesced)
+ * voted: "<attempt> go" if all are quiesced, else "<attempt> retry", or
+ * "<attempt> abort" once the session cannot succeed (a node is gone, or the
+ * driver's quiesce deadline passed: it keeps the nodes' deadline, so they
+ * stop at the same attempt). Returns 1 for go, 0 for retry, -1 on abort or
+ * when deadline (now_ms() time) passes with no verdict.
+ *
+ * A node that gives up at its deadline first takes back an "ok" vote: left
+ * in DIR/q, a late driver could still count it and send "go" to the other
+ * nodes, which would release while this one rolls back. It then waits a
+ * while for a verdict the driver may already be sending: a "go" decided
+ * before the vote was taken back is followed, not rolled back. The wait
+ * covers a delivery the driver retries for a while (an agent unreachable
+ * for a moment); it ends as soon as any verdict arrives. */
+static double now_ms(void);
+
+#define VOTE_WITHDRAW_MS 20000  /* the driver retries a verdict each poll: every 200 ms to an agent that
+                                  * refuses, about every 20 s to one that does not answer */
+
+static int write_vote(const char *q, const char *tmp, int attempt, int quiesced)
 {
-    char q[512], tmp[520], d[512], line[64];
-    snprintf(q, sizeof(q), "%s/q", fabric_dir);
-    snprintf(tmp, sizeof(tmp), "%s/q.tmp", fabric_dir);
-    snprintf(d, sizeof(d), "%s/d", fabric_dir);
     FILE *fp = fopen(tmp, "we");
     if (!fp || fprintf(fp, "%d %s\n", attempt, quiesced ? "ok" : "busy") < 0 || fclose(fp) != 0 || rename(tmp, q) != 0) {
         fprintf(stderr, "%s: %s\n", q, strerror(errno));
         return -1;
     }
-    for (int t = 0; t < 6000; t++) {
+    return 0;
+}
+
+static int node_vote(int attempt, int quiesced, double deadline)
+{
+    char q[512], tmp[520], d[512], line[64];
+    snprintf(q, sizeof(q), "%s/q", fabric_dir);
+    snprintf(tmp, sizeof(tmp), "%s/q.tmp", fabric_dir);
+    snprintf(d, sizeof(d), "%s/d", fabric_dir);
+    if (write_vote(q, tmp, attempt, quiesced) < 0) return -1;
+    int withdrawn = 0;
+    for (;;) {
         int a = -1;
         char verdict[16] = "";
+        FILE *fp;
         if ((fp = fopen(d, "re"))) {
             if (fgets(line, sizeof(line), fp)) sscanf(line, "%d %15s", &a, verdict);
             fclose(fp);
         }
-        if (a == attempt) return !strcmp(verdict, "go");
+        if (a == attempt) {
+            if (!strcmp(verdict, "abort")) {
+                printf("quiesce: the vote was aborted at attempt %d: rolling back\n", attempt);
+                return -1;
+            }
+            if (!strcmp(verdict, "go") && withdrawn)
+                printf("quiesce: \"go\" for attempt %d came after the deadline, before the vote was taken back: "
+                       "going on\n", attempt);
+            /* A "retry" after the deadline: the caller rolls back. */
+            return !strcmp(verdict, "go");
+        }
+        if (now_ms() >= deadline) {
+            if (withdrawn || !quiesced) break;
+            if (write_vote(q, tmp, attempt, 0) < 0) return -1;
+            withdrawn = 1;
+            deadline = now_ms() + VOTE_WITHDRAW_MS;
+        }
         usleep(100000);
     }
-    fprintf(stderr, "no verdict in %s after 600 s\n", d);
+    fprintf(stderr, "no verdict in %s for attempt %d by the deadline\n", d, attempt);
     return -1;
+}
+
+static double now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
+/* Bring the held ranks (see "hold" in gpushare.c) to a point where all
+ * have drained at once, then quiesce them: while any rank is busy, let one
+ * held launch through on each drained one. A drained rank has seen every
+ * collective it launched complete, so it is behind or level with every
+ * peer, and one launch at a time never takes it past them. nudge: these
+ * ranks had all drained but another node's had not (they wait for these):
+ * let one launch through on each first. Returns what ctl_all returns for
+ * "quiesce", -2 if they did not all drain (a busy rank waits for another
+ * node, or for work the gate does not hold), -1 on error. Its polls and
+ * steps share its 10 s: a rank that stops answering ends it as busy then,
+ * so that the other ranks are not held past the vote while one request
+ * waits out its own limit. The final "quiesce" keeps its own. */
+#define CATCH_UP_MS 10000
+static int catch_up(const int *pids, int n, int nudge)
+{
+    char rep[GPUSHARE_REPLY_MAX];
+    int *st = calloc(n, sizeof(*st));  /* -2 busy, -1 no control socket, else launches held */
+    double t0 = now_ms(), last = t0;
+    int steps = 0, r = -2;
+    for (;;) {
+        int busy = 0, err = 0;
+        for (int i = 0; i < n && !err; i++) {
+            int left = (int)(t0 + CATCH_UP_MS - now_ms());
+            int c = left <= 0 ? -4 : ctl_rep_ms(pids[i], "poll", rep, sizeof(rep), 1, left);
+            if (c == 1) st[i] = -1;
+            else if (c < 0) err = c;
+            else if (sscanf(rep, "ok idle %d", &st[i]) != 1) st[i] = -2, busy++;
+        }
+        if (err == -4) break;  /* out of time: busy */
+        if (err) { r = err; break; }
+        /* One at a time: a quiescing process asks its peers' control
+         * threads about imports it has not matched yet ("whose"). */
+        if (!busy && !nudge) { r = ctl_all(pids, n, "quiesce"); break; }
+        int stepped = 0;
+        for (int i = 0; i < n && !err; i++) {
+            if (st[i] <= 0) continue;
+            int left = (int)(t0 + CATCH_UP_MS - now_ms());
+            int c = left <= 0 ? -4 : ctl_rep_ms(pids[i], "step", rep, sizeof(rep), 1, left);
+            if (c < 0) err = c;
+            else stepped += !strcmp(rep, "ok stepped");
+        }
+        if (err == -4) break;
+        if (err) { r = err; break; }
+        nudge = 0;
+        double t = now_ms();
+        if (stepped) steps += stepped, last = t;
+        else if (t - last > 2000) break;  /* stuck */
+        else usleep(1000);
+        if (t - t0 > CATCH_UP_MS) break;
+    }
+    printf("catch-up: %d launch(es) let through in %.0f ms: %s\n", steps, now_ms() - t0,
+           r >= 0 ? "quiesced" : r == -2 ? "busy" : "failed");
+    free(st);
+    return r;
+}
+
+/* Wait for the next whole second of the wall clock at least 300 ms away.
+ * Nodes that read a verdict at about the same time hold their ranks at the
+ * same instant, so the ranks of one node are not far ahead of another's. */
+static void wait_slot(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    t.tv_sec += t.tv_nsec >= 700000000L ? 2 : 1;
+    t.tv_nsec = 0;
+    while (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &t, NULL) == EINTR) {}
+}
+
+/* Attempts in a row that keep the ranks held (catching up across nodes)
+ * before all are let go and held again at a common instant. */
+#define HOLD_ROUNDS 8
+
+#define SYNC_OPEN_UNSYNCED "GPU launches let through before every node resumed"
+
+/* --sync-open: after resume_unheld resumed the pids with their launches held,
+ * report this node resumed (DIR/resumed, "<token>") and let the launches
+ * through once the driver answers "<token> open" in DIR/o, or anyway on
+ * "<token> abort" or after sync_open_ms with no answer (see the top). The
+ * token, this tool's pid and round, keeps a verdict for another tool or
+ * round from counting; a verdict left from one is removed first. DIR
+ * belongs to the workload's user: every name is opened relative to it,
+ * never through a symlink. Returns what open_all returns. */
+static int sync_round;
+static int open_synced(const int *pids, int n)
+{
+    char tok[32], line[96], why[160] = "", t[32], v[16];
+    snprintf(tok, sizeof(tok), "%d-%d", (int)getpid(), sync_round++);
+    int got = 0;  /* 1 open, -1 abort */
+    int dfd = open(fabric_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd < 0) snprintf(why, sizeof(why), "%s: %s", fabric_dir, strerror(errno));
+    if (dfd >= 0) {
+        if (unlinkat(dfd, "o", 0) != 0 && errno != ENOENT)
+            fprintf(stderr, "%s/o: %s (a verdict left there is ignored: its token is not this one)\n", fabric_dir, strerror(errno));
+        unlinkat(dfd, "resumed.tmp", 0);
+        int fd = openat(dfd, "resumed.tmp", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        int len = snprintf(line, sizeof(line), "%s\n", tok);
+        int ok = fd >= 0 && write(fd, line, len) == len;
+        if (fd >= 0 && close(fd) != 0) ok = 0;
+        if (!ok || renameat(dfd, "resumed.tmp", dfd, "resumed") != 0) {
+            snprintf(why, sizeof(why), "cannot report resumed in %s: %s", fabric_dir, strerror(errno));
+            unlinkat(dfd, "resumed.tmp", 0);
+        }
+    }
+    if (!why[0]) {
+        printf("sync-open: resumed with launches held (%s); waiting up to %u ms for every node\n", tok, sync_open_ms);
+        double t0 = now_ms();
+        while (!got) {
+            /* Non-blocking, and a regular file only: the workload could
+             * put a FIFO there, whose open or read would block past the
+             * deadline. Anything else is no verdict yet. */
+            int fd = openat(dfd, "o", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+            struct stat st;
+            if (fd >= 0 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))) close(fd), fd = -1;
+            if (fd >= 0) {
+                ssize_t r = read(fd, line, sizeof(line) - 1);
+                close(fd);
+                line[r > 0 ? r : 0] = 0;
+                if (sscanf(line, "%31s %15s", t, v) == 2 && !strcmp(t, tok))
+                    got = !strcmp(v, "open") ? 1 : !strcmp(v, "abort") ? -1 : 0;
+            }
+            if (got) break;
+            if (now_ms() - t0 >= sync_open_ms) {
+                snprintf(why, sizeof(why), "no verdict in %s/o after %u ms", fabric_dir, sync_open_ms);
+                break;
+            }
+            usleep(100000);
+        }
+        if (got < 0) snprintf(why, sizeof(why), "the driver answered abort (a node did not resume, or not in time)");
+    }
+    if (dfd >= 0) close(dfd);
+    int r = open_all(pids, n);
+    if (got > 0 && held_fallback)
+        snprintf(why, sizeof(why), "%d process(es) without \"resume hold lease\" (or its lease) opened at their resume",
+                 held_fallback);
+    if (got > 0 && !held_fallback) {
+        /* A failed open is reported by the caller. */
+        if (r == 0) printf("sync-open: every node resumed: launches let through\n");
+    } else printf("sync-open: %s; " SYNC_OPEN_UNSYNCED "\n", why);
+    return r;
 }
 
 static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
@@ -1139,10 +1476,14 @@ static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
     if (load_api() < 0) goto out;
 
     /* Processes that share GPU memory drop their shared mappings first:
-     * CUDA calls block once locked. "quiesce" holds the app's launches in
-     * libnvsnap_gpushare's gate (until "resume") and checks every process can
-     * release; only then does any process "release". Busy: GPU work waits on
-     * work not launched yet (e.g. a peer's NCCL kernel) — reopen and retry. */
+     * CUDA calls block once locked. "hold" holds the app's launches in
+     * libnvsnap_gpushare's gate (until "resume"), catch_up lets the ranks
+     * behind catch up, and "quiesce" checks every process can release; only
+     * then does any process "release". Busy: GPU work waits on work not
+     * launched yet (e.g. a peer's NCCL kernel on another node). With other
+     * nodes, the ranks stay held and catch up over the next attempts. A
+     * library without "hold" quiesces one process at a time: busy reopens
+     * and retries. */
     int shared = 0;
     if (fabric_dir) {  /* a previous suspend's votes */
         snprintf(path, sizeof(path), "%s/q", fabric_dir);
@@ -1150,21 +1491,50 @@ static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
         snprintf(path, sizeof(path), "%s/d", fabric_dir);
         unlink(path);
     }
+    /* The deadline is wall-clock time: an attempt takes far longer than its
+     * 250 ms pause (a busy pid waits up to 2 s to drain, a catch-up up to
+     * 10 s, and a node's vote waits for every other node's), so counting
+     * attempts let a 120 s timeout run for 27 minutes. With --fabric-map the
+     * driver ends the session at the deadline with an "abort" verdict, the
+     * same attempt on every node; this node's own deadline, a minute later,
+     * only covers a driver that never answers. */
+    /* --timeout-ms 0 waits forever, on one node only: main refuses it with
+     * --fabric-map. */
+    double deadline = timeout_ms ? now_ms() + timeout_ms + (fabric_dir ? 60000 : 0) : 1e300;
+    int catchup = 1, holding = 0, nudge = 0;
     for (int tries = 0;; tries++) {
-        int r = ctl_all(pids, n, "quiesce");
-        if (r < 0) ctl_all(pids, n, "resume");
-        if (r < 0 && r != -2) goto out;
+        int r = -3;
+        if (catchup) {
+            if (!holding && fabric_dir) wait_slot();
+            r = ctl_all_par(pids, n, "hold");  /* after a quiesce: launches only */
+            if (r == -3) catchup = 0;  /* nothing held */
+            else if (r >= 0) holding = 1, r = catch_up(pids, n, nudge);
+        }
+        if (!catchup) r = ctl_all(pids, n, "quiesce");
+        nudge = 0;
+        if (r < 0 && r != -2) { resume_all(pids, n); goto out; }
+        /* Busy with no other node to wait for (or an older library): start over. */
+        if (r == -2 && (!holding || !fabric_dir)) resume_all(pids, n), holding = 0;
         if (fabric_dir) {  /* every node must be quiesced before any releases */
-            int v = node_vote(tries, r >= 0);
-            if (v < 0) { if (r >= 0) ctl_all(pids, n, "resume"); goto out; }
+            int v = node_vote(tries, r >= 0, deadline);
+            if (v < 0) { resume_all(pids, n); goto out; }
             if (v == 1) { shared = r > 0; break; }
-            if (r >= 0) ctl_all(pids, n, "resume");
+            if (holding && (tries + 1) % HOLD_ROUNDS) nudge = r >= 0;  /* keep holding: catch up */
+            else {
+                if (r >= 0 || holding) resume_all(pids, n);
+                holding = 0;
+            }
         } else if (r >= 0) {
             shared = r > 0;
             break;
         }
-        if (tries * 250 >= (int)timeout_ms) goto out;
-        usleep(250000);
+        if (now_ms() >= deadline) {
+            if (holding) resume_all(pids, n);
+            printf("quiesce: not quiesced after %d attempt(s) in %u ms: rolling back\n", tries + 1,
+                   timeout_ms + (fabric_dir ? 60000 : 0));
+            goto out;
+        }
+        if (!holding) usleep(250000);
     }
     char release[600] = "release";
     if (store_dir) snprintf(release, sizeof(release), "release %s %s%s%s", store_dir, ckpt_dir,
@@ -1311,6 +1681,9 @@ static int resume(const int *pids, int n, unsigned timeout_s)
     if (state_exists(hp)) {
         if (hold_gate) printf("--hold-gate: not for an in-place resume; launches go through at once\n");
         if (clock_at >= 0) printf("--clock-at: not for an in-place resume; ignored\n");
+        /* The stop failed after the suspend: the holder resumes and opens
+         * at once, so the caller learns this node was not held. */
+        if (sync_open_ms) printf("sync-open: only after stop; " SYNC_OPEN_UNSYNCED "\n");
         return signal_holder(pids, SIGUSR1, timeout_s);
     }
     return resume_unheld(pids, n);
@@ -1572,11 +1945,16 @@ static void usage(const char *prog)
         "         stop         (after suspend: leave pids SIGSTOPped for CRIU dump)\n"
         "         resume       (restore + unlock all, then thaw)\n"
         "         open         (after resume --hold-gate: let the pids' GPU launches through)\n"
+        "         mx-pause     (before suspend: ModelExpress drops its NIXL/RDMA state)\n"
+        "         mx-resume    (after open: ModelExpress registers and republishes again)\n"
+        "         nixl-pause   (before suspend: vLLM's NIXL KV connector drops its RDMA state)\n"
+        "         nixl-resume  (after open: the connector comes back under a new engine id)\n"
         "         gpus [FILE]  (print or write the visible GPU UUIDs, for --gpu-map)\n"
         "         probe        (is the one visible GPU usable? prints ok or the failing\n"
         "                       step and CUDA error; exit 0, 2 on a failure, 1 if it cannot ask)\n"
         "--libcuda PATH: (probe) the driver library to load (default libcuda.so.1)\n"
-        "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever)\n"
+        "--host H: (mx-resume, nixl-resume) the address peers reach this pod at (its IP)\n"
+        "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever; not with --fabric-map)\n"
         "--gpu-map FILE: restore GPUs listed in FILE onto the GPUs visible here\n"
         "--store S --ckpt-dir C: (suspend) libnvsnap_gpushare processes save GPU memory\n"
         "         to chunk store S; C lists the chunks of this checkpoint\n"
@@ -1584,6 +1962,8 @@ static void usage(const char *prog)
         "--fabric-map DIR: (suspend, resume) multi-node NVLink: after load, write the new\n"
         "         fabric handles to DIR/out and wait for DIR/in, all nodes' out merged\n"
         "--hold-gate: (resume after CRIU restore) thaw with GPU launches held until open\n"
+        "--sync-open MS: (resume after stop, with --fabric-map) hold the GPU launches,\n"
+        "         write DIR/resumed and open on DIR/o, or anyway after MS\n"
         "--clock-at NS: (resume after CRIU restore) thaw once the pids' CLOCK_MONOTONIC\n"
         "         reaches NS, the value CRIU dumped\n"
         "Cache:   cache-prefetch STORE CKPT-DIR CACHE | cache-gc CACHE MAX-GiB\n"
@@ -1618,14 +1998,48 @@ int main(int argc, char **argv)
             cache_dir = argv[argi + 1];
         else if (strcmp(argv[argi], "--fabric-map") == 0)
             fabric_dir = argv[argi + 1];
+        else if (strcmp(argv[argi], "--sync-open") == 0) {
+            char *end;
+            errno = 0;
+            unsigned long v = strtoul(argv[argi + 1], &end, 10);
+            if (errno || end == argv[argi + 1] || *end || argv[argi + 1][0] == '-' || v == 0 || v > 86400000UL) {
+                fprintf(stderr, "--sync-open needs a number of milliseconds above 0, not %s\n", argv[argi + 1]);
+                return 1;
+            }
+            sync_open_ms = (unsigned)v;
+        }
         else if (strcmp(argv[argi], "--libcuda") == 0)
             libcuda_path = argv[argi + 1];
+        else if (strcmp(argv[argi], "--host") == 0)
+            mx_host = argv[argi + 1];
         else
             break;
         argi += 2;
     }
     if (!store_dir != !ckpt_dir) {
         fprintf(stderr, "--store and --ckpt-dir go together\n");
+        return 1;
+    }
+    /* A node that votes must give up shortly after the driver does. With no
+     * deadline it would hold its ranks forever if the driver never answers;
+     * with one shorter than the driver's, it would roll back while the driver
+     * can still send "go" to the other nodes. */
+    if (fabric_dir && timeout_ms == 0) {
+        fprintf(stderr, "--fabric-map needs --timeout-ms above 0\n");
+        return 1;
+    }
+    /* Only the driver of a fabric session answers DIR/resumed; after
+     * --hold-gate the caller sends "open" itself. */
+    if (sync_open_ms && !fabric_dir) {
+        fprintf(stderr, "--sync-open goes with --fabric-map\n");
+        return 1;
+    }
+    if (sync_open_ms && hold_gate) {
+        fprintf(stderr, "--sync-open does not go with --hold-gate\n");
+        return 1;
+    }
+    if (sync_open_ms && (argi >= argc || strcmp(argv[argi], "resume"))) {
+        fprintf(stderr, "--sync-open goes with resume\n");
         return 1;
     }
 
@@ -1675,6 +2089,29 @@ int main(int argc, char **argv)
     }
     if (strcmp(action, "open") == 0) {
         failures = open_all(pids, n) < 0;
+        free(pids);
+        return failures;
+    }
+    if (!strcmp(action, "mx-pause") || !strcmp(action, "mx-resume") ||
+        !strcmp(action, "nixl-pause") || !strcmp(action, "nixl-resume")) {
+        /* "mx-pause" -> "mx pause", "nixl-resume" -> "nixl resume [HOST]" */
+        const char *dash = strchr(action, '-');
+        int kind = (int)(dash - action), pause = dash[1] == 'p';
+        char cmd[300];
+        if (mx_host && pause) {
+            fprintf(stderr, "--host goes with %.*s-resume\n", kind, action);
+            free(pids);
+            return 1;
+        }
+        snprintf(cmd, sizeof(cmd), "%.*s %s%s%s", kind, action, pause ? "pause" : "resume",
+                 mx_host ? " " : "", mx_host ? mx_host : "");
+        failures = ctl_all_par(pids, n, cmd) < 0;
+        /* A pid that paused would serve nothing until resumed. */
+        if (failures && pause) {
+            fprintf(stderr, "%s failed: resuming every pid\n", action);
+            snprintf(cmd, sizeof(cmd), "%.*s resume", kind, action);
+            ctl_all_par(pids, n, cmd);
+        }
         free(pids);
         return failures;
     }

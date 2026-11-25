@@ -33,6 +33,7 @@ tests for amd64 and arm64 with warnings as errors.
   - [Chunk store](#chunk-store)
 - [Use through nvsnap](#use-through-nvsnap)
   - [Workloads that span nodes](#workloads-that-span-nodes)
+  - [NCCL over InfiniBand or RoCE](#nccl-over-infiniband-or-roce)
 - [Requirements and limits](#requirements-and-limits)
 - [Validation](#validation)
 <!-- /toc -->
@@ -40,7 +41,11 @@ tests for amd64 and arm64 with warnings as errors.
 ## How it works
 
 Each process that loads the shim runs a control thread on the abstract socket
-`@nvsnap-gpushare.<pid>`. `nvsnap-gpu-suspend` sends it these commands
+`@nvsnap-gpushare.<pid>`, from its first export, import, IPC or host-memory
+call. With `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1` it starts at the process's first
+use of CUDA (its first driver entry-point lookup) instead, even if the process
+never allocates GPU memory itself, as vLLM's engine core at TP > 1 does not;
+`nixl-pause` needs that (set it for the workloads that use it). `nvsnap-gpu-suspend` sends it these commands
 (`gpushare.h`):
 
 | Command | Who | What it does |
@@ -246,11 +251,117 @@ dump. `leaveRunning: false` dumps it for a move: the processes stop, and the
 dump's network lock keeps the source pods from sending resets until they are
 deleted. Each checkpoint records its pod's IP and index in the instance.
 
+An in-place resume opens the GPU launch gates only once every node has
+resumed. Each node binds its share of the memory multicast across nodes
+(NCCL NVLS) again at its resume. A node that launched before another had
+bound its share would have its NVLink accesses refused (Xid 137 on the node
+that launched) and its kernels would spin. Before the suspend, each member's
+agent tells the driver that its tool will hold (`holdsOpen` in the member's
+fabric state, `syncOpenFor` in `internal/agent/checkpoint_v2.go`) when the
+tool has `--sync-open` and the driver asked for it (`gpushareSyncOpen` in
+the member's checkpoint request, set by a driver that runs this open
+phase). The suspend then runs as before, and so does `stop`:
+the holder leaves the processes stopped for CRIU and exits. After the dump,
+the agent runs `resume --fabric-map DIR --sync-open <ms>`. The tool loads,
+exchanges handles, remaps, and sends `resume hold lease` (the launches
+held, with a lease on the tool). It then thaws the
+processes, writes `DIR/resumed` (`<token>`: its pid and round), and waits
+for `DIR/o`. The driver answers every member `<token> open` once all
+members that hold have reported resumed. The tool then sends `open` to
+every process (`open_synced` in `nvsnap-gpu-suspend.c`, `fabricOpener` in
+`internal/agent/gpushare_fabric.go`). The handle exchange makes every node
+load before any remaps, so the markers normally come close together.
+
+- The driver answers `<token> abort` when a member that holds ends without
+  reporting resumed, or when one has not reported 2 minutes after the first
+  (`fabricOpenDeadline`). A member that reports later gets `abort` too. The
+  tool also gives up on its own after `--sync-open` (3 minutes, a minute
+  after the driver; `gpushareSyncOpenWait`).
+- On `abort`, or with no verdict, the tool opens the gates anyway and prints
+  `GPU launches let through before every node resumed`. Gates left closed
+  would stall the workload for good. An early launch hangs it only if a
+  node has not bound its memory yet. The member's capture fails as
+  `resume_stalled`, and the group's error names the members that did not
+  report. No pod is deleted for this. The kernel-log check (`kmsg.go`) reads
+  until after the open, so an Xid from an early launch is reported too.
+- The tool prints the same text when a process's library has no `resume
+  hold lease` (it got plain `resume`, and opened at its resume), when the
+  library could not take the lease ("no lease"), and when the resume goes
+  through a
+  holder that is still there (the stop after the suspend failed): that
+  node was not held.
+- A verdict counts only for the token the tool wrote. The tool removes
+  `DIR/o` before it writes `DIR/resumed`, and the session directory is new
+  for every session. So a verdict from another round or session never
+  opens the gates. A `DIR/resumed` that is not a token (the directory is
+  the workload's to write) is not counted, and the agent logs it.
+- A member that reported resumed and then ended counts as resumed: its share
+  of the memory was bound.
+- The resume runs under the agent's resume deadline (60 minutes,
+  `gpushareResumeDeadline`), which covers the handle exchange (at most 10
+  minutes), the load and remap, and the 3-minute wait. If the tool dies
+  while it waits (killed at that deadline, or with its agent), each process
+  opens its gates once the tool has exited. The tool resumes each process
+  with `resume hold lease`, which takes a lease like the one `hold` takes
+  (`release` ended that one) before it answers, and a successful `open`
+  ends it. A tool that dies at any point after the request, even before
+  it reads the answer, opens the gates. No hold is ever left without a
+  lease. When the library cannot take one (it cannot get the sender's pid
+  or a pidfd), it lets the launches through and answers "no lease". `hold`
+  and `lease` answer an error in that case. A library without `resume hold
+  lease` is resumed with plain `resume`. Either way, the process opened at
+  its resume, so the tool reports the resume as not synced. A separate
+  `resume hold` and then `lease` would leave a moment between the two
+  requests with the launches held and no lease. Without the lease, a tool that died with its agent
+  would leave the workload held for good, with no agent left to delete
+  it. The resume fails, the
+  source counts as left suspended, and the instance's pods are deleted. So
+  are they when `open` fails for a process after the verdict (the tool
+  says "not every pid's GPU launches were let through").
+- A member whose tool has no `--sync-open` (an older node bundle) is not
+  waited for. It opens at its own resume, as before, and the agent logs
+  that. So does a member whose driver did not ask for the hold (an older
+  agent drives the session during a rolling upgrade, and would never
+  answer it).
+- A suspend that fails after `release` and rolls back does not wait: its
+  rollback opens at once, as before. It runs while the other nodes may
+  still be suspending or dumping, so a wait could only end at the deadline,
+  and its output reports the failed suspend already.
+- Without `--sync-open` (one node, a dump for a move, a group restore,
+  which holds with `--hold-gate` and `open` instead), the resume is as
+  before.
+
 Limits of the group checkpoint:
 
 - If a member's checkpoint ends before the vote passes, later votes are
-  answered `abort`; the tool treats that as `retry` and rolls back at its own
-  timeout (`--timeout-ms`, 120 s here), not at once.
+  answered `abort`, and the tool rolls back as soon as it reads one. A `go`
+  that some members already have is delivered to the rest first, never
+  overtaken by an `abort`.
+- A node that reaches its own deadline (`--timeout-ms` plus a minute, after
+  the driver's) with an `ok` vote standing takes the vote back first, then
+  waits up to 20 s for a `go` the driver may already be sending, and
+  follows it (`node_vote`, `VOTE_WITHDRAW_MS` in `nvsnap-gpu-suspend.c`).
+  The driver retries a verdict on each poll (`fabricVoter.finish` in
+  `internal/agent/gpushare_fabric.go`): every 200 ms when the agent refuses
+  the connection, about every 20 s when it does not answer at all
+  (`fabricMemberTimeout` per request). A `go` that cannot reach a node
+  within the 20 s still splits the nodes.
+- While the ranks catch up, launches stay held for up to `--timeout-ms`
+  plus a minute, plus the 20 s wait after a vote is taken back. If the tool dies before `release`, each process opens its
+  gates again once the process that sent `hold` has exited (`lease_take`,
+  `lease_expired` in `gpushare.c`); if the state lock is busy then, it
+  retries about every 3 s until it is free (`lease_recover`). A `release`
+  that refused before changing anything (busy state lock, not quiesced)
+  keeps the lease too. A `resume` or
+  `open` that fails keeps the lease, so the tool's exit still reopens the
+  gates. After `release`, the gates stay closed until `resume`. The lease
+  needs `pidfd_open` (Linux 5.3): where that fails, the process logs "no
+  lease" and a tool that dies leaves the launches held until a `resume` or
+  `open`.
+- An engine more than about 8 launches behind a rank on another node may
+  not catch up before the deadline: every 8 attempts the ranks are let go
+  and held again at a common instant. The checkpoint then ends in a
+  rollback, not a split.
 - A member whose dump fails still resumes and takes part in the exchange. A
   member that returns without writing a handle list is left out; the others
   resume among themselves.
@@ -300,6 +411,107 @@ Limits of the move:
   minutes.
 - Requires a CRIU with `--inet-addr-map` and `net-unlock` (base image
   v0.0.26 or later); the restore refuses to start otherwise.
+
+### NCCL over InfiniBand or RoCE
+
+NCCL opens the node's RDMA devices when it starts, even when every rank is on
+one node, and keeps them, with its queue pairs and memory registrations, until
+the process exits. CRIU cannot dump them, so the capture preflight refuses
+such a pod. Annotated `nvsnap.io/gpushare-ibv: "true"`, or on a cluster whose
+chart sets `webhook.gpushareIBV: true` (every pod under the library unless
+annotated `"false"`), the pod's GPU containers get `NCCL_IBVERBS_LIB` pointed
+at `libnvsnap_ibv.so` from the node bundle. A value the pod sets itself in
+`env` wins. So does one an `envFrom` source might set, except over the
+annotation `"true"`. A container that mounts anything but the selected node
+bundle at `/nvsnap` gets no path: a library that is not there would turn
+NCCL's RDMA off (`gpusharePatches`).
+The workload keeps its transport: NCCL still runs over RDMA. NCCL then loads its verbs from that
+library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
+
+- NCCL gets shadow objects. The queue pair numbers, memory keys, LIDs and GIDs
+  it reads, and has sent its peers, keep their values for the life of the
+  process. Each post and poll goes to the real object underneath, with the
+  keys and numbers translated to the real ones, per device (two NICs can
+  give out the same key or queue pair number).
+- `quiesce`, once GPU work has drained, lets every send NCCL posted
+  complete: a signaled zero-length write (a read, on a queue pair that allows
+  only reads) completes after them. The sends need their peers' queue pairs,
+  and no node releases before every node has quiesced. Completions nobody had
+  polled yet are kept for NCCL, and the fence writes' completions never reach
+  it. NCCL's verbs calls then stay held until `release`: NCCL's proxy can
+  post the last write of a send whose kernel has already finished, and that
+  write would otherwise go out on a queue pair `release` destroys. Held, it
+  goes out on the new queue pair after the restore. Whatever lets the
+  process run again without a release (the gates opening, a `hold` to catch
+  up again) lets the calls run too.
+- `quiesce` also refuses RDMA device files, verbs event files or device
+  mappings left in the process other than NCCL's, before anything stops: the
+  dump could not save them.
+- `release` empties every completion queue, then destroys every queue pair,
+  completion queue, registration, protection domain and device, so the
+  process holds no RDMA device file.
+- `load`, once GPU memory is back, opens the devices of the same name and
+  creates every object again. GPU memory registered through a dma-buf gets a
+  new dma-buf of the same range from CUDA. The queue pairs go to INIT, and
+  the receives NCCL had posted that were still outstanding are posted again.
+- `fabmap` adds the new GIDs, LIDs, queue pair numbers and keys to the
+  exchange. Across nodes, the agent's fabric session merges them. Without
+  `--fabric-map`, the tool merges the lists of the pods' own processes.
+  `remap` then brings each queue pair to RTR and RTS with its peer's new
+  numbers, and `resume` lets NCCL's verbs calls run again.
+
+Every rank NCCL connects must be suspended and restored together, which the
+group checkpoint does. What the library cannot save is refused at one of
+two points, and the two have different results:
+
+- At the suspend, which refuses the capture: a shared receive queue, an
+  address handle, a queue pair other than reliable-connected, a receive
+  with more than four scatter entries, and a queue pair with a failed
+  completion (which of its receives finished is unknown) make `quiesce`
+  and `release` refuse. `release` also refuses on an async event of a
+  queue pair or completion queue that NCCL does not acknowledge within
+  2 s (the provider cannot destroy the object before). A refusal at
+  `quiesce`, or at a `release` with no fence before it, lets NCCL's calls
+  run again, and the workload runs on.
+- At queue creation, which fails the program at its start: a completion
+  channel. `ibv_create_cq` with one fails with `EOPNOTSUPP` (NCCL polls
+  its completion queues and asks for none), so a program that needs one
+  fails where it creates the queue, never at a capture.
+
+A refusal at `release` after the process's `quiesce` fenced NCCL's queue
+pairs does not let the workload run on. Every rank fenced, so the other
+ranks may already be destroying their queue pairs, and a rollback
+re-creates only theirs: this process's queue pairs would go on targeting
+peers that are gone. So libnvsnap_ibv keeps NCCL's verbs calls held for
+good (`nvsnap_ibv_doomed`), also when its wait for calls in progress
+times out. A `release` that finds gpushare's state lock busy after the
+fence is treated the same way, without that lock: gpushare marks the
+process and tells the library (`nvsnap_ibv_doom_if_fenced`). An older
+library without that call stays held anyway, because gpushare never
+opens NCCL's calls again for a marked process. gpushare answers every command that would let the process run
+again (`resume`, `resume hold`, `open`, `hold`, `step`, `quiesce`,
+`release`) with "it cannot run again (replace it)" and keeps its gates
+closed, also when a lease expires. The tool's rollback then fails
+("suspend failed and so did the rollback"), and the agent replaces the
+workload: the pod alone, or every pod of the instance in a group capture.
+An older libnvsnap_ibv, without `nvsnap_ibv_doomed`, reopens NCCL's calls
+on any refusal, as before.
+
+Devices are matched by name (`mlx5_3`), so the restore node needs the
+same NIC names. Other users of verbs in the process (UCX, NIXL) are not
+covered: their devices still fail the dump, which rolls the workload back,
+unless they release them first. ModelExpress (`mx-pause`) and vLLM's NIXL
+KV connector (`nixl-pause`) do, before `quiesce`, while NCCL still holds its
+devices. Their checks that no RDMA is left (device files, verbs event files
+and device mappings) skip NCCL's files, which the library names
+(`nvsnap_ibv_fds`), and mappings of those devices: another user's open file
+still fails the pause, even on one of NCCL's devices. A mapping of one of
+NCCL's devices that another user left after closing its file cannot be told
+from NCCL's; rdma-core unmaps at close, so none is expected, and the dump
+would fail on it and roll the workload back. The check stays at the pause,
+before any rank releases: a refusal at `release`, with other ranks already
+released, would leave shared GPU memory and other nodes to a harder
+rollback.
 
 ## Requirements and limits
 
@@ -375,9 +587,10 @@ Limits of the move:
   distroless static) cannot load the shim.
 - Held calls: while suspended, the shim holds launches, copies, memsets and
   stream memory operations made through the CUDA runtime or the driver's
-  entry-point lookup (as PyTorch, NCCL and vLLM do). Not held: copies to or
-  from CUDA arrays, managed-memory prefetches, batched copies
-  (`cuMemcpyBatchAsync`), and calls a program links directly against
+  entry-point lookup (as PyTorch, NCCL and vLLM do), including batched
+  copies, managed-memory prefetches and stream-ordered allocations. Not
+  held: copies to or from CUDA arrays, `cuMemPrefetchBatchAsync`,
+  `cuLaunchGridAsync`, and calls a program links directly against
   `libcuda`.
 - State files: the tool keeps state in `/tmp/nvsnap-gpu-suspend` and refuses
   to run if it exists and is not owned by its user with mode 0700.
@@ -391,11 +604,11 @@ Limits of the move:
   `rdma_cm`) or an MPTCP socket at capture cannot be captured; CRIU cannot
   dump them (checkpoint-restore/criu#267), and RDMA state (memory
   registrations in a NIC context, queue pairs connected to peers) would not
-  survive a restore anyway. gpushare does not touch RDMA. The capture
+  survive a restore anyway. The capture
   preflight blocks such a capture and the instance runs on and starts cold
   (ARCHITECTURE.md, "Who is captured"; MPTCP support: #2926). This covers,
-  for example, ModelExpress peer-to-peer over RDMA (NIXL/UCX) and NCCL over
-  InfiniBand or RoCE. A workload that has released its RDMA devices by
+  for example, NIXL KV over RDMA without `nixl-pause` and NCCL over
+  InfiniBand or RoCE without `libnvsnap_ibv.so`. A workload that has released its RDMA devices by
   capture time is not blocked.
 - ModelExpress: a worker that loads its weights through ModelExpress
   (`MODEL_EXPRESS_URL` in a process's environment, or `--load-format mx` or `modelexpress`)
@@ -405,8 +618,9 @@ Limits of the move:
   each member's agent runs `mx-pause` on the GPU processes right before the
   suspend, after the instance is held and the capture claimed, so a
   skipped or retried capture never pauses a serving worker. `mx-pause`
-  fails while any RDMA device is still held (NCCL or NIXL KV over RDMA
-  outside ModelExpress): the capture fails there, before anything is
+  fails while any RDMA device is still held (NIXL KV, or NCCL over RDMA
+  without `libnvsnap_ibv.so`; see "NCCL over InfiniBand or RoCE" for NCCL
+  with it): the capture fails there, before anything is
   stopped, with the tool's reason, and the agent runs `mx-resume`. Every
   way the source runs on after a pause (a failed capture, a leave-running
   dump) runs `mx-resume` after the source's resume. The capture records
@@ -425,6 +639,32 @@ Limits of the move:
   library that use ModelExpress); any other process's RDMA still blocks.
   A source whose GPU resume failed gets no `mx-resume`: it is replaced.
   `internal/agent/gpushare_mx.go`.
+- vLLM's NIXL KV connector (`NixlConnector` in pull mode, KV in GPU
+  memory) can release its RDMA devices with `nixl-pause`, but the agent does
+  not call it yet, so these workloads are still refused.
+  `nvsnap-gpu-suspend nixl-pause`, before the suspend, makes the engine take
+  no new requests, waits up to 60 s for KV transfers in flight, stops the
+  handshake listener and shuts the connector down on every TP worker, which
+  drops its NIXL agent and RDMA state. `nixl-resume`, after `open`, creates
+  the connectors again on the same KV memory under a new engine id (peers
+  cache a remote engine's agent and keys by engine id, so a restored engine
+  must look new to them) and restarts the listener, on `--host` when given,
+  as for `mx-resume`. Requests that reached a paused decode engine are
+  prefilled there if the pause outlasted a third of prefill's hold on their
+  KV (`kv_lease_duration`, 30 s by default), since prefill may have reused
+  those blocks. `nixl-pause` fails while any RDMA device file is left (other
+than NCCL's through `libnvsnap_ibv.so`): the
+  engine checks every worker after the release and resumes itself, and the
+  tool resumes every pid on any failure. At TP > 1 the engine-core process allocates no GPU
+  memory, so the pod needs `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1` (see "How it
+  works"); without it the workers time out waiting for the engine and the
+  pause is refused. At TP > 1 in a pod with RDMA NICs, NCCL opens
+  the RDMA devices even when every rank is on one node, and keeps them open
+  until the process exits (destroying all its communicators does not close
+  them), so `nixl-pause` refuses such a pod unless NCCL loads its verbs from
+  `libnvsnap_ibv.so` (see "NCCL over InfiniBand or RoCE"). A process holding both ModelExpress and NIXL KV
+  RDMA state is not handled yet: whichever pause runs first fails its RDMA
+  check, since the other still holds RDMA devices.
 
 ## Validation
 

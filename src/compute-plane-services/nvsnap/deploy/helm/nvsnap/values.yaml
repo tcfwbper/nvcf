@@ -758,6 +758,16 @@ webhook:
   # as they are Ready, and a capture may stop an instance that serves.
   captureHold: true
 
+  # Point NCCL in every GPU pod under the gpushare library at the bundled
+  # verbs library (libnvsnap_ibv.so, NCCL_IBVERBS_LIB), so that a workload
+  # whose NCCL uses RDMA (IB or RoCE) can be captured: the library releases
+  # NCCL's RDMA state before the checkpoint and creates it again after the
+  # restore. Without it, the capture of such a workload is refused and it
+  # starts cold. A pod annotated nvsnap.io/gpushare-ibv: "false", or one
+  # that sets NCCL_IBVERBS_LIB itself, keeps NCCL's own library. Other RDMA
+  # users in the pod (UCX, NIXL) are not covered.
+  gpushareIBV: false
+
   # Operator salt folded into every cache identity the webhook composes.
   # The identity covers image, model, arguments, cache-relevant env, driver
   # and GPU class, but not a change whose effect exists only on a fresh

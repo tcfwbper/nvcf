@@ -255,6 +255,9 @@ func main() {
 	flag.BoolVar(&config.Webhook.CaptureHold, "webhook-capture-hold", false,
 		"Hold a pod a CRIU capture may freeze out of service (a readiness gate) until the node agent has captured it or decided not to, so that a capture never stops an instance that serves.")
 
+	flag.BoolVar(&config.Webhook.GPUShareIBV, "webhook-gpushare-ibv", false,
+		"Point NCCL in every pod under the gpushare library at the bundled verbs library (libnvsnap_ibv.so), so that a workload whose NCCL uses RDMA (IB or RoCE) can be captured; a pod annotated nvsnap.io/gpushare-ibv: \"false\" keeps NCCL's own.")
+
 	flag.StringVar(&config.Webhook.HostBundleRoot, "webhook-host-bundle-root", "",
 		"On-host path the nvsnap-agent DaemonSet stages the restore bundle into (default /var/lib/nvsnap/bundle). Function pods mount {root}/nvsnap + {root}/nvsnap-lib via hostPath.")
 

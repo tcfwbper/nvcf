@@ -21,8 +21,10 @@ records are in `nvsnap-system`.
 - [NvsnapRestoreNotRunRepeatedly](#nvsnaprestorenotrunrepeatedly)
 - [NvsnapTeardownKilled](#nvsnapteardownkilled)
 - [NvsnapCaptureFailed](#nvsnapcapturefailed)
+- [Leave-running capture failures](#leave-running-capture-failures)
 - [NvsnapInventoryStale](#nvsnapinventorystale)
 - [NvsnapCaptureStuckVerifying](#nvsnapcapturestuckverifying)
+- [Workloads whose NCCL uses RDMA (`webhook.gpushareIBV`)](#workloads-whose-nccl-uses-rdma-webhookgpushareibv)
 - [Node model cache](#node-model-cache)
 <!-- /toc -->
 
@@ -237,7 +239,9 @@ three times.
 - The node's account: the failed capture's logs are kept on its node under
   `/var/lib/nvsnap/checkpoints/.failed-logs/<capture>/` (the newest 20),
   CRIU's and, when the GPU tool failed it, its whole output
-  (`nvsnap-gpu-suspend-suspend.log`):
+  (`nvsnap-gpu-suspend-<command>.log`, up to 4 MiB; the error carries only
+  its last 8 lines and ends with
+  `(the tool's whole output is kept on the node in <path>)`):
   `kubectl -n nvsnap-system exec <agent> -c agent -- ls /var/lib/nvsnap/checkpoints/.failed-logs`.
 - `gpushare-failed`: the record's `gpushareFailure` has the container's
   last termination (reason, exit code, its termination message) and, for a
@@ -249,9 +253,74 @@ three times.
   log only, never on the record: search the agent's log for "the end of
   the failed run's log" and the pod's name.
 - Captures that failed for the workload's own doing (`reason`
-  `workload_exited`: it ended during the capture; `no_gpu_process`: it had
-  nothing on the GPU) do not fire this alert; they are on the dashboard's
-  "Capture outcomes".
+  `workload_exited`: it ended during the capture, including when the GPU
+  tool ended with it, see
+  [Leave-running capture failures](#leave-running-capture-failures);
+  `no_gpu_process`: it had
+  nothing on the GPU; `modelexpress_version`: it runs a ModelExpress older
+  than 0.7, so it serves uncaptured until its owner updates ModelExpress)
+  do not fire this alert; they are on the dashboard's "Capture outcomes".
+
+## Leave-running capture failures
+
+A capture asked to leave its workload running (`leaveRunning`, as
+`POST /v1/gpushare/group-checkpoint` takes it) suspends the workload's GPU
+work, dumps it, and resumes it. It is a success only once the workload is
+seen running again. These failures are counted as failed captures, and
+none of them deletes a pod. Pods are deleted only when a member was left
+suspended or locked, as before.
+
+- `the kernel reported a GPU fault during the capture` (reason `gpu_xid`):
+  between the suspend and the end of the resume, the node's kernel logged
+  Xid 137 (an NVLink access the GPU refused, "PRIV Error") on one of the
+  workload's GPUs. A workload resumed after one has hung: its GPUs show
+  100 % utilization, it completes no request, and the engine's own timeout
+  (300 s in vLLM) kills it later. The lines are kept in the failed
+  capture's logs as `kernel-gpu-faults.log`. The agent reads `/dev/kmsg`
+  from the start of the capture (`internal/agent/kmsg.go`). It reads at
+  most 1 MiB, for at most 2 s. If it cannot open `/dev/kmsg` (an agent that
+  is not privileged), it logs `cannot read the node's kernel log` and the
+  check is off. Recover the workload by deleting its pods. Do not capture
+  it in place again until the cause is fixed.
+- `the workload stopped making progress after resume` (reason
+  `resume_stalled`), one of:
+  - On a member's node: a GPU process the capture suspended had ended once
+    the resume was done (`GPU process(es) … ended after their resume`).
+  - On the group's driver, after the holds end: a member's pod was not
+    Ready again within 60 s, a container restarted or ended, or the pod
+    was replaced or deleted within the next 10 s
+    (`internal/agent/resume_guard.go`, `postResumeWatch`).
+  - On a member's node, in a group captured in place: its GPU launch
+    gates were opened before every node of the instance had resumed
+    (`GPU launches let through before every node resumed`). The driver
+    answered `abort`, because a member's resume failed or a member did not
+    report resumed within 2 minutes of the first. Or no verdict came within
+    3 minutes. Or the stop after the suspend failed, so the resume went
+    through the holder and opened at once. Or the pod runs an older
+    `libnvsnap_gpushare` without `resume hold lease`, so it opened at its
+    own resume: then every in-place group capture of it fails as
+    `resume_stalled`. Restart the pod onto the new library; retrying does
+    not help. A library that could not take the tool's lease ("no lease"
+    in the tool's output, with the reason) also opened at its resume. The group's error names the members that did not report
+    (`the GPU launch gates were opened before every node resumed: …`). The
+    workload runs, but it may hang on memory that another node had not
+    bound yet. Check for the Xid above on this node, and look at the named
+    member's own error.
+  The limit: neither check sees the GPU work itself. A workload whose
+  GPU work hangs while its processes run and its readiness probe passes
+  still passes these checks. A hang seen so far came with the Xid above.
+- `the workload exited during the capture` (reason `workload_exited`): the
+  workload's process ended while the capture ran. The GPU tool runs in
+  the workload's pid namespace, so when the workload's init exits the
+  kernel kills the tool too (`signal: killed`). Or the tool sees the
+  workload's processes stop answering (`err no reply`,
+  `Connection reset by peer`) and exits a moment before. The agent waits
+  up to 5 s for the init to end, then says the workload exited. It does
+  not say the tool failed or that the workload could not be resumed. When
+  the capture had suspended the workload, the text adds
+  `the instance is replaced`, and its pods are deleted as before. Look at
+  the workload's own log for why it exited. In the case above, it was the
+  engine's timeout after a hang from an earlier cycle.
 
 ## NvsnapInventoryStale
 
@@ -276,6 +345,51 @@ for 6 minutes; until then only its own namespace restores from it.
 - Its namespace's pods: deleted and restored again and again within 6
   minutes (a test that cycles its instance) never verify it. Otherwise
   [follow its last restore](#following-one-capture-or-restore).
+
+## Workloads whose NCCL uses RDMA (`webhook.gpushareIBV`)
+
+NCCL over InfiniBand or RoCE holds the node's RDMA devices, which a
+checkpoint cannot save. Without help, the capture preflight refuses such a
+pod (its finding: "holds RDMA devices … a checkpoint cannot save RDMA
+state"), and the configuration starts cold every time.
+
+- On: set `webhook.gpushareIBV: true`. Pods admitted after the rollout get
+  `NCCL_IBVERBS_LIB=/nvsnap/libnvsnap_ibv.so` in each GPU container that
+  gets the gpushare library (not annotated `nvsnap.io/gpushare: "false"`),
+  unless the container sets `NCCL_IBVERBS_LIB` in `env`, has an `envFrom`
+  that could set it (only the annotation `nvsnap.io/gpushare-ibv: "true"`
+  overrides that), or mounts something other than the node bundle at
+  `/nvsnap`. `gpusharePatches` in `internal/webhook/gpushare.go` applies
+  these rules. Pods already running keep NCCL's own library until they
+  are recreated. The workload keeps its transport: NCCL still runs over
+  RDMA, and the library releases and re-creates NCCL's RDMA state around
+  the capture (docs/design/GPUSHARE.md, "NCCL over InfiniBand or RoCE").
+- Check a pod: `kubectl exec <pod> -c <container> -- printenv NCCL_IBVERBS_LIB`
+  shows what was asked for. NCCL logs
+  `NCCL_IBVERBS_LIB set by environment to /nvsnap/libnvsnap_ibv.so` (with
+  `NCCL_DEBUG=INFO`) before it tries to load the library, so that line
+  does not prove the load. To check the load, list the NCCL processes that
+  have it mapped:
+  `kubectl exec <pod> -c <container> -- sh -c 'grep -l libnvsnap_ibv.so /proc/[0-9]*/maps'`
+  (the shell in the container expands the glob: unquoted, the local shell
+  would expand it to the local machine's processes).
+  The capture preflight then reports those processes' RDMA devices as a
+  warning ("… through libnvsnap_ibv.so"), not a block.
+- One workload out: annotate its pods `nvsnap.io/gpushare-ibv: "false"`, or
+  set `NCCL_IBVERBS_LIB` in the pod; NCCL keeps its own library and the
+  capture is refused as before.
+- Not covered: RDMA held by anything other than NCCL in the pod (UCX, NIXL,
+  ModelExpress transfers) and not released by `mx-pause` or `nixl-pause`.
+  A process that holds such RDMA and does not map the library is blocked
+  by the preflight, and nothing stops. In a process that maps the library,
+  `quiesce` refuses it ("RDMA device file(s) open, … outside NCCL's verbs
+  library"), before anything stops, and the workload runs on uncaptured.
+  RDMA that only shows up after the instance stopped fails the dump; a
+  capture that fails after the instance stopped replaces it cold.
+- Off: set it back to `false`; pods recreated after that use NCCL's own
+  library. Pods whose template sets `nvsnap.io/gpushare-ibv: "true"` still
+  get the bundled library: remove the annotation, or set it to `"false"`,
+  before recreating them.
 
 ## Node model cache
 

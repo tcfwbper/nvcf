@@ -282,6 +282,25 @@ func TestRDMAFindingsBlock(t *testing.T) {
 	}
 }
 
+// A process whose NCCL takes its verbs from libnvsnap_ibv.so warns instead
+// of blocking: the GPU suspend releases NCCL's RDMA state.
+func TestRDMAFindingsIBVLibWarns(t *testing.T) {
+	proc := t.TempDir()
+	fakeRDMAProc(t, proc, 41, "VllmWorker", nil,
+		"7f0000002000-7f0000003000 r-xp 00000000 103:01 78 /opt/nvsnap/bin/libnvsnap_ibv.so\n")
+	fakeRDMAProc(t, proc, 9, "nixl", nil, "7f0000002000-7f0000003000 r-xp 00000000 103:01 77 /usr/lib/libibverbs.so.1\n")
+	fs := rdmaFindings(proc, "w-0", "main", map[int][]string{
+		41: {"/dev/infiniband/uverbs0"},
+		9:  {"/dev/infiniband/uverbs2"},
+	})
+	if len(fs) != 2 || fs[0].Severity != preflightBlock || fs[1].Severity != preflightWarn {
+		t.Fatalf("want process 9 blocking and process 41 warning: %+v", fs)
+	}
+	if !strings.Contains(fs[1].Detail, "process 41 (VllmWorker) holds RDMA devices /dev/infiniband/uverbs0 through libnvsnap_ibv.so") {
+		t.Errorf("warning detail: %s", fs[1].Detail)
+	}
+}
+
 // The host checks of a container block its capture when one of its
 // processes holds an RDMA device, and only then; the other checks still
 // report.

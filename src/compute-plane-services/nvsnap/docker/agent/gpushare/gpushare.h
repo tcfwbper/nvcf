@@ -44,6 +44,28 @@ SPDX-License-Identifier: Apache-2.0
  *   resume hold  the same, but the gate stays closed until "open": across
  *            nodes, only once every node has bound its multicast memory.
  *   open     (after "resume hold")  reopen the launch gate.
+ *   resume hold lease  "resume hold", and, before it answers, a lease on
+ *            the sender (the process that will send "open"): the launch
+ *            gate reopens if it exits first, even right after the reply;
+ *            a successful "open" ends it. When no lease can be taken, the
+ *            gate is not left closed: "ok resumed ...; no lease (why):
+ *            launches let through".
+ *   lease    (after "resume hold", from the process that will send "open")
+ *            the same lease alone; "err no lease (why): launches let
+ *            through" when none can be taken ("hold" too).
+ *   mx pause  (before quiesce)  ModelExpress stops serving its weights to
+ *            peers and drops its NIXL/RDMA state, which CRIU cannot dump.
+ *   mx resume (after open)  it registers them again and republishes.
+ *   mx resume HOST  the same, advertising HOST (MX_WORKER_HOST) to peers:
+ *            after a restore into another pod, that pod's address.
+ *            Both need ModelExpress >= 0.7 (an earlier one: "err").
+ *   nixl pause  (before quiesce)  vLLM's NIXL KV connector (pull mode):
+ *            the engine takes no new requests, waits for KV transfers in
+ *            flight and shuts the connector down on every TP worker,
+ *            dropping its NIXL/RDMA state. A TP worker process waits for
+ *            that. On failure the engine resumes.
+ *   nixl resume [HOST]  (after open)  the connectors come back under a new
+ *            engine id; the handshake listener restarts (on HOST if given).
  *
  * Shared memory is tracked whether it is passed as a POSIX fd or, with an
  * IMEX channel, as a fabric handle (identified by "whosefab", hex). An
