@@ -76,6 +76,7 @@ static struct {
     int (*query_device)(struct ibv_context *, struct ibv_device_attr *);
     int (*query_port)(struct ibv_context *, uint8_t, struct _compat_ibv_port_attr *);
     int (*query_gid)(struct ibv_context *, uint8_t, int, union ibv_gid *);
+    int (*query_gid_ex)(struct ibv_context *, uint32_t, uint32_t, struct ibv_gid_entry *, uint32_t, size_t);
     int (*query_pkey)(struct ibv_context *, uint8_t, int, __be16 *);
     int (*query_qp)(struct ibv_qp *, struct ibv_qp_attr *, int, struct ibv_qp_init_attr *);
     struct ibv_pd *(*alloc_pd)(struct ibv_context *);
@@ -113,6 +114,8 @@ static void load_real(void)
     L(destroy_qp, V11); L(fork_init, V11); L(event_type_str, V11);
     L(query_ece, "IBVERBS_1.10"); L(set_ece, "IBVERBS_1.10"); L(query_port_speed, "IBVERBS_1.16");
 #undef L
+    /* ibv_query_gid_ex is an inline over this one (rdma-core 32 and later). */
+    *(void **)&R.query_gid_ex = dlvsym(real_lib, "_ibv_query_gid_ex", "IBVERBS_1.11");
 }
 
 static int real_ok(void)
@@ -128,7 +131,9 @@ struct vctx;
 /* One generation of a translation table: readers load the pointer once. */
 struct u32tab { int cap, used; uint32_t *k, *v; };
 struct u32map { struct u32tab *t; };
-struct vgid { uint8_t port; int index; union ibv_gid old, cur; int cur_index; };
+/* type: the entry's enum ibv_gid_type (IB, RoCE v1, RoCE v2) when NCCL read
+ * it, -1 if the provider could not tell. */
+struct vgid { uint8_t port; int index; union ibv_gid old, cur; int cur_index; int type; };
 struct vport { uint8_t port; uint16_t old_lid, cur_lid; int queried; };
 struct vctx {
     struct ibv_context v;
@@ -410,6 +415,33 @@ EXPORT int (ibv_query_port)(struct ibv_context *ctx, uint8_t port, struct _compa
     return r;
 }
 
+#ifndef NVSNAP_IBV_SYSFS
+#define NVSNAP_IBV_SYSFS "/sys/class/infiniband"
+#endif
+
+/* The type (enum ibv_gid_type) of entry index of c's port, -1 if it cannot
+ * be told: IB on an InfiniBand port; else what ibv_query_gid_ex reports
+ * (rdma-core 32 and later), or else what the kernel's sysfs says, where
+ * NCCL reads it ("IB/RoCE v1", "RoCE v2"). */
+static int gid_type(struct vctx *c, uint8_t port, int index)
+{
+    struct ibv_port_attr pa;
+    memset(&pa, 0, sizeof(pa));
+    if (!R.query_port(c->real, port, (struct _compat_ibv_port_attr *)&pa) && pa.link_layer == IBV_LINK_LAYER_INFINIBAND)
+        return IBV_GID_TYPE_IB;
+    struct ibv_gid_entry e;
+    if (R.query_gid_ex && index >= 0 && !R.query_gid_ex(c->real, port, index, &e, 0, sizeof(e))) return e.gid_type;
+    char p[256], t[32] = "";
+    snprintf(p, sizeof(p), "%s/%s/ports/%u/gid_attrs/types/%d", NVSNAP_IBV_SYSFS, c->dev.name, port, index);
+    FILE *f = fopen(p, "re");
+    if (!f) return -1;
+    int ok = fgets(t, sizeof(t), f) != NULL;
+    fclose(f);
+    if (ok && !strncmp(t, "RoCE v2", 7)) return IBV_GID_TYPE_ROCE_V2;
+    if (ok && !strncmp(t, "IB/RoCE v1", 10)) return IBV_GID_TYPE_ROCE_V1;  /* not an InfiniBand port */
+    return -1;
+}
+
 EXPORT int ibv_query_gid(struct ibv_context *ctx, uint8_t port, int index, union ibv_gid *gid)
 {
     struct vctx *c = (struct vctx *)ctx;
@@ -423,9 +455,12 @@ EXPORT int ibv_query_gid(struct ibv_context *ctx, uint8_t port, int index, union
     pthread_mutex_unlock(&omu);
     enter();
     int r = R.query_gid(c->real, port, index, gid);
+    /* Its type too: a restore must use an entry of the same type, or the
+     * queue pair's RoCE version differs from its peer's. */
+    int type = r ? -1 : gid_type(c, port, index);
     leave();
     if (!r) {
-        struct vgid g = { .port = port, .index = index, .old = *gid, .cur = *gid, .cur_index = index };
+        struct vgid g = { .port = port, .index = index, .old = *gid, .cur = *gid, .cur_index = index, .type = type };
         pthread_mutex_lock(&omu);
         PUSHP(c->gids, c->n_gids, g);
         pthread_mutex_unlock(&omu);
@@ -1290,9 +1325,11 @@ static struct ibv_device *find_dev(struct ibv_device **l, int nd, const char *na
     return NULL;
 }
 
-/* After the restore the same GID index may hold another kind of address:
- * use the index on the new port that holds the same kind (RoCE v2 IPv4,
- * IPv6, or IB) as the old one did, the old index first. */
+/* After the restore the same GID index may hold another kind of address,
+ * or the same address with another RoCE version: use the index on the new
+ * port that holds the same kind (IPv4, link-local, or other IPv6 / IB) with
+ * the same type (IB, RoCE v1 or v2) as the old one did, the old index first.
+ * An entry whose type was not known when NCCL read it matches none. */
 static int gid_kind(const union ibv_gid *g)
 {
     static const uint8_t v4[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
@@ -1301,20 +1338,30 @@ static int gid_kind(const union ibv_gid *g)
     return 3;
 }
 
+static int gid_like(struct vctx *c, const struct vgid *g, int i, union ibv_gid *x)
+{
+    return g->type >= 0 && !R.query_gid(c->real, g->port, i, x) && memcmp(x->raw, (uint8_t[16]){ 0 }, 16) &&
+           gid_kind(x) == gid_kind(&g->old) && gid_type(c, g->port, i) == g->type;
+}
+
 static int pick_gid(struct vctx *c, struct vgid *g)
 {
     union ibv_gid x;
-    if (!R.query_gid(c->real, g->port, g->index, &x) && gid_kind(&x) == gid_kind(&g->old) &&
-        memcmp(x.raw, (uint8_t[16]){ 0 }, 16)) {
+    if (gid_like(c, g, g->index, &x)) {
         g->cur = x, g->cur_index = g->index;
         return 0;
     }
     for (int i = 0; i < 256; i++)
-        if (!R.query_gid(c->real, g->port, i, &x) && gid_kind(&x) == gid_kind(&g->old) && memcmp(x.raw, (uint8_t[16]){ 0 }, 16)) {
+        if (gid_like(c, g, i, &x)) {
             g->cur = x, g->cur_index = i;
             return 0;
         }
     return -1;
+}
+
+static const char *gid_type_name(int t)
+{
+    return t == IBV_GID_TYPE_IB ? "IB" : t == IBV_GID_TYPE_ROCE_V1 ? "RoCE v1" : t == IBV_GID_TYPE_ROCE_V2 ? "RoCE v2" : "unknown";
 }
 
 /* Create every object again (gpushare "load", after GPU memory is back):
@@ -1339,11 +1386,19 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
         }
         __atomic_add_fetch(&c->gen, 1, __ATOMIC_SEQ_CST);
         /* NCCL reads many GID entries to choose one (some empty); only the
-         * ones a queue pair uses must exist again. A device that fails the
-         * check is closed again, so a retry checks it again. */
+         * ones a queue pair uses must exist again, and only those are
+         * looked for (map and connect read no other). A device that fails
+         * the check is closed again, so a retry checks it again. */
         for (int k = 0; k < c->n_gids && !bad; k++)
-            if (pick_gid(c, &c->gids[k]) && gid_used(c, &c->gids[k])) {
-                snprintf(reply, n, "err %s port %d: no GID like index %d had", c->dev.name, c->gids[k].port, c->gids[k].index);
+            if (gid_used(c, &c->gids[k]) && pick_gid(c, &c->gids[k])) {
+                struct vgid *g = &c->gids[k];
+                if (g->type < 0)
+                    snprintf(reply, n, "err %s port %d: GID index %d: the provider did not report its type (IB, RoCE v1 or v2) "
+                             "when NCCL read it (ibv_query_gid_ex, sysfs gid_attrs/types); cannot match it",
+                             c->dev.name, g->port, g->index);
+                else
+                    snprintf(reply, n, "err %s port %d: no GID of the address family and type (%s) index %d had",
+                             c->dev.name, g->port, gid_type_name(g->type), g->index);
                 bad = 1;
             }
         if (bad) {

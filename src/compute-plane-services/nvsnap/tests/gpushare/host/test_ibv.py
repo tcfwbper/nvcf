@@ -49,6 +49,7 @@ FAKE = r"""
 #include <errno.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -65,7 +66,7 @@ struct fmr { struct ibv_mr m; int live; };
 struct fwc { struct ibv_wc w; };
 struct fcq { struct ibv_cq c; struct ibv_wc q[256]; int n; int live; };
 struct frecv { uint64_t wr_id; struct ibv_sge sg; };
-struct fqp { struct ibv_qp q; uint32_t dest; union ibv_gid dgid; uint16_t dlid; int global;
+struct fqp { struct ibv_qp q; uint32_t dest; union ibv_gid dgid; uint16_t dlid; int global; int sgid;
              struct frecv r[64]; int nr; int live; int unacked; };
 static struct fmr *mrs[256]; static int n_mrs;
 static struct fqp *qps[256]; static int n_qps;
@@ -78,6 +79,33 @@ static void gid_of(int e, int d, union ibv_gid *g)
 }
 
 int fake_open_contexts(void) { return open_ctxs; }
+/* The GID table of every port: an index below 16 set here holds the IPv4
+ * address (gid_of) with RoCE type kind - 1; every other index below 16
+ * holds a link-local address, type RoCE v1; indices from 16 are empty (a
+ * zero GID, ENODATA from the type query). As a RoCE NIC: index 3, IPv4
+ * RoCE v2. */
+static int gkind[16] = { [3] = 1 + IBV_GID_TYPE_ROCE_V2 }, gid_ex_fail;
+static int ib_link;  /* the ports' link layer is InfiniBand: every GID is type IB */
+/* As the kernel's sysfs, under $FAKE_SYSFS (directories made by the test):
+ * <dev>/ports/1/gid_attrs/types/<index> for the 16 entries in use. */
+static void sysfs_sync(void)
+{
+    const char *root = getenv("FAKE_SYSFS");
+    for (int d = 0; root && d < 2; d++)
+        for (int i = 0; i < 16; i++) {
+            char p[512];
+            snprintf(p, sizeof(p), "%s/fake%d/ports/1/gid_attrs/types/%d", root, d, i);
+            FILE *f = fopen(p, "w");
+            if (!f) continue;
+            fputs(!ib_link && gkind[i] == 1 + IBV_GID_TYPE_ROCE_V2 ? "RoCE v2\n" : "IB/RoCE v1\n", f);
+            fclose(f);
+        }
+}
+void fake_gid(int i, int kind) { gkind[i] = kind; sysfs_sync(); }
+void fake_gid_ex_fail(int on) { gid_ex_fail = on; }  /* the GID type query fails */
+void fake_ib(int on) { ib_link = on; sysfs_sync(); }
+static int gid_queries;
+int fake_gid_queries(void) { return gid_queries; }  /* GID table reads, either call */
 /* After a move the two NICs number apart: a number looked up under the
  * wrong device is one the right device rejects. */
 void fake_move(void) { epoch++; counter[0] = 0; counter[1] = 50; }
@@ -99,6 +127,7 @@ int fake_async_calls(void) { return async_calls; }
 int fake_live_pds(void) { return live_pds; }
 int fake_qp_state(struct ibv_qp *q) { return q->state; }
 int fake_qp_receives(struct ibv_qp *q) { return ((struct fqp *)q)->nr; }
+int fake_qp_sgid(struct ibv_qp *q) { return ((struct fqp *)q)->sgid; }
 
 static void push(struct fcq *c, struct ibv_wc w) { if (c->n < 256) c->q[c->n++] = w; }
 
@@ -191,6 +220,7 @@ struct ibv_context *ibv_open_device(struct ibv_device *d)
     c->async_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     c->ops.poll_cq = poll_cq; c->ops.post_send = post_send; c->ops.post_recv = post_recv;
     open_ctxs++;
+    sysfs_sync();
     return c;
 }
 /* As the kernel: what is left of the device's objects goes with it. The
@@ -225,16 +255,34 @@ int (ibv_query_port)(struct ibv_context *c, uint8_t p, struct _compat_ibv_port_a
     __atomic_sub_fetch(&port_in, 1, __ATOMIC_SEQ_CST);
     struct ibv_port_attr *x = (struct ibv_port_attr *)a;
     memset(x, 0, sizeof(*x));
-    x->state = IBV_PORT_ACTIVE; x->lid = 1 + epoch; x->link_layer = IBV_LINK_LAYER_ETHERNET;
+    x->state = IBV_PORT_ACTIVE; x->lid = 1 + epoch; x->link_layer = ib_link ? IBV_LINK_LAYER_INFINIBAND : IBV_LINK_LAYER_ETHERNET;
     return 0;
 }
-int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g)
+/* static: the probe exports its own ibv_query_gid (the library's). */
+static void gid_at(struct ibv_context *c, int i, union ibv_gid *g)
 {
-    (void)p;
-    if (i != 3) { memset(g, 0, sizeof(*g)); g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[14] = di(c); g->raw[15] = i; return 0; }
+    memset(g, 0, sizeof(*g));
+    if (i < 0 || i >= 16) return;
+    if (!gkind[i]) { g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[14] = di(c); g->raw[15] = i; return; }
     gid_of(epoch, di(c), g);
+}
+int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g) { (void)p; gid_queries++; gid_at(c, i, g); return 0; }
+/* ibv_query_gid_ex (rdma-core's inline calls this): the entry and its type.
+ * Built with NO_GID_EX: a libibverbs older than rdma-core 32, without it. */
+#ifndef NO_GID_EX
+int _ibv_query_gid_ex(struct ibv_context *c, uint32_t p, uint32_t i, struct ibv_gid_entry *e, uint32_t flags, size_t size)
+{
+    gid_queries++;
+    if (flags || size < sizeof(*e)) return EINVAL;
+    if (gid_ex_fail) return EOPNOTSUPP;
+    memset(e, 0, sizeof(*e));
+    gid_at(c, i, &e->gid);
+    if (!memcmp(e->gid.raw, (uint8_t[16]){ 0 }, 16)) return ENODATA;
+    e->gid_index = i; e->port_num = p;
+    e->gid_type = ib_link ? IBV_GID_TYPE_IB : i < 16 && gkind[i] ? gkind[i] - 1 : IBV_GID_TYPE_ROCE_V1;
     return 0;
 }
+#endif
 int ibv_query_pkey(struct ibv_context *c, uint8_t p, int i, __be16 *k) { (void)c; (void)p; (void)i; *k = 0xffff; return 0; }
 int ibv_query_qp(struct ibv_qp *q, struct ibv_qp_attr *a, int m, struct ibv_qp_init_attr *ia)
 { (void)q; (void)a; (void)m; (void)ia; return 0; }
@@ -279,7 +327,8 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask)
                                   (a->qp_state == IBV_QPS_RTS && q->q.state != IBV_QPS_RTR)))
         return EINVAL;
     if (mask & IBV_QP_DEST_QPN) q->dest = a->dest_qp_num;
-    if (mask & IBV_QP_AV) q->dgid = a->ah_attr.grh.dgid, q->dlid = a->ah_attr.dlid, q->global = a->ah_attr.is_global;
+    if (mask & IBV_QP_AV)
+        q->dgid = a->ah_attr.grh.dgid, q->dlid = a->ah_attr.dlid, q->global = a->ah_attr.is_global, q->sgid = a->ah_attr.grh.sgid_index;
     if (mask & IBV_QP_STATE) q->q.state = a->qp_state;
     return 0;
 }
@@ -307,6 +356,7 @@ IBVERBS_1.1 {
     ibv_create_qp; ibv_modify_qp; ibv_destroy_qp; ibv_fork_init; ibv_event_type_str;
   local: *;
 };
+IBVERBS_1.11 { global: _ibv_query_gid_ex; } IBVERBS_1.1;
 FAKE_1 { global: fake_*; };
 """
 
@@ -468,6 +518,8 @@ static int open_pause, open_paused, open_go;
 /* Set once stop_calls is in its wait for verbs calls in progress. */
 static int in_drain_wait;
 #define NVSNAP_IBV_WAITING_HOOK() __atomic_store_n(&in_drain_wait, 1, __ATOMIC_SEQ_CST)
+/* sysfs: the fake's tree, or none. */
+#define NVSNAP_IBV_SYSFS (getenv("FAKE_SYSFS") ? getenv("FAKE_SYSFS") : "/nonexistent/sysfs")
 /* Counts the broadcasts that let NCCL's held verbs calls go (reopen). */
 static int probe_broadcast(pthread_cond_t *c);
 #define pthread_cond_broadcast(c) probe_broadcast(c)
@@ -486,12 +538,13 @@ FK(void, fake_move, void); FK(void, fake_port_block, int); FK(void, fake_fail_ma
 FK(void, fake_fail_init, int); FK(void, fake_fail_destroy, int); FK(void, fake_err_opcode, int); FK(void, fake_next_lkey, uint32_t);
 FK(void, fake_raise_qp_event, struct ibv_qp *); FK(int, fake_async_calls, void); FK(int, fake_live_pds, void);
 FK(int, fake_qp_state, struct ibv_qp *); FK(int, fake_qp_receives, struct ibv_qp *); FK(int, fake_port_in, void);
+FK(void, fake_gid, int, int); FK(void, fake_gid_ex_fail, int); FK(int, fake_qp_sgid, struct ibv_qp *); FK(void, fake_ib, int); FK(int, fake_gid_queries, void);
 static void fakes(void)
 {
 #define G(name) *(void **)&name = dlsym(real_lib, #name); if (!name) { printf("no %s\n", #name); exit(2); }
     G(fake_move); G(fake_port_block); G(fake_fail_marker); G(fake_fail_init); G(fake_fail_destroy); G(fake_err_opcode);
     G(fake_next_lkey); G(fake_raise_qp_event); G(fake_async_calls); G(fake_live_pds); G(fake_qp_state);
-    G(fake_qp_receives); G(fake_port_in);
+    G(fake_qp_receives); G(fake_port_in); G(fake_gid); G(fake_gid_ex_fail); G(fake_qp_sgid); G(fake_ib); G(fake_gid_queries);
 #undef G
 }
 
@@ -924,6 +977,46 @@ int main(int argc, char **argv)
         printf("fence=%d\n", fence_rc);
         return 0;
     }
+    if (!strncmp(c, "roce_", 5)) {
+        /* NCCL connected through index 3, IPv4 RoCE v2. On the node of the
+         * restore, index 3 holds the same IPv4 address as RoCE v1, and
+         * index 4 (roce_type) holds it as RoCE v2; roce_none has no RoCE v2
+         * entry. roce_unknown: the provider could not tell the GID's type
+         * when NCCL read it. roce_ib: an InfiniBand port, its table as it
+         * was. PROBE_GIDEX_FAIL: the type query fails throughout;
+         * PROBE_IB: the ports are InfiniBand. */
+        int nd;
+        ibv_get_device_list(&nd);
+        fakes();
+        if (getenv("PROBE_IB")) fake_ib(1);
+        if (!strcmp(c, "roce_unknown") || getenv("PROBE_GIDEX_FAIL")) fake_gid_ex_fail(1);
+        up(1);
+        if (!getenv("PROBE_GIDEX_FAIL")) fake_gid_ex_fail(0);
+        /* NCCL reads the port's table to choose an entry, empty ones too. */
+        for (int i = 0; i < 24; i++) { union ibv_gid x; ibv_query_gid(ctx, 1, i, &x); }
+        fake_gid_ex_fail(0);  /* the new node's provider reports types */
+        if (strcmp(c, "roce_ib")) fake_gid(3, 1 + IBV_GID_TYPE_ROCE_V1);
+        if (!strcmp(c, "roce_type")) fake_gid(4, 1 + IBV_GID_TYPE_ROCE_V2);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        int q0 = fake_gid_queries();
+        int r = nvsnap_ibv_restore(rep, sizeof(rep));
+        printf("restore=%d restore_gid_queries=%d\n", r, fake_gid_queries() - q0);
+        if (r) {
+            printf("restore_error=%s\n", strstr(rep, "did not report") ? "unknown" : strstr(rep, "no GID of") ? "nomatch" : "other");
+            fprintf(stderr, "%s\n", rep);
+            return 0;
+        }
+        if (reconnect()) return 1;
+        nvsnap_ibv_open();
+        send_t(NULL);
+        struct ibv_wc wc[8];
+        int n = cq->context->ops.poll_cq(cq, 8, wc), ok = 0;
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("sgid_a=%d sgid_b=%d completed=%d\n", fake_qp_sgid(((struct vqp *)qa)->real),
+               fake_qp_sgid(((struct vqp *)qb)->real), ok);
+        return 0;
+    }
     if (!strcmp(c, "noslot")) {
         up(0);
         pd = ibv_alloc_pd(ctx);
@@ -1055,6 +1148,14 @@ class Ibv(unittest.TestCase):
         cls.fake = os.path.join(t, "libibverbs.so.1")
         subprocess.run(["gcc", "-shared", "-fPIC", *inc, "-Wl,--version-script=" + os.path.join(t, "fake.map"),
                         "-o", cls.fake, os.path.join(t, "fake.c")], check=True)
+        # The same verbs without _ibv_query_gid_ex (libibverbs before rdma-core 32).
+        os.mkdir(os.path.join(t, "old"))
+        with open(os.path.join(t, "old", "fake.map"), "w") as f:
+            f.write("\n".join(l for l in FAKE_MAP.splitlines() if "IBVERBS_1.11" not in l))
+        cls.fake_old = os.path.join(t, "old", "libibverbs.so.1")
+        subprocess.run(["gcc", "-shared", "-fPIC", "-DNO_GID_EX", *inc,
+                        "-Wl,--version-script=" + os.path.join(t, "old", "fake.map"),
+                        "-o", cls.fake_old, os.path.join(t, "fake.c")], check=True)
         subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIC", "-shared", "-fvisibility=hidden", *inc,
                         "-I", CUDA_INC, "-Wl,--version-script=" + os.path.join(SRC, "nvsnap_ibv.map"),
                         "-o", os.path.join(t, "libnvsnap_ibv.so"), os.path.join(SRC, "nvsnap_ibv.c"),
@@ -1112,8 +1213,9 @@ class Ibv(unittest.TestCase):
         self.assertGreaterEqual(int(moved[0]["lines"]), 10, p.stdout)  # per device: a port, 2 keys, 2 queue pairs
 
     def probe(self, case, **env):
-        p = subprocess.run([os.path.join(self.tmp, "probe"), case], capture_output=True, text=True, timeout=60,
-                           env=dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake, **env))
+        e = dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake)
+        e.update(env)
+        p = subprocess.run([os.path.join(self.tmp, "probe"), case], capture_output=True, text=True, timeout=60, env=e)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return dict(kv.split("=", 1) for line in p.stdout.splitlines() for kv in line.split() if "=" in kv)
 
@@ -1252,6 +1354,56 @@ class Ibv(unittest.TestCase):
     def test_receive_recorded_while_the_fence_waits_refuses_the_checkpoint(self):
         self.assertNotEqual(self.probe("sge5drain")["fence"], "0",
                             "a receive cut short while the fence waited for its call was checkpointed")
+
+    def test_restore_picks_a_gid_of_the_same_roce_type(self):
+        out = self.probe("roce_type")
+        self.assertEqual(out["restore"], "0", out)
+        self.assertEqual((out["sgid_a"], out["sgid_b"]), ("4", "4"),
+                         "the restore took a GID of the same address family but another RoCE type: %s" % out)
+        self.assertEqual(out["completed"], "1", out)
+
+    def test_restore_reads_only_the_gids_queue_pairs_use(self):
+        # NCCL read 24 entries; one is in use. The others are not searched
+        # for on the new port (up to 256 reads each).
+        out = self.probe("roce_type")
+        self.assertEqual(out["restore"], "0", out)
+        self.assertLess(int(out["restore_gid_queries"]), 16, out)
+
+    def test_restore_without_a_gid_of_the_same_roce_type_is_refused(self):
+        out = self.probe("roce_none")
+        self.assertNotEqual(out["restore"], "0", "a restore with no GID of the captured RoCE type went on: %s" % out)
+        self.assertEqual(out["restore_error"], "nomatch", out)
+
+    def test_restore_without_the_captured_gid_type_is_refused(self):
+        out = self.probe("roce_unknown")
+        self.assertNotEqual(out["restore"], "0", "a restore whose captured GID type is unknown went on: %s" % out)
+        self.assertEqual(out["restore_error"], "unknown", out)
+
+    def sysfs(self):
+        root = tempfile.mkdtemp(dir=self.tmp)
+        for d in ("fake0", "fake1"):
+            os.makedirs(os.path.join(root, d, "ports/1/gid_attrs/types"))
+        return root
+
+    def test_restore_reads_the_gid_type_from_sysfs_without_the_query(self):
+        # A libibverbs without _ibv_query_gid_ex: the types NCCL reads.
+        out = self.probe("roce_type", NVSNAP_IBV_REAL_LIB=self.fake_old, FAKE_SYSFS=self.sysfs())
+        self.assertEqual(tuple(out.get(k) for k in ("restore", "sgid_a", "sgid_b", "completed")), ("0", "4", "4", "1"), out)
+        out = self.probe("roce_none", NVSNAP_IBV_REAL_LIB=self.fake_old, FAKE_SYSFS=self.sysfs())
+        self.assertEqual(out.get("restore_error"), "nomatch", out)
+
+    def test_restore_reads_the_gid_type_from_sysfs_when_the_query_fails(self):
+        out = self.probe("roce_type", PROBE_GIDEX_FAIL="1", FAKE_SYSFS=self.sysfs())
+        self.assertEqual(tuple(out.get(k) for k in ("restore", "sgid_a", "sgid_b", "completed")), ("0", "4", "4", "1"), out)
+
+    def test_restore_on_an_infiniband_port_needs_no_type_query(self):
+        out = self.probe("roce_ib", NVSNAP_IBV_REAL_LIB=self.fake_old, PROBE_IB="1")
+        self.assertEqual(tuple(out.get(k) for k in ("restore", "sgid_a", "sgid_b", "completed")), ("0", "3", "3", "1"), out)
+
+    def test_restore_without_the_query_or_sysfs_is_refused(self):
+        out = self.probe("roce_type", NVSNAP_IBV_REAL_LIB=self.fake_old)
+        self.assertNotEqual(out["restore"], "0", out)
+        self.assertEqual(out["restore_error"], "unknown", out)
 
     def test_untracked_queue_pair_refuses_the_checkpoint(self):
         out = self.probe("noslot")
