@@ -66,7 +66,7 @@ func TestCRIUGroupAdmits_ScalingGroupOfSeveralReplicas(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), groveReplicas: tc.replicas}
-			got, why := a.criuGroupAdmits(context.Background(), tc.pod)
+			got, why := a.criuGroupAdmits(context.Background(), tc.pod, webhook.CRIUGroup{})
 			if got != tc.want || !strings.Contains(why, tc.reason) {
 				t.Errorf("admits = %v (%q), want %v (%q)", got, why, tc.want, tc.reason)
 			}
@@ -104,7 +104,7 @@ func TestCRIUCompanionAdmits_ScalingGroupOfSeveralReplicas(t *testing.T) {
 				}
 			}
 			a := &Agent{kubeClient: kc, log: logrus.New(), groveReplicas: tc.replicas}
-			got, why := a.criuCompanionAdmits(context.Background(), etcd)
+			got, why := a.criuCompanionAdmits(context.Background(), etcd, webhook.CRIUGroup{})
 			if got != tc.want || !strings.Contains(why, tc.reason) {
 				t.Errorf("admits = %v (%q), want %v (%q)", got, why, tc.want, tc.reason)
 			}

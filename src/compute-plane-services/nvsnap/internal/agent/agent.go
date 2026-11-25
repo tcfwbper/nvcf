@@ -335,6 +335,9 @@ type Agent struct {
 	// capturing holds the container IDs with a checkpoint in progress: two
 	// captures of one workload would each suspend it and both fail.
 	capturing sync.Map
+	// leavingIgnored holds the leaving listings admission ignored and
+	// logged (leavingPod), so each is logged once.
+	leavingIgnored sync.Map
 
 	// fabricSessions maps a multi-node gpushare session's pod key to its
 	// directory on this node (see gpushare_fabric.go).

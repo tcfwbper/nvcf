@@ -407,9 +407,9 @@ type Mutator struct {
 	CaptureHoldAdmits func(ctx context.Context, pod *corev1.Pod) (bool, string)
 
 	// CRIUCompanionAdmits reports whether a pod without GPUs may be admitted
-	// as a companion of a group restore: not while a GPU rank of its
-	// namespace already runs. Nil admits.
-	CRIUCompanionAdmits func(ctx context.Context, pod *corev1.Pod) (bool, string)
+	// as a companion of group g's restore: not while a GPU rank of its
+	// namespace already runs (one g lists as leaving does not). Nil admits.
+	CRIUCompanionAdmits func(ctx context.Context, pod *corev1.Pod, g CRIUGroup) (bool, string)
 	// CRIUCompanionSlot claims for pod one of slots, the slots of identical
 	// companions of group g, that no other placeholder of its instance
 	// holds; two pods admitted together never get the same one. Nil
@@ -492,9 +492,9 @@ type Mutator struct {
 
 	// CRIUGroupAdmits reports whether pod's instance of several ranks can
 	// restore as a group, and why not: a group restore needs every rank to
-	// arrive as a placeholder together. Not asked for a single pod. nil
-	// admits.
-	CRIUGroupAdmits func(ctx context.Context, pod *corev1.Pod) (bool, string)
+	// arrive as a placeholder together (a pod g lists as leaving is not
+	// running). Not asked for a single pod. nil admits.
+	CRIUGroupAdmits func(ctx context.Context, pod *corev1.Pod, g CRIUGroup) (bool, string)
 	// DebugEnv sets debug variables on the GPU containers of matching
 	// pods (debug_env.go).
 	DebugEnv []DebugEnv

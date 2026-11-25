@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -83,6 +84,13 @@ type CRIUGroup struct {
 	// for identical companions (replicas of one template), any of which a
 	// pod of that configuration can restore. Empty otherwise.
 	Slots []int
+	// Leaving holds the UIDs of the captured pods the agent deletes so
+	// their replacements restore from the capture, written to the record
+	// at LeavingAt, before the first delete. A replacement may be admitted
+	// before the API server has accepted a sibling's delete; such a
+	// sibling is leaving, not running. Empty for none.
+	Leaving   []string
+	LeavingAt time.Time
 }
 
 // Ranks is the number of GPU ranks of the group.
@@ -164,7 +172,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	var ordinal int
 	if companion {
 		if m.CRIUCompanionAdmits != nil {
-			if ok, why := m.CRIUCompanionAdmits(ctx, pod); !ok {
+			if ok, why := m.CRIUCompanionAdmits(ctx, pod, g); !ok {
 				log.WithField("reason", why).Info("CRIU group restore: the companion cannot restore with its instance; cold start")
 				return nil
 			}
@@ -206,7 +214,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		// Only an instance of several ranks waits for all of them; one
 		// pod restores alone whatever its controller.
 		if ranks > 1 && m.CRIUGroupAdmits != nil {
-			if ok, why := m.CRIUGroupAdmits(ctx, pod); !ok {
+			if ok, why := m.CRIUGroupAdmits(ctx, pod, g); !ok {
 				log.WithField("reason", why).Info("CRIU group restore: the instance cannot restore as a group; cold start")
 				admit(metrics.AdmitCold, "not-restorable-as-group")
 				return nil

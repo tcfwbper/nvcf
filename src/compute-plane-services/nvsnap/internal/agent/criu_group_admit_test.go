@@ -58,7 +58,7 @@ func TestCRIUGroupAdmits(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			kc := fake.NewSimpleClientset(tc.objs...)
 			a := &Agent{kubeClient: kc, log: logrus.New()}
-			got, why := a.criuGroupAdmits(context.Background(), tc.pod)
+			got, why := a.criuGroupAdmits(context.Background(), tc.pod, webhook.CRIUGroup{})
 			if got != tc.want || !strings.Contains(why, tc.reason) {
 				t.Errorf("admits = %v (%q), want %v (%q)", got, why, tc.want, tc.reason)
 			}
@@ -70,7 +70,7 @@ func TestCRIUGroupAdmits(t *testing.T) {
 	lws := rank("engine-0", nil, false)
 	lws.Labels = map[string]string{lwsGroupKeyLabel: "grp"}
 	a := &Agent{kubeClient: fake.NewSimpleClientset(sts(appsv1.OrderedReadyPodManagement)), log: logrus.New()}
-	if ok, why := a.criuGroupAdmits(context.Background(), lws); !ok {
+	if ok, why := a.criuGroupAdmits(context.Background(), lws, webhook.CRIUGroup{}); !ok {
 		t.Errorf("LWS rank refused: %s", why)
 	}
 }

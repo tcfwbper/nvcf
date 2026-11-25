@@ -437,7 +437,7 @@ func (a *Agent) companionCapturable(ctx context.Context, p *corev1.Pod) error {
 // without GPUs as a companion placeholder: no GPU pod of its namespace
 // already runs outside a restore. A companion recreated next to a running
 // instance (its etcd crashed) must start, not wait for a restore.
-func (a *Agent) criuCompanionAdmits(ctx context.Context, pod *corev1.Pod) (bool, string) {
+func (a *Agent) criuCompanionAdmits(ctx context.Context, pod *corev1.Pod, g webhook.CRIUGroup) (bool, string) {
 	pods, err := a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return false, fmt.Sprintf("cannot list the namespace's pods: %v", err)
@@ -445,9 +445,12 @@ func (a *Agent) criuCompanionAdmits(ctx context.Context, pod *corev1.Pod) (bool,
 	if why := a.namespaceSharesCompanions(ctx, pod.Namespace, pods.Items); why != "" {
 		return false, why
 	}
+	now := time.Now()
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.DeletionTimestamp != nil || !hasGPU(p) {
+		// A GPU pod g lists as leaving is a captured rank being deleted
+		// for its replacement to restore (deleteInstance).
+		if p.DeletionTimestamp != nil || !hasGPU(p) || a.leavingPod(g, p, now) {
 			continue
 		}
 		if p.Annotations[webhook.CRIUGroupAnnotation] != "" && p.Annotations[webhook.CRIURestoredAnnotation] == "" {

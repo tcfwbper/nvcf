@@ -144,8 +144,12 @@ func (a *Agent) lookupCRIUGroupFor(ctx context.Context, ns, uri string) (webhook
 //     Ready before it creates rank 1, and rank 0's placeholder is not
 //     Ready until the instance is restored.
 //
+// A pod of the instance that g, the record pod would restore from, lists
+// as leaving (deleteInstance) is not running, whether or not its delete is
+// visible yet: admission does not depend on the order of the deletes.
+//
 // A pod that cannot restore as a group starts cold.
-func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod) (bool, string) {
+func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod, g webhook.CRIUGroup) (bool, string) {
 	if c := metav1.GetControllerOf(pod); c != nil && c.Kind == "StatefulSet" && groveInstance(pod) == "" && pod.Labels[lwsGroupKeyLabel] == "" {
 		sts, err := a.kubeClient.AppsV1().StatefulSets(pod.Namespace).Get(ctx, c.Name, metav1.GetOptions{})
 		if err != nil {
@@ -167,9 +171,10 @@ func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod) (bool, str
 	} else if why != "" {
 		return false, why
 	}
+	now := time.Now()
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Name == pod.Name || p.DeletionTimestamp != nil || !sameInstance(pod, p) {
+		if p.Name == pod.Name || p.DeletionTimestamp != nil || !sameInstance(pod, p) || a.leavingPod(g, p, now) {
 			continue
 		}
 		if p.Annotations[webhook.CRIUGroupAnnotation] != "" && p.Annotations[webhook.CRIURestoredAnnotation] == "" {

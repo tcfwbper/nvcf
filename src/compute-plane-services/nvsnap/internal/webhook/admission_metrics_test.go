@@ -56,7 +56,7 @@ func TestCRIUGroupRestore_CountsAdmissions(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			m, _ := groupMutator(t, tc.g, tc.blocked)
 			if tc.refuse {
-				m.CRIUGroupAdmits = func(context.Context, *corev1.Pod) (bool, string) { return false, "a rank already runs" }
+				m.CRIUGroupAdmits = func(context.Context, *corev1.Pod, CRIUGroup) (bool, string) { return false, "a rank already runs" }
 			}
 			before := admissions(t, tc.decision, tc.reason)
 			m.criuGroupRestorePatches(context.Background(), lwsRank("0"))
