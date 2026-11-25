@@ -64,20 +64,33 @@ var errNoColdStart = errors.New("the placeholder cannot start its workload in pl
 // its controller; a pod nothing recreates would just be gone, so it starts
 // its workload cold in place instead, and is deleted only when it cannot.
 // A pod that is no longer the one whose restore failed (deleted, or
-// replaced under the same name) is left alone.
-func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, uid types.UID, container string, log *logrus.Entry) {
+// replaced under the same name) is left alone. It reports whether the
+// placeholder is settled: gone, replaced, started (or marked to start)
+// cold, or deleted. Not when the pod could not be read or deleted: a
+// restore marker kept for it is then kept (releaseNotServing), so an agent
+// that restarts replaces the pod.
+func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, uid types.UID, container string, log *logrus.Entry) bool {
+	return a.disposeFailedPlaceholderIn(ctx, ns, name, uid, container, false, log)
+}
+
+// disposeFailedPlaceholderIn is disposeFailedPlaceholder; inPlace starts
+// the workload cold in place even in a pod its controller would replace
+// (deleted only when it cannot): for a failure of the node, where a
+// replacement could land again.
+func (a *Agent) disposeFailedPlaceholderIn(ctx context.Context, ns, name string, uid types.UID, container string, inPlace bool, log *logrus.Entry) bool {
 	pod, err := a.kubeClient.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			log.WithError(err).Error("CRIU auto-restore failed; cannot read the pod, so it is left as it is")
+			return false
 		}
-		return
+		return true
 	}
 	if uid != "" && pod.UID != uid {
 		log.Warn("CRIU auto-restore failed in a pod that has since been replaced; the replacement is left alone")
-		return
+		return true
 	}
-	if !podRecreatedOnDelete(pod) {
+	if inPlace || !podRecreatedOnDelete(pod) {
 		// A failure that may pass (the runtime or the API server busy, the
 		// pod's status behind its container) is tried again: deleting the
 		// pod is for good. Only a pod that cannot start in place, or keeps
@@ -99,7 +112,7 @@ func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, u
 		})
 		if cerr == nil && permanent == nil {
 			log.Warn("CRIU auto-restore failed in a pod nothing would recreate; its workload starts cold in place")
-			return
+			return true
 		}
 		if permanent != nil {
 			cerr = permanent
@@ -107,13 +120,15 @@ func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, u
 		if coldStarted(pod) {
 			// Marked: considerColdStart finishes it on the pod's next event.
 			log.WithError(cerr).Error("CRIU auto-restore failed in a pod nothing would recreate; its cold start in place is marked but not done, and is tried again on the pod's next event")
-			return
+			return true
 		}
 		log.WithError(cerr).Error("CRIU auto-restore failed in a pod nothing would recreate, and it cannot start cold in place; deleting it")
 	}
 	if err := a.deletePodRetrying(ctx, ns, name, pod.UID); err != nil {
 		log.WithError(err).Error("CRIU auto-restore: could not delete the failed pod")
+		return false
 	}
+	return true
 }
 
 // coldStartInPlace starts the workload of placeholder pod's container in

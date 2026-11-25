@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -393,5 +394,119 @@ func TestDisposeFailedPlaceholder_RetriesAFailureThatMayPass(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil || !exited(cmd) {
 		t.Errorf("not restarted to start cold: marker %v", err)
+	}
+}
+
+// A restore refused because this node cannot resume the pod's paused NIXL
+// KV connector starts the workload cold in place, even in a pod its
+// controller would replace: a replacement could land on the same node and
+// be refused again.
+func TestCRIUAutoRestore_NIXLNodeRefusalStartsColdInPlace(t *testing.T) {
+	cmd, marker := startPlaceholder(t, "/bin/sh", "-c", "exec sleep 30")
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	kc := fake.NewSimpleClientset(pod)
+	a := &Agent{kubeClient: kc, log: logrus.New(), runtime: pidRuntime{pid: procPID(cmd)}}
+	prev := restoreForRequest
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		return nil, fmt.Errorf("%w: %w: no nixl-resume", errCheckpointUnavailable, errNIXLResumeUnavailable)
+	}
+	t.Cleanup(func() { restoreForRequest = prev })
+	ctx := context.Background()
+
+	a.criuRestorer().restore(ctx, pod.Namespace, pod.Name, pod.UID, "abc__20261008-101010", "inference", "")
+
+	got, err := kc.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("the pod was deleted: %v", err)
+	}
+	if !coldStarted(got) {
+		t.Error("the pod is not marked started cold")
+	}
+	if _, err := os.Stat(marker); err != nil || !exited(cmd) {
+		t.Errorf("not restarted to start cold: marker %v", err)
+	}
+}
+
+// A restored pod whose engine died, and which cannot be read for its
+// disposal, keeps its restore record, marked failed: the next event
+// retries only the disposal, so the failure is counted once, and the
+// record goes once the pod is disposed of.
+func TestFailRestored_KeepsTheRecordUntilTheDisposal(t *testing.T) {
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	pod.Annotations[webhook.CRIURestoredAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	pod.Annotations[webhook.CRIUGroupAnnotation] = "k1"
+	const id = "abc__20261008-101010"
+	record := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName("k1"), Namespace: "nvsnap-system"},
+		Data: map[string]string{"state": "complete", "size": "1", "captures": "1", "checkpoint.0": id}}
+	kc := fake.NewSimpleClientset(pod, record)
+	readFails := true
+	kc.PrependReactor("get", "pods", func(k8stesting.Action) (bool, kruntime.Object, error) {
+		if readFails {
+			return true, nil, errors.New("the API server is unavailable")
+		}
+		return false, nil, nil
+	})
+	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{CheckpointDir: t.TempDir()}}
+	c := a.criuRestorer()
+	ctx := context.Background()
+	if err := c.recordRestore(pod.UID, restoreRecord{Checkpoint: id, Container: "inference", Namespace: pod.Namespace, Pod: pod.Name}); err != nil {
+		t.Fatal(err)
+	}
+	fail := func() {
+		ref, ok, err := c.restoredBy(ctx, pod)
+		if err != nil || !ok {
+			t.Fatalf("restoredBy = %v, %v", ok, err)
+		}
+		c.failRestored(ctx, pod, ref, errors.New("the restored engine is gone"))
+	}
+
+	fail()
+	rec, ok := c.restoredRecordOf(pod.UID)
+	if !ok || !rec.Failed {
+		t.Fatalf("record = %+v, %v; want it kept, marked failed", rec, ok)
+	}
+	readFails = false
+	fail()
+	if _, ok := c.restoredRecordOf(pod.UID); ok {
+		t.Error("the record outlived the disposal")
+	}
+	if _, err := kc.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+		t.Error("the placeholder was not disposed of")
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if got := cm.Data[groupRestoreFailuresKey]; got != "1" {
+		t.Errorf("restore failures = %q, want the failure counted once", got)
+	}
+}
+
+// A lone restore whose failure is recorded and whose placeholder is not
+// yet disposed of is disposed of on the pod's next event, even while the
+// container runtime cannot find the container (the engine probe would see
+// nothing gone).
+func TestConsiderRestored_DisposesAFailedRestoreWithoutTheProbe(t *testing.T) {
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	pod.Annotations[webhook.CRIURestoredAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	pod.Status.Phase = corev1.PodRunning
+	kc := fake.NewSimpleClientset(pod)
+	// pid 0: the runtime has no container to probe.
+	a := &Agent{kubeClient: kc, log: logrus.New(), runtime: pidRuntime{pid: 0}, config: Config{CheckpointDir: t.TempDir()}}
+	c := a.criuRestorer()
+	ctx := context.Background()
+	if err := c.recordRestore(pod.UID, restoreRecord{Checkpoint: "abc__20261008-101010", Container: "inference",
+		Namespace: pod.Namespace, Pod: pod.Name, Failed: true}); err != nil {
+		t.Fatal(err)
+	}
+	c.considerRestored(ctx, pod)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := kc.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		_, recorded := c.restoredRecordOf(pod.UID)
+		if err != nil && !recorded {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pod still there (%v) or record kept (%v)", err == nil, recorded)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

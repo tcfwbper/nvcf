@@ -177,7 +177,7 @@ func TestDumpFailure_GoneBeforeTheDump(t *testing.T) {
 // with the process gone since.
 func TestPIDNSDumpDone_MarkerFails(t *testing.T) {
 	proc := t.TempDir() // pid 9 is gone (the dump stopped it)
-	dumped, err := pidNSDumpDone(filepath.Join(t.TempDir(), "missing", "dir"), pidNSCapture{})
+	dumped, err := pidNSDumpDone(filepath.Join(t.TempDir(), "missing", "dir"), pidNSMarkerFile, pidNSCapture{})
 	if !dumped || err == nil {
 		t.Fatalf("marker write into a missing directory: dumped %v, err %v; want true and an error", dumped, err)
 	}
@@ -185,7 +185,7 @@ func TestPIDNSDumpDone_MarkerFails(t *testing.T) {
 		t.Errorf("a marker failure after CRIU dumped: %v, want it not marked workload_exited", got)
 	}
 	dir := t.TempDir()
-	if dumped, err := pidNSDumpDone(dir, pidNSCapture{Subtree: true}); !dumped || err != nil {
+	if dumped, err := pidNSDumpDone(dir, pidNSMarkerFile, pidNSCapture{Subtree: true}); !dumped || err != nil {
 		t.Fatalf("marker write: dumped %v, err %v", dumped, err)
 	}
 	if c, ok, err := readPIDNSMarker(dir); err != nil || !ok || !c.Subtree {

@@ -254,6 +254,8 @@ func main() {
 		"Seconds of silence every liveness probe is widened to tolerate (its failureThreshold raised), so a capture's freeze does not get the pod restarted; 0 leaves probes as they are.")
 	flag.BoolVar(&config.Webhook.CaptureHold, "webhook-capture-hold", false,
 		"Hold a pod a CRIU capture may freeze out of service (a readiness gate) until the node agent has captured it or decided not to, so that a capture never stops an instance that serves.")
+	flag.BoolVar(&config.Webhook.NIXLPause, "webhook-nixl-pause", false,
+		"Honor the nvsnap.io/nixl-pause pod annotation: a gpushare pod that sets it has its vLLM NIXL KV connector released before a capture and brought back after a restore (docs/design/NIXL-PAUSE.md). Off: the annotation is ignored, and such pods are refused as before.")
 
 	flag.BoolVar(&config.Webhook.GPUShareIBV, "webhook-gpushare-ibv", false,
 		"Point NCCL in every pod under the gpushare library at the bundled verbs library (libnvsnap_ibv.so), so that a workload whose NCCL uses RDMA (IB or RoCE) can be captured; a pod annotated nvsnap.io/gpushare-ibv: \"false\" keeps NCCL's own.")

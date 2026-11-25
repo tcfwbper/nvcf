@@ -332,7 +332,7 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 		if !awaitRestored(ctx, members, ranks, done) {
 			mu.Lock()
 			for _, i := range companions {
-				res.Members[i].Error = "not restored: a GPU rank of the instance did not restore"
+				res.Members[i].Error = companionNotRestored
 				finished[i] = true
 			}
 			mu.Unlock()
@@ -384,6 +384,14 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 			res.DeletedPods = append(res.DeletedPods, name)
 		}
 	}
+	if nixlResumeUnavailable(res.Members) {
+		// A member's node cannot bring its paused NIXL KV connector back:
+		// it refused before CRIU ran, and the others failed with it. The
+		// checkpoint is not at fault. The members' errors are strings, so
+		// the sentinel is wrapped here, for recordFailure to count a node
+		// refusal rather than a stall.
+		return res, fmt.Errorf("%w: %w: %w", errCheckpointUnavailable, errNIXLResumeUnavailable, membersFailed("group restore", res.Session, len(res.Members), failed))
+	}
 	failure := &groupRestoreFailure{err: membersFailed("group restore", res.Session, len(res.Members), failed)}
 	var faults []gpuFault
 	for _, m := range res.Members {
@@ -426,6 +434,39 @@ func (e *groupRestoreFailure) Unwrap() []error {
 		return []error{e.err, e.fault}
 	}
 	return []error{e.err}
+}
+
+// nixlResumeUnavailable reports whether the group's restore did not run,
+// as far as its capture goes: a member refused it before CRIU because its
+// node cannot resume the NIXL KV connector (errNIXLResumeUnavailable, as
+// text from its agent), and every other member that failed was aborted
+// for it (openHeldGPUOnUnlock, or no unlock in time). Another member that
+// failed on its own makes the failure that member's.
+func nixlResumeUnavailable(members []GroupRestoreMemberResult) bool {
+	refused := false
+	for _, m := range members {
+		switch {
+		case m.Error == "":
+		case strings.Contains(m.Error, errNIXLResumeUnavailable.Error()):
+			refused = true
+		case !abortedByAPeer(m.Error):
+			return false
+		}
+	}
+	return refused
+}
+
+// companionNotRestored is the error of a companion (a member without GPU
+// state) not restored because a GPU rank of its instance did not.
+const companionNotRestored = "not restored: a GPU rank of the instance did not restore"
+
+// abortedByAPeer reports whether a member's restore error (text from its
+// agent) says it failed because another member did; a companion that was
+// never launched for a rank's failure counts.
+func abortedByAPeer(e string) bool {
+	return strings.Contains(e, "aborted: another pod of the instance failed to restore") ||
+		strings.Contains(e, "the other pods did not finish restoring") ||
+		e == companionNotRestored
 }
 
 // allRefusedAsRestored reports whether every member refused the restore

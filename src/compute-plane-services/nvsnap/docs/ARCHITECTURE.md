@@ -282,6 +282,8 @@ the capture before anything is frozen, each finding naming the process:
   (checkpoint-restore/criu#267), and their state would be useless after a restore (`rdmaDevices`). A ModelExpress
   worker whose GPU tool has `mx-pause` is not blocked: the capture has ModelExpress release them right before the
   suspend, and fails there, before anything is stopped, if any are still held (design/GPUSHARE.md, "ModelExpress").
+  A disaggregated vLLM pod that opts in to `nvsnap.io/nixl-pause`, on a cluster that enables it, is handled the same
+  way for its NIXL KV connector (design/NIXL-PAUSE.md).
 - MPTCP sockets (`IPPROTO_MPTCP`, 262): CRIU cannot dump them (`inet: Unsupported proto 262`). Go 1.24 and later
   open MPTCP listeners by default, so a recent Go service such as a NATS server holds them without asking.
   Setting `GODEBUG=multipathtcp=0` on that service makes it capturable. Support is tracked in

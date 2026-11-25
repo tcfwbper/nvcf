@@ -74,6 +74,9 @@ type WebhookConfig struct {
 	CaptureHold bool
 	// GPUShareIBV is webhook.Mutator.GPUShareIBVByDefault.
 	GPUShareIBV bool
+	// NIXLPause is webhook.Mutator.NIXLPause: the cluster honors the
+	// nvsnap.io/nixl-pause annotation (gpushare_nixl.go).
+	NIXLPause bool
 
 	// CacheSalt is folded into every cache identity the webhook composes
 	// (rootfsonly.HashInputComposer.Salt). Bump it to start fresh captures
@@ -235,6 +238,9 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		// NCCL in pods under the library takes its verbs from the bundled
 		// library, which releases its RDMA state around a capture.
 		GPUShareIBVByDefault: cfg.GPUShareIBV,
+		// Pods annotated nvsnap.io/nixl-pause get the env nixl-pause
+		// needs, where the cluster enables it.
+		NIXLPause: cfg.NIXLPause,
 		// nvsnap#202: restore-prep strategy. When "init-container",
 		// the webhook emits a nvsnap-mount-prep init container instead
 		// of doing the OverlayFS mount syscalls during admission.

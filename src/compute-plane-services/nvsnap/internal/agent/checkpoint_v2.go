@@ -221,6 +221,9 @@ func runDump(ctx context.Context, deadline time.Duration, env []string, name str
 type dumpV2Opts struct {
 	LeaveRunning  bool
 	FabricSession string
+	// RankNodes: on how many nodes the instance's GPU ranks run
+	// (CheckpointRequest.GPUShareRankNodes).
+	RankNodes int
 	// SyncOpen: the session's driver runs the open phase
 	// (CheckpointRequest.GPUShareSyncOpen).
 	SyncOpen bool
@@ -242,6 +245,11 @@ type dumpV2Opts struct {
 	// snapshot was not taken fails. criuSaves names the mountpoints the
 	// dump saves itself, contents included (nil when it saves none).
 	Snapshot func(criuSaves map[string]bool) error
+	// nixlFence: the capture paused the NIXL KV connector, so its marker
+	// fences the checkpoint from agents that cannot resume it
+	// (pidNSMarkerName). dumpAroundSuspend sets it, through
+	// sourceDump.nixlPaused, before the dump.
+	nixlFence bool
 }
 
 func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerInfo, checkpointDir string, o dumpV2Opts, log *logrus.Entry) (_ *GPUShareInfo, retErr error) {
@@ -320,15 +328,6 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	if gsErr != nil {
 		return nil, gsErr
 	}
-	var gsInfo *GPUShareInfo
-	var gpuMap string
-	var guard suspendGuard
-	// syncOpen: the source's in-place resume holds its GPU launches until
-	// every node has resumed (syncOpenFor).
-	var syncOpen time.Duration
-	// A leave-running capture watches the node's kernel log from before
-	// its suspend to after its resume (kmsg.go, resume_guard.go).
-	var faults *gpuFaultWatch
 	if fabricSession != "" && !gsOn {
 		return nil, errNoGPUProcess(fabricSession)
 	}
@@ -368,12 +367,126 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 		if oerr := ownGPUShareStore(procBase, targetHostPID, root, fabric); oerr != nil {
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
+	}
+	nixlPaused, dump := fencedDumpSteps(o, func(o dumpV2Opts) (ran, done bool, cleanup func(), err error) {
+		ran, done, cleanup, err = a.dumpPrepared(ctx, procBase, targetHostPID, checkpointDir, externals, leaveRunning, gsOn, o, log)
+		dumped = done
+		return ran, done, cleanup, err
+	})
+	return a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
+		on: gsOn, procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
+		toolText: tools.gpuToolText(), bundle: tools.version, fabric: fabric, fabricDir: fabricDir,
+		closeFabric: closeFabric, nixlPaused: nixlPaused, dump: dump,
+	}, log), log)
+}
+
+// fencedDumpSteps returns a capture's sourceDump.nixlPaused and
+// sourceDump.dump for options o and the dump itself (dump, given the
+// options it runs with): once nixlPaused is called (the NIXL KV connector
+// paused), the dump runs with o.nixlFence set, so its marker fences the
+// checkpoint (pidNSMarkerName).
+func fencedDumpSteps(o dumpV2Opts, dump func(dumpV2Opts) (ran, done bool, cleanup func(), err error)) (nixlPaused func(), run func() (ran, done bool, cleanup func(), err error)) {
+	return func() { o.nixlFence = true }, func() (bool, bool, func(), error) { return dump(o) }
+}
+
+// sourceDumpFor completes d, the dump of containerInfo's container, with
+// the capture's choices (o) and the production steps: the nixl-pause
+// opt-in, read from the pod as admitted (nixlOptIn), the session and the
+// nodes its GPU ranks run on, and the suspend, resume, fault watch and
+// harvest. d carries the container's state and its dump.
+func (a *Agent) sourceDumpFor(ctx context.Context, containerInfo *containerd.ContainerInfo, checkpointDir string, o dumpV2Opts, d sourceDump, log *logrus.Entry) sourceDump {
+	d.leaveRunning, d.syncOpenAsked, d.postDumpDir = o.LeaveRunning, o.SyncOpen, o.PostDumpDir
+	d.fabricSession, d.rankNodes, d.checkpointDir = o.FabricSession, o.RankNodes, checkpointDir
+	if d.on {
+		opted, why, pod, err := a.nixlOptInPod(ctx, containerInfo.Labels["io.kubernetes.pod.namespace"],
+			containerInfo.Labels["io.kubernetes.pod.name"], containerInfo.Labels["io.kubernetes.container.name"])
+		d.nixlOptIn, d.nixlRefusal = opted, nixlCaptureRefusal(a.nixlPauseOn(), opted, pod, err)
+		if why != "" && d.nixlRefusal == "" {
+			log.Warn("gpushare: not pausing the NIXL KV connector: " + why)
+		}
+	}
+	d.suspend, d.resume, d.watchFaults = gpushareSuspend, resumeSource, startGPUFaultWatch
+	d.collect = func(gpuMap string) error { return a.gpushareCollectStore(containerInfo, checkpointDir, gpuMap) }
+	return d
+}
+
+// sourceDump is one capture's dump of its source, around the gpushare
+// library's suspend when the workload runs under it (on): dumpV2 gathers
+// it, dumpAroundSuspend runs it. Its function fields are the steps that act
+// on the workload, which tests replace.
+type sourceDump struct {
+	on, leaveRunning bool
+	// nixlOptIn: the pod opted in to nixl-pause (nixlOptIn).
+	nixlOptIn bool
+	// nixlRefusal: why the capture is refused before nixl-pause, from
+	// the pod (nixlCaptureRefusal); "" when it is not.
+	nixlRefusal string
+	// nixlPaused, when set, is called once the NIXL KV connector is
+	// paused, before the suspend and the dump: the dump then fences the
+	// checkpoint (dumpV2Opts.nixlFence).
+	nixlPaused func()
+	// syncOpenAsked: the session's driver runs the open phase
+	// (dumpV2Opts.SyncOpen).
+	syncOpenAsked bool
+	postDumpDir   string
+	procBase      string
+	// hostPID is the container's init; targetHostPID the dump's target.
+	hostPID, targetHostPID int
+	// pids are the GPU processes under the library (namespace pids), lib
+	// the library's path.
+	pids          []int
+	lib           string
+	toolText      string
+	bundle        string
+	fabric        *fabricSessionDir
+	fabricDir     string
+	fabricSession string
+	// rankNodes: on how many nodes the instance's GPU ranks run (0: not
+	// said).
+	rankNodes     int
+	checkpointDir string
+
+	suspend     func(ctx context.Context, hostPID int, pids []int, fabricDir string, log *logrus.Entry) (string, bool, error)
+	resume      func(ctx context.Context, hostPID int, pids []int, fabricDir string, syncOpen time.Duration, log *logrus.Entry) error
+	watchFaults func(log *logrus.Entry) *gpuFaultWatch
+	closeFabric func()
+	collect     func(gpuMap string) error
+	// dump prepares and runs the CRIU dump (dumpPrepared): ran is false
+	// when it failed before CRIU ran, done is CRIU's completion. cleanup,
+	// never nil, runs when dumpAroundSuspend returns, before the source is
+	// settled by the suspend's guard.
+	dump func() (ran, done bool, cleanup func(), err error)
+}
+
+// dumpAroundSuspend runs d. Under the library, in order: ModelExpress and
+// the NIXL KV connector of a pod that opted in release their RDMA state
+// (mx-pause, nixl-pause), the GPU processes are suspended, the tree is
+// dumped, and the source, if it runs on, is resumed: its GPU first, then
+// its NIXL KV connector (checked: a paused engine serves nothing), then
+// ModelExpress. A source whose GPU resume failed is replaced
+// (errSourceLeftSuspended) and gets neither.
+func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus.Entry) (_ *GPUShareInfo, retErr error) {
+	var gsInfo *GPUShareInfo
+	var gpuMap string
+	var guard suspendGuard
+	// syncOpen: the source's in-place resume holds its GPU launches until
+	// every node has resumed (syncOpenFor).
+	var syncOpen time.Duration
+	// A leave-running capture watches the node's kernel log from before
+	// its suspend to after its resume (kmsg.go, resume_guard.go).
+	var faults *gpuFaultWatch
+	dumped := false
+	// nixlResumed: the source's connector came back before the store's
+	// harvest; the deferred rollback has nothing left to do.
+	var nixlPaused []int
+	nixlResumed := false
+	if d.on {
 		// ModelExpress drops its RDMA state, which the dump cannot save,
 		// right before the suspend (gpushare_mx.go). Deferred before the
 		// suspend's guard, its resume runs after the source's: mx refuses
 		// while launches are held.
-		modelExpress := usesModelExpress(procBase, sessionPIDs(procBase, targetHostPID))
-		paused, mxErr := pauseModelExpress(ctx, modelExpress, tools.gpuToolText(), hostPID, gsPIDs, log)
+		modelExpress := usesModelExpress(d.procBase, sessionPIDs(d.procBase, d.targetHostPID))
+		paused, mxErr := pauseModelExpress(ctx, modelExpress, d.toolText, d.hostPID, d.pids, log)
 		if mxErr != nil {
 			return nil, fmt.Errorf("gpushare: %w", mxErr)
 		}
@@ -381,26 +494,44 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			defer func() {
 				// Not on a source whose GPU resume failed: it is stopped,
 				// and is replaced (errSourceLeftSuspended).
-				if sourceRunsOn(dumped, leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
-					resumeModelExpress(ctx, hostPID, "", gsPIDs, log)
+				if sourceRunsOn(dumped, d.leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
+					resumeModelExpress(ctx, d.hostPID, "", d.pids, log)
 				}
 			}()
 		}
-		if leaveRunning {
-			faults = startGPUFaultWatch(log)
+		// The NIXL KV connector of a pod that opted in, likewise. Its
+		// resume is checked: a paused engine takes no requests, so a
+		// source that runs on and does not resume is replaced.
+		var nixlErr error
+		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.nixlOptIn, d.nixlRefusal, d.procBase, d.targetHostPID, d.fabricSession, d.rankNodes, d.toolText, d.hostPID, d.pids, log)
+		if nixlErr != nil {
+			return nil, fmt.Errorf("gpushare: %w", nixlErr)
+		}
+		if len(nixlPaused) > 0 {
+			if d.nixlPaused != nil {
+				d.nixlPaused()
+			}
+			defer func() {
+				if !nixlResumed && sourceRunsOn(dumped, d.leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
+					retErr = resumeNIXLSource(ctx, d.hostPID, d.pids, nixlPaused, retErr, log)
+				}
+			}()
+		}
+		if d.leaveRunning {
+			faults = d.watchFaults(log)
 			defer faults.close()
 		}
-		syncOpen = syncOpenFor(leaveRunning, o.SyncOpen, fabric, tools.gpuToolText(), tools.version, log)
-		gm, suspended, serr := gpushareSuspend(ctx, hostPID, gsPIDs, fabricDir, log)
+		syncOpen = syncOpenFor(d.leaveRunning, d.syncOpenAsked, d.fabric, d.toolText, d.bundle, log)
+		gm, suspended, serr := d.suspend(ctx, d.hostPID, d.pids, d.fabricDir, log)
 		if suspended {
 			// The source is stopped with its GPU memory released from
 			// here, even when the suspend's last step failed. The dump
 			// settles it (settleSource); any return before the dump brings
 			// it back through the guard. Deferred after the fabric
 			// session's close, so it runs while the session is still open.
-			guard.arm(func() error { return resumeSource(ctx, hostPID, gsPIDs, fabricDir, syncOpen, log) }, func() {
-				if o.PostDumpDir != "" {
-					markPostDumpFailed(o.PostDumpDir, log)
+			guard.arm(func() error { return d.resume(ctx, d.hostPID, d.pids, d.fabricDir, syncOpen, log) }, func() {
+				if d.postDumpDir != "" {
+					markPostDumpFailed(d.postDumpDir, log)
 				}
 			})
 			defer func() { retErr = guard.settle(retErr) }()
@@ -409,9 +540,63 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare suspend: %w", serr)
 		}
 		gpuMap = gm
-		gsInfo = &GPUShareInfo{PIDs: gsPIDs, StorePath: GPUShareStoreInContainer, LibPath: gsLib, ModelExpress: paused}
+		gsInfo = &GPUShareInfo{PIDs: d.pids, StorePath: GPUShareStoreInContainer, LibPath: d.lib, ModelExpress: paused, NIXL: len(nixlPaused) > 0, NIXLPIDs: nixlPaused}
 	}
 
+	ran, done, cleanup, err := d.dump()
+	defer cleanup()
+	if !ran {
+		return nil, err
+	}
+	dumped = done
+	guard.handOff()
+	resumeErr := settleSource(d.on, d.leaveRunning, err != nil, func() error {
+		return d.resume(ctx, d.hostPID, d.pids, d.fabricDir, syncOpen, log)
+	})
+	// A workload left running is seen running again before the capture
+	// succeeds: no GPU fault in the kernel log over the capture, and every
+	// GPU process it suspended still there (resume_guard.go).
+	var resumed error
+	if d.leaveRunning && d.on {
+		resumed = faults.check(driverGPUsDir, gpuMap, d.checkpointDir)
+		if resumed == nil && err == nil && resumeErr == nil {
+			resumed = membersAfterResume(d.procBase, d.targetHostPID, d.pids)
+		}
+	}
+	if err != nil || resumeErr != nil || resumed != nil {
+		return nil, errors.Join(resumed, err, resumeErr)
+	}
+	if d.on {
+		// A source left running serves nothing until its connector is back:
+		// resume it before the store's harvest, which may copy across
+		// mounts.
+		if len(nixlPaused) > 0 && d.leaveRunning {
+			nixlResumed = true
+			if rerr := resumeNIXLSource(ctx, d.hostPID, d.pids, nixlPaused, nil, log); rerr != nil {
+				return nil, rerr
+			}
+		}
+		d.closeFabric()
+		if err := d.collect(gpuMap); err != nil {
+			return nil, err
+		}
+	}
+	log.Info("criu-v2: pid-namespace dump complete")
+	return gsInfo, nil
+}
+
+// dumpPrepared prepares the dump's hooks (the snapshot, the post-dump
+// barrier) and dumps the pid namespace of targetHostPID. ran is false when
+// a preparation failed before CRIU ran; done is CRIU's completion. cleanup
+// removes what it prepared.
+func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID int, checkpointDir string, externals []string,
+	leaveRunning, gsOn bool, o dumpV2Opts, log *logrus.Entry) (ran, done bool, cleanup func(), err error) {
+	var cleanups []func()
+	cleanup = func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
 	final := finalOf(leaveRunning)
 	freeze := func() error {
 		if o.Freeze == nil {
@@ -419,22 +604,22 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 		}
 		return o.Freeze(ctx)
 	}
-	hooks := pidnsDumpHooks{Before: freeze, FreezeCgroup: o.HeldCgroup}
+	hooks := dumpHooksFor(o, freeze)
 	// criu runs from the agent here: its action script sees the
 	// agent's paths.
 	var snapDir string
 	if o.Snapshot != nil {
 		snapDir = filepath.Join(checkpointDir, dumpHookDir)
 		if merr := os.MkdirAll(snapDir, 0o755); merr != nil {
-			return nil, fmt.Errorf("dump snapshot hook: %w", merr)
+			return false, false, cleanup, fmt.Errorf("dump snapshot hook: %w", merr)
 		}
-		defer func() { _ = os.RemoveAll(snapDir) }()
+		cleanups = append(cleanups, func() { _ = os.RemoveAll(snapDir) })
 	}
 	if o.PostDumpDir != "" {
 		if merr := os.MkdirAll(o.PostDumpDir, 0o755); merr != nil {
-			return nil, fmt.Errorf("post-dump barrier: %w", merr)
+			return false, false, cleanup, fmt.Errorf("post-dump barrier: %w", merr)
 		}
-		defer func() { _ = os.RemoveAll(o.PostDumpDir) }()
+		cleanups = append(cleanups, func() { _ = os.RemoveAll(o.PostDumpDir) })
 	}
 	if snapDir != "" || o.PostDumpDir != "" {
 		dir := snapDir
@@ -443,7 +628,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 		}
 		script := filepath.Join(dir, "action.sh")
 		if werr := writeDumpActionScript(script, snapDir, o.PostDumpDir); werr != nil {
-			return nil, fmt.Errorf("dump action script: %w", werr)
+			return false, false, cleanup, fmt.Errorf("dump action script: %w", werr)
 		}
 		hooks.ActionScript = script
 	}
@@ -453,21 +638,21 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 		// (pidns_capture.go); the snapshot need not copy them too.
 		entries, external, gpu, merr := pidNSMounts(procBase, targetHostPID)
 		if merr != nil {
-			return nil, fmt.Errorf("dump snapshot: %w", merr)
+			return false, false, cleanup, fmt.Errorf("dump snapshot: %w", merr)
 		}
 		saved := criuSavedTmpfs(entries, external, gpu)
 		snap, oerr := openConfinedDir(snapDir)
 		if oerr != nil {
-			return nil, fmt.Errorf("dump snapshot hook: %w", oerr)
+			return false, false, cleanup, fmt.Errorf("dump snapshot hook: %w", oerr)
 		}
-		defer func() { _ = snap.Close() }()
+		cleanups = append(cleanups, func() { _ = snap.Close() })
 		stopSnapshot = serveSnapshot(ctx, snap, func() error { return o.Snapshot(saved) })
 	}
 	// The container's pid namespace, from its init, dumped from outside
 	// with the agent's own CRIU (pidns_capture.go).
-	// dumped is CRIU's completion, not the error: a marker that cannot be
+	// done is CRIU's completion, not the error: a marker that cannot be
 	// written after CRIU dumped the container is nvsnap's failure.
-	dumped, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
+	done, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)
 	}
@@ -477,31 +662,13 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 		// resume, which needs them, can proceed.
 		markPostDumpFailed(o.PostDumpDir, log)
 	}
-	guard.handOff()
-	resumeErr := settleSource(gsOn, leaveRunning, err != nil, func() error {
-		return resumeSource(ctx, hostPID, gsPIDs, fabricDir, syncOpen, log)
-	})
-	// A workload left running is seen running again before the capture
-	// succeeds: no GPU fault in the kernel log over the capture, and every
-	// GPU process it suspended still there (resume_guard.go).
-	var resumed error
-	if leaveRunning && gsOn {
-		resumed = faults.check(driverGPUsDir, gpuMap, checkpointDir)
-		if resumed == nil && err == nil && resumeErr == nil {
-			resumed = membersAfterResume(procBase, targetHostPID, gsPIDs)
-		}
-	}
-	if err != nil || resumeErr != nil || resumed != nil {
-		return nil, errors.Join(resumed, err, resumeErr)
-	}
-	if gsOn {
-		closeFabric()
-		if err := a.gpushareCollectStore(containerInfo, checkpointDir, gpuMap); err != nil {
-			return nil, err
-		}
-	}
-	log.Info("criu-v2: pid-namespace dump complete")
-	return gsInfo, nil
+	return true, done, cleanup, err
+}
+
+// dumpHooksFor is the pid-namespace dump's hooks for a capture's options
+// o, with freeze run before CRIU starts.
+func dumpHooksFor(o dumpV2Opts, freeze func() error) pidnsDumpHooks {
+	return pidnsDumpHooks{Before: freeze, FreezeCgroup: o.HeldCgroup, NIXLFence: o.nixlFence}
 }
 
 // settleSource brings back a source whose GPU state a dump suspended,

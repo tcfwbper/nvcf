@@ -474,6 +474,10 @@ type Mutator struct {
 	// "false", so that a workload whose NCCL uses RDMA can be captured
 	// without a change to its pods (chart webhook.gpushareIBV).
 	GPUShareIBVByDefault bool
+	// NIXLPause honors NIXLPauseAnnotation (the cluster's switch, chart
+	// webhook.nixlPause.enabled, off by default): an opted-in gpushare pod
+	// gets the env nixl-pause needs. Off, the annotation is ignored.
+	NIXLPause bool
 	// CRIUCapture is set when the cluster captures with CRIU (agent
 	// captureMethod criu): a restore brings the whole process back, so the
 	// cachedir capture and its compile-cache set do not run, and GPU pods

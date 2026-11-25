@@ -334,6 +334,30 @@ func TestGPUShareByDefault_FabricForMultiPodEngines(t *testing.T) {
 	if envOf(single.Spec.Containers[1], gpushareFabricEnv) != nil {
 		t.Error("single-pod engine got fabric sharing")
 	}
+	// A node count of one and a node rank of zero are a single-node
+	// engine's: no fabric, so nixl-pause does not read the pod as
+	// spanning nodes. Either flag still counts with a multi-node value.
+	for _, tc := range []struct {
+		args   string
+		fabric bool
+	}{
+		{"vllm serve m --nnodes=1", false},
+		{"vllm serve m --nnodes 1 --node-rank 0", false},
+		{"vllm serve m --node_rank=0", false},
+		{"vllm serve m --nnodes=2", true},
+		{"vllm serve m --node-rank 1", true},
+		{"vllm serve m --nnodes", true},
+	} {
+		p := gpushareTestPod(false, nil)
+		p.Spec.Containers[1].Args = []string{tc.args}
+		got := applyPatches(t, p, m.gpusharePatches(context.Background(), p))
+		if fabric := envOf(got.Spec.Containers[1], gpushareFabricEnv) != nil; fabric != tc.fabric {
+			t.Errorf("%q: fabric sharing %v, want %v", tc.args, fabric, tc.fabric)
+		}
+		if spans := EngineSpansPods(got) != ""; spans != tc.fabric {
+			t.Errorf("%q: EngineSpansPods says spans %v, the fabric decision %v", tc.args, spans, tc.fabric)
+		}
+	}
 }
 
 // A gpushare checkpoint restores with the checkpoint's chunk store at the

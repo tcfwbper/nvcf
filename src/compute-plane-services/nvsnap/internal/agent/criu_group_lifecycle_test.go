@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -824,5 +825,62 @@ func TestRestoreGroup_PlaceholderWithoutAgent(t *testing.T) {
 				t.Errorf("record = %v; a node an agent is on its way to must be waited for\n%s", cm.Data, logs.String())
 			}
 		})
+	}
+}
+
+// A restore refused before CRIU because its node cannot resume the NIXL KV
+// connector says nothing about the capture, nor about the configuration:
+// it is not a stall (three stalls start the configuration cold for good),
+// nor a restore failure. It is counted on its own, and the pods go so
+// their replacements try again.
+func TestFailGroup_NIXLNodeRefusalIsNotAStall(t *testing.T) {
+	c, kc, leader := groupFixture(t)
+	ctx := context.Background()
+	cause := fmt.Errorf("%w: %w: no nixl-resume", errCheckpointUnavailable, errNIXLResumeUnavailable)
+	// Below the node refusals' own bound (criuGroupMaxNodeRefusals), and
+	// as many as would be stalls that start the configuration cold.
+	n := min(criuGroupMaxStalls, criuGroupMaxNodeRefusals-1)
+	for range n {
+		c.failGroup(ctx, leader, "k1", false, cause, logrus.NewEntry(logrus.New()))
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if cm.Data["stalls"] != "" || cm.Data["state"] != "complete" || cm.Data[groupNodeRefusalsKey] != strconv.Itoa(n) {
+		t.Errorf("record = %v, want complete, no stall, %d node refusals", cm.Data, n)
+	}
+	if _, ok := parseCRIUGroup("k1", cm.Data); !ok {
+		t.Error("the configuration no longer restores")
+	}
+	if c.Blocked(ctx, "c0") {
+		t.Error("a node refusal blocked the checkpoint")
+	}
+}
+
+// A group refused for its node again and again (its replacements land on
+// a node that lags) is bounded: from criuGroupMaxNodeRefusals the
+// configuration starts cold for criuGroupNodeRefusalHold, its checkpoints
+// kept, and then restores again; a restore that runs clears the count.
+func TestFailGroup_NIXLNodeRefusalsAreBounded(t *testing.T) {
+	c, kc, leader := groupFixture(t)
+	ctx := context.Background()
+	cause := fmt.Errorf("%w: %w: no nixl-resume", errCheckpointUnavailable, errNIXLResumeUnavailable)
+	for range criuGroupMaxNodeRefusals {
+		c.failGroup(ctx, leader, "k1", false, cause, logrus.NewEntry(logrus.New()))
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if _, ok := parseCRIUGroup("k1", cm.Data); ok {
+		t.Errorf("record = %v: the configuration still restores after %d node refusals, want it cold", cm.Data, criuGroupMaxNodeRefusals)
+	}
+	if cm.Data["stalls"] != "" || cm.Data["state"] != "complete" || c.Blocked(ctx, "c0") {
+		t.Errorf("record = %v: want complete, no stall, the checkpoint not blocked", cm.Data)
+	}
+	at, err := time.Parse(time.RFC3339, cm.Data[groupLastNodeRefusalAtKey])
+	if err != nil {
+		t.Fatalf("lastNodeRefusalAt: %v", err)
+	}
+	if nodeRefusalsHold(cm.Data, at.Add(criuGroupNodeRefusalHold)) {
+		t.Error("still cold after the hold: the configuration would start cold for good")
+	}
+	if !recordRestored(cm.Data, "c0", "u/c") || cm.Data[groupNodeRefusalsKey] != "" || cm.Data[groupLastNodeRefusalAtKey] != "" {
+		t.Errorf("record = %v: a restore that ran left the node refusals", cm.Data)
 	}
 }

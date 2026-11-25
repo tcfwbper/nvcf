@@ -22,7 +22,9 @@ on both sides). Each fake logs what vLLM would do. The test checks that
     for, not reported as a failure while it still runs;
   * a process without vLLM answers ok, and a bad host never reaches Python;
   * nixl-pause names the process's UCX, and refuses a UCX other than 1.22
-    (restored into another pod, it would keep the old pod's routes).
+    (restored into another pod, it would keep the old pod's routes);
+  * given a GPU process without a control socket (a vLLM API server), the
+    tool prints nothing for it and exits 0.
 
 Run: python3 -I tests/gpushare/host/test_nixl_host.py
 (CUDA_INC names the directory with cuda.h; default /usr/local/cuda/include.)
@@ -492,6 +494,48 @@ class ControlSocketOnCudaUse(unittest.TestCase):
 
     def test_on_with_env(self):
         self.assertTrue(self.has_socket(NVSNAP_GPUSHARE_CTL_ON_CUDA_USE="1"))
+
+
+class GPUProcessWithoutControlSocket(unittest.TestCase):
+    """A vLLM pod's API server maps the library and holds GPU device files
+    but never looks up a CUDA entry point, so it has no control socket.
+    Given both pids, the tool reaches only the engine: it prints the
+    engine's reply, nothing for the API server, and exits 0. The agent
+    passes the tool only the pids with a control socket and reads its
+    replies by pid (gpushare_nixl.go, controlSocketPIDs)."""
+
+    @classmethod
+    def setUpClass(cls):
+        NixlPauseResume.setUpClass.__func__(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_tool_skips_a_pid_without_a_socket(self):
+        engine = NixlPauseResume("test_without_vllm")
+        engine.tmp, engine.env = self.tmp, self.env
+        engine._testMethodName = self._testMethodName
+        self.addCleanup(engine.doCleanups)
+        engine.start()
+        env = dict(self.env, LD_PRELOAD=os.path.join(self.tmp, "libnvsnap_gpushare.so"))
+        env.pop("NVSNAP_GPUSHARE_CTL_ON_CUDA_USE", None)
+        api = subprocess.Popen([sys.executable, "-I", "-c", LOOKUP], env=env, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(api.stdout.close)
+        self.addCleanup(api.wait)
+        self.addCleanup(api.kill)
+        self.assertEqual(api.stdout.readline().strip(), "ready")
+        with open("/proc/net/unix") as f:
+            sockets = f.read()
+        self.assertIn("@nvsnap-gpushare.%d" % engine.pid, sockets)
+        self.assertNotIn("@nvsnap-gpushare.%d" % api.pid, sockets)
+        tool = os.path.join(self.tmp, "nvsnap-gpu-suspend")
+        for verb, args in (("pause", []), ("resume", ["--host", "10.9.8.7"])):
+            p = subprocess.run([tool, *args, "nixl-" + verb, str(engine.pid), str(api.pid)], env=self.env,
+                               capture_output=True, text=True, timeout=150)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("pid=%d nixl %s" % (engine.pid, verb), p.stdout)
+            self.assertNotIn("pid=%d " % api.pid, p.stdout)
 
 
 if __name__ == "__main__":

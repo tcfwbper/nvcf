@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -121,6 +122,17 @@ var recoverRetry = struct{ first, max, total time.Duration }{time.Second, 30 * t
 // that may pass (the API server unreachable for a moment).
 var deleteRetry = struct{ first, max, total time.Duration }{time.Second, 15 * time.Second, 2 * time.Minute}
 
+// deleteRetryMu guards deleteRetry, which tests change while disposals
+// that earlier tests started may still read it.
+var deleteRetryMu sync.RWMutex
+
+// deleteRetryBounds is deleteRetry, read under deleteRetryMu.
+func deleteRetryBounds() struct{ first, max, total time.Duration } {
+	deleteRetryMu.RLock()
+	defer deleteRetryMu.RUnlock()
+	return deleteRetry
+}
+
 // deletePodRetrying deletes pod ns/name, bound to uid when it is known, and
 // retries a failure that may pass. A pod gone, or replaced under the same
 // name, is done.
@@ -129,7 +141,8 @@ func (a *Agent) deletePodRetrying(ctx context.Context, ns, name string, uid type
 	if uid != "" {
 		opts.Preconditions = &metav1.Preconditions{UID: &uid}
 	}
-	return retryUntil(ctx, deleteRetry.first, deleteRetry.max, deleteRetry.total, func() (bool, error) {
+	b := deleteRetryBounds()
+	return retryUntil(ctx, b.first, b.max, b.total, func() (bool, error) {
 		err := a.kubeClient.CoreV1().Pods(ns).Delete(ctx, name, opts)
 		if err == nil || apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 			return true, nil

@@ -103,6 +103,27 @@ const (
 	// groupLastRestoreFailureKey holds the last one's cause.
 	groupRestoreFailuresKey    = "restoreFailures"
 	groupLastRestoreFailureKey = "lastRestoreFailure"
+	// groupNodeRefusalsKey counts the restores refused before CRIU because
+	// their node could not resume a paused NIXL KV connector
+	// (errNIXLResumeUnavailable): node-local, they count neither as a
+	// stall nor as a restore failure. groupLastNodeRefusalKey holds the
+	// last one's cause.
+	groupNodeRefusalsKey    = "nodeRefusals"
+	groupLastNodeRefusalKey = "lastNodeRefusal"
+	// groupLastNodeRefusalAtKey is when the last one was recorded
+	// (RFC 3339).
+	groupLastNodeRefusalAtKey = "lastNodeRefusalAt"
+	// criuGroupMaxNodeRefusals bounds those refusals: from the third, the
+	// configuration starts cold until criuGroupNodeRefusalHold has passed
+	// since the last one, so a group re-landing on a node that keeps
+	// refusing does not keep its instance from serving. Three, as for
+	// stalls: one or two re-landings are a passing API error or a bundle
+	// rollout reaching the node; a third says the node lags.
+	criuGroupMaxNodeRefusals = 3
+	// criuGroupNodeRefusalHold is how long the configuration starts cold
+	// after that, before a restore is tried again: about a node bundle's
+	// rollout (an estimate, not measured). A success clears the count.
+	criuGroupNodeRefusalHold = 30 * time.Minute
 	// groupGPUFaultsKey counts the restores of a capture that failed on a
 	// GPU the probe found faulty (gpu_probe.go): they say nothing about the
 	// capture and do not count toward criuGroupMaxRestoreFailures.
@@ -214,12 +235,27 @@ func recordUnusedVolumes(data map[string]string, members []*corev1.Pod, ranks in
 // beyond.
 const processConfigRecordBudget = 256 << 10
 
+// nodeRefusalsHold reports whether group record d has had
+// criuGroupMaxNodeRefusals node refusals, the last less than
+// criuGroupNodeRefusalHold before now: its configuration starts cold
+// until then. A last refusal of unknown time holds.
+func nodeRefusalsHold(d map[string]string, now time.Time) bool {
+	if n, _ := strconv.Atoi(d[groupNodeRefusalsKey]); n < criuGroupMaxNodeRefusals {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339, d[groupLastNodeRefusalAtKey])
+	return err != nil || now.Sub(at) < criuGroupNodeRefusalHold
+}
+
 // parseCRIUGroup reads a complete group record.
 func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool) {
 	if !recordUsable(data) {
 		return webhook.CRIUGroup{}, false
 	}
 	if n, _ := strconv.Atoi(data["stalls"]); n >= criuGroupMaxStalls {
+		return webhook.CRIUGroup{}, false
+	}
+	if nodeRefusalsHold(data, time.Now()) {
 		return webhook.CRIUGroup{}, false
 	}
 	size, err := strconv.Atoi(data["size"])
@@ -257,7 +293,7 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 // happened (the agent stopped between the record and the delete, or every
 // retry failed) leaves a pod listed; after the window it counts as running
 // again.
-func leavingWindow() time.Duration { return deleteRetry.total + time.Minute }
+func leavingWindow() time.Duration { return deleteRetryBounds().total + time.Minute }
 
 // leavingSkew is how far ahead of this agent's clock a listing may be
 // stamped, by the clock of the agent that wrote it, and still count.
@@ -1970,6 +2006,12 @@ func recordFailure(d map[string]string, id string, restoreFailed bool, cause err
 		d["state"], d["reason"] = criuGroupStateRestoreFailed, truncate(cause.Error(), groupReasonMax)
 		return true
 	}
+	if errors.Is(cause, errNIXLResumeUnavailable) {
+		n, _ := strconv.Atoi(d[groupNodeRefusalsKey])
+		d[groupNodeRefusalsKey], d[groupLastNodeRefusalKey] = strconv.Itoa(n+1), truncate(cause.Error(), groupReasonMax)
+		d[groupLastNodeRefusalAtKey] = time.Now().UTC().Format(time.RFC3339)
+		return true
+	}
 	n, _ := strconv.Atoi(d["stalls"])
 	d["stalls"], d["lastStall"] = strconv.Itoa(n+1), truncate(cause.Error(), groupReasonMax)
 	return true
@@ -1993,7 +2035,7 @@ func recordGPUFault(d map[string]string, id string, f *gpuFaultError) bool {
 
 // recordRestored records a restore of the capture checkpoint id belongs
 // to, which made pods (groupRestoredPodsKey entries, uid/container): its
-// stalls are cleared as its restores run. A capture being verified stays
+// stalls and node refusals are cleared as its restores run. A capture being verified stays
 // so until those pods serve (restored_verify.go).
 func recordRestored(d map[string]string, id, pods string) bool {
 	if !recordOf(d, id) {
@@ -2003,9 +2045,12 @@ func recordRestored(d map[string]string, id, pods string) bool {
 	if d[groupRestoredPodsKey] != pods {
 		d[groupRestoredPodsKey], changed = pods, true
 	}
-	if d["stalls"] != "" || d["replacements"] != "" {
+	if d["stalls"] != "" || d["replacements"] != "" || d[groupNodeRefusalsKey] != "" {
 		delete(d, "stalls")
 		delete(d, "replacements")
+		delete(d, groupNodeRefusalsKey)
+		delete(d, groupLastNodeRefusalKey)
+		delete(d, groupLastNodeRefusalAtKey)
 		changed = true
 	}
 	return changed

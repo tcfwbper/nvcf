@@ -49,6 +49,11 @@ type restoreRecord struct {
 	Namespace  string    `json:"namespace"`
 	Pod        string    `json:"pod"`
 	At         time.Time `json:"at"`
+	// Failed: the restored engine died and the failure was recorded (the
+	// checkpoint blocked, or the failure counted), but the placeholder
+	// could not be disposed of yet (failRestored). A later event, or the
+	// next agent, retries only the disposal.
+	Failed bool `json:"failed,omitempty"`
 }
 
 func (c *criuAutoRestorer) restoreRecordPath(uid types.UID) string {

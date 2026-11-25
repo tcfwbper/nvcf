@@ -768,6 +768,21 @@ webhook:
   # users in the pod (UCX, NIXL) are not covered.
   gpushareIBV: false
 
+  # Capture disaggregated vLLM pods whose KV transfer is NIXL over RDMA
+  # (docs/design/NIXL-PAUSE.md). A pod opts in with the annotation
+  # nvsnap.io/nixl-pause: "true"; this switch decides whether the cluster
+  # honors it. On, an opted-in pod under the gpushare library gets
+  # NVSNAP_NIXL_PAUSE=1 and NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1, and a capture
+  # has its NIXL KV connector release its RDMA state right before the
+  # suspend (refused, with the reason, if any RDMA is still held: NCCL over
+  # RDMA, say); its restore brings the connector back at the new pod's
+  # address, or fails and starts cold. Off (default): the annotation is
+  # ignored, and such pods are refused by the capture preflight as before.
+  # A change applies to pods admitted after it; a checkpoint taken with the
+  # connector paused still brings it back on restore. Rolls the agents.
+  nixlPause:
+    enabled: false
+
   # Operator salt folded into every cache identity the webhook composes.
   # The identity covers image, model, arguments, cache-relevant env, driver
   # and GPU class, but not a change whose effect exists only on a fresh

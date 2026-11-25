@@ -14,6 +14,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,13 +41,16 @@ type restoredRef struct {
 	container  string
 	checkpoint string // a lone restore
 	group      string // a rank of a group restore
+	// failed: a lone restore whose failure is recorded already, its
+	// placeholder not yet disposed of (restoreRecord.Failed).
+	failed bool
 }
 
 // restoredBy returns what the agent restored into pod, or false when it
 // restored nothing there, whatever the pod's annotations say.
 func (c *criuAutoRestorer) restoredBy(ctx context.Context, pod *corev1.Pod) (restoredRef, bool, error) {
 	if rec, ok := c.restoredRecordOf(pod.UID); ok {
-		return restoredRef{container: rec.Container, checkpoint: rec.Checkpoint}, true, nil
+		return restoredRef{container: rec.Container, checkpoint: rec.Checkpoint, failed: rec.Failed}, true, nil
 	}
 	key := pod.Annotations[webhook.CRIUGroupAnnotation]
 	if key == "" || !isGroupPlaceholder(pod) {
@@ -76,6 +80,12 @@ func (c *criuAutoRestorer) considerRestored(ctx context.Context, pod *corev1.Pod
 		}
 		if !ok {
 			return // not a restore of this agent's: nothing to watch
+		}
+		if ref.group == "" && ref.failed {
+			// Its failure is recorded; only its disposal is left, whatever
+			// the engine probe would say now.
+			c.failRestored(ctx, pod, ref, errors.New("the restored engine died; disposing of its placeholder again"))
+			return
 		}
 		reason, sure := c.restoredEngineGone(ctx, pod, ref.container)
 		if reason == "" {
@@ -158,6 +168,11 @@ func onlyPlaceholderLeft(procBase string, hostPID int) bool {
 // restore (ref), not from the pod.
 func (c *criuAutoRestorer) failRestored(ctx context.Context, pod *corev1.Pod, ref restoredRef, cause error) {
 	ctx = context.WithoutCancel(ctx)
+	if ref.group == "" && ref.failed {
+		// Recorded already: only the disposal is left to do.
+		c.disposeFailedRestored(ctx, pod, ref, c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "checkpoint": ref.checkpoint}))
+		return
+	}
 	cause = c.a.onPodGPUFault(ctx, pod, probedContainer(pod), cause, logrus.NewEntry(c.a.log))
 	if ref.group != "" {
 		c.endGroup(ctx, pod, ref.group, true, true, cause, c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "criuGroup": ref.group}))
@@ -181,11 +196,29 @@ func (c *criuAutoRestorer) failRestored(ctx context.Context, pod *corev1.Pod, re
 	} else {
 		log.WithError(cause).Error("CRIU restore failed after it ran; its capture was verified, so it is kept and the replacement restores from it again")
 	}
+	c.disposeFailedRestored(ctx, pod, ref, log)
+}
+
+// disposeFailedRestored disposes of the placeholder of a lone restore
+// whose engine died, its failure recorded, and then drops the restore's
+// record. A placeholder not settled (it could not be read or deleted)
+// keeps its record, marked failed, so a later event or the next agent
+// retries the disposal without recording the failure again.
+func (c *criuAutoRestorer) disposeFailedRestored(ctx context.Context, pod *corev1.Pod, ref restoredRef, log *logrus.Entry) {
 	container := ref.container
 	if container == "" {
 		container = pod.Annotations[webhook.CRIURestoreContainerAnnotation]
 	}
-	c.a.disposeFailedPlaceholder(ctx, pod.Namespace, pod.Name, pod.UID, container, log)
+	if !c.a.disposeFailedPlaceholder(ctx, pod.Namespace, pod.Name, pod.UID, container, log) {
+		if rec, ok := c.restoredRecordOf(pod.UID); ok && !rec.Failed {
+			rec.Failed = true
+			if err := c.recordRestore(pod.UID, rec); err != nil {
+				log.WithError(err).Error("CRIU restore: cannot mark the restore record failed; the failure may be recorded again")
+			}
+		}
+		log.Warn("CRIU restore: the failed placeholder is not disposed of yet; its record is kept, and the disposal is tried again on its next event")
+		return
+	}
 	// Dropped after: an agent that stops before the pod is marked or gone
 	// finds the record, and the dead engine, again.
 	c.dropRestoreRecord(pod.UID)

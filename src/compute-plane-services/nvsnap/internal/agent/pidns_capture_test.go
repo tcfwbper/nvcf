@@ -391,3 +391,54 @@ func TestPIDNSFDs(t *testing.T) {
 		}
 	}
 }
+
+// A checkpoint whose capture paused the NIXL KV connector carries its
+// pid-namespace marker under the NIXL name: an agent from before
+// nixl-resume, which reads only the plain name, finds none and refuses the
+// restore before CRIU (its pod starts cold), while an agent that resumes
+// NIXL reads it. Any other checkpoint keeps the plain name.
+// dumpV2's steps: the dump runs fenced exactly when the pause was
+// reported before it.
+func TestFencedDumpSteps(t *testing.T) {
+	for _, paused := range []bool{false, true} {
+		var got dumpV2Opts
+		nixlPaused, dump := fencedDumpSteps(dumpV2Opts{LeaveRunning: true}, func(o dumpV2Opts) (bool, bool, func(), error) {
+			got = o
+			return true, true, func() {}, nil
+		})
+		if paused {
+			nixlPaused()
+		}
+		_, _, _, _ = dump()
+		if got.nixlFence != paused || !got.LeaveRunning {
+			t.Errorf("paused %v: the dump ran with %+v", paused, got)
+		}
+	}
+}
+
+func TestDumpHooksFor_CarriesTheNIXLFence(t *testing.T) {
+	for _, fence := range []bool{false, true} {
+		if got := dumpHooksFor(dumpV2Opts{nixlFence: fence}, nil).NIXLFence; got != fence {
+			t.Errorf("fence %v: hooks carry %v", fence, got)
+		}
+	}
+}
+
+func TestPIDNSMarker_NIXLFence(t *testing.T) {
+	want := pidNSCapture{Mounts: []string{"/models"}}
+	for _, fence := range []bool{false, true} {
+		dir := t.TempDir()
+		if _, err := pidNSDumpDone(dir, pidNSMarkerName(fence), want); err != nil {
+			t.Fatal(err)
+		}
+		// What an agent from before nixl-resume reads.
+		_, oldErr := os.Stat(filepath.Join(dir, pidNSMarkerFile))
+		if oldVisible := oldErr == nil; oldVisible == fence {
+			t.Errorf("fence %v: plain marker present %v, want %v", fence, oldVisible, !fence)
+		}
+		got, ok, err := readPIDNSMarker(dir)
+		if err != nil || !ok || !reflect.DeepEqual(got, want) {
+			t.Errorf("fence %v: readPIDNSMarker = %+v, %v, %v; want the marker", fence, got, ok, err)
+		}
+	}
+}

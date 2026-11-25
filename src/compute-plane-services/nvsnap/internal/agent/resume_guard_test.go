@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -503,5 +504,59 @@ func TestGroupCheckpoint_LeaveRunningOpensOnceEveryMemberResumed(t *testing.T) {
 	}
 	if sourceMustBeReplacedText(err.Error()) {
 		t.Errorf("an unsynced open deletes the pods: %v", err)
+	}
+}
+
+// The group's driver tells each member on how many nodes the instance's
+// GPU ranks run (a member's nixl-pause is refused across more than one).
+func TestGroupCheckpoint_SendsTheRankNodes(t *testing.T) {
+	old := postResumeWatch
+	postResumeWatch = resumeWatchOpts{ReadyWait: 300 * time.Millisecond, Steady: 100 * time.Millisecond, Poll: 20 * time.Millisecond}
+	defer func() { postResumeWatch = old }()
+	for _, tc := range []struct {
+		name  string
+		nodeB string
+		want  int
+	}{{"one node", "n1", 1}, {"two nodes", "n2", 2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var got []int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/checkpoint" {
+					var req CheckpointRequest
+					_ = json.NewDecoder(r.Body).Decode(&req)
+					mu.Lock()
+					got = append(got, req.GPUShareRankNodes)
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"checkpointId":"c"}`))
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+			u, err := url.Parse(srv.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var objs []runtime.Object
+			for _, n := range []string{"n1", "n2"} {
+				objs = append(objs, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: n},
+					Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: "InternalIP", Address: u.Hostname()}}}})
+			}
+			a, b := memberPod("a", true, 0), memberPod("b", true, 0)
+			a.Spec.NodeName, b.Spec.NodeName = "n1", tc.nodeB
+			cs := fake.NewClientset(append(objs, a, b)...)
+			ag := &Agent{kubeClient: cs, config: Config{ListenAddr: ":" + u.Port()}}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, _ = ag.groupCheckpoint(ctx, GroupCheckpointRequest{LeaveRunning: true,
+				Members: []CheckpointRequest{{Namespace: "ns", PodName: "a"}, {Namespace: "ns", PodName: "b"}}}, guardLog())
+			mu.Lock()
+			defer mu.Unlock()
+			if len(got) != 2 || got[0] != tc.want || got[1] != tc.want {
+				t.Errorf("rank nodes sent = %v, want %d to each member", got, tc.want)
+			}
+		})
 	}
 }

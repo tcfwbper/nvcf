@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -126,6 +127,14 @@ func (a *Agent) podPreflight(pod *corev1.Pod, container string, rank bool) []Pre
 	if rank && !a.gpushareEnabledFor(pod) {
 		add(container, preflightBlock, "gpushare", "a GPU rank without the gpushare library: its GPU memory cannot be saved")
 	}
+	// An opted-in engine (nixlOptIn) that spans nodes is refused
+	// nixl-pause by its spec too: its processes may not show it (a fabric
+	// annotation "false", a renamed process).
+	if opted, _ := nixlOptInFromPod(a.nixlPauseOn(), pod, container); rank && opted {
+		if why := webhook.EngineSpansPods(pod); why != "" {
+			add(container, preflightBlock, "nixl-pause", "the pod opted in to nixl-pause, but its engine spans nodes ("+why+"); nixl-pause is not supported for an engine that spans nodes yet")
+		}
+	}
 	if pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
 		add("", preflightInfo, "shared-pid-namespace", "the containers share one pid namespace: the restore recreates the dumped container's pids beside the sidecars' own")
 	}
@@ -170,21 +179,52 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 	if err != nil {
 		return nil, err
 	}
+	return a.containerFindings(ctx, procBase, int(info.PID), pids, ns, pod, container), nil
+}
+
+// containerFindings is the host checks of the container whose init is
+// initPID and whose processes are pids: what its processes hold, its node
+// bundle, and what the capture releases before its suspend
+// (releaseFindings).
+func (a *Agent) containerFindings(ctx context.Context, procBase string, initPID int, pids []int, ns, pod, container string) []PreflightFinding {
 	fs := processFindings(procBase, pids, pod, container, a.ghostLimit())
 	// The capture runs its tools from the node bundle mounted in the
 	// container, and only there (bundle_tools.go). A companion that started
 	// before its version was mounted here has it mounted into it, when the
 	// version is staged on this node (companion_tools.go).
-	if err := a.ensureCompanionToolsIn(procBase, int(info.PID)); err != nil {
+	if err := a.ensureCompanionToolsIn(procBase, initPID); err != nil {
 		a.log.WithError(err).WithField("pod", ns+"/"+pod).Warn("node bundle: cannot mount the tools into a pod without GPUs yet; its capture waits for them")
 	}
-	tools, err := bundleToolsOf(procBase, int(info.PID), a.bundleVersionsDir())
+	tools, err := bundleToolsOf(procBase, initPID, a.bundleVersionsDir())
 	if err != nil {
-		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
-	} else if gpushareMXSupported(tools.gpuToolText()) {
-		fs = releasedByMXPause(fs, mxPausable(procBase, int(info.PID)))
+		return append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
 	}
-	return fs, nil
+	return a.releaseFindings(ctx, fs, tools.gpuToolText(), procBase, initPID, ns, pod, container)
+}
+
+// releaseFindings applies to a container's findings fs what the capture
+// releases before its suspend, with a GPU tool (its text, toolText) that
+// can: ModelExpress's RDMA (mx-pause) and, for a pod that opted in
+// (nixlOptIn), the NIXL KV connector's (nixl-pause). sessionHostPID is the
+// container's init. A pod that asked for nixl-pause but is not opted in
+// gets a finding saying why, when RDMA blocks its capture.
+func (a *Agent) releaseFindings(ctx context.Context, fs []PreflightFinding, toolText, procBase string, sessionHostPID int, ns, pod, container string) []PreflightFinding {
+	if gpushareMXSupported(toolText) {
+		fs = releasedByMXPause(fs, mxPausable(procBase, sessionHostPID))
+	}
+	if !gpushareNIXLSupported(toolText) {
+		return fs
+	}
+	optedIn, why := a.nixlOptIn(ctx, ns, pod, container)
+	if !optedIn {
+		if why != "" && slices.ContainsFunc(fs, func(f PreflightFinding) bool { return f.Check == "rdma" && f.Severity == preflightBlock }) {
+			fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "nixl-pause",
+				Detail: "the pod's RDMA is not released for the capture: " + why})
+		}
+		return fs
+	}
+	return nixlPauseFindings(fs, nixlGPUProcesses(procBase, sessionHostPID),
+		nixlPauseLimit(procBase, sessionPIDs(procBase, sessionHostPID), "", 1), pod, container)
 }
 
 // processFindings is the host checks of a container's processes pids.
@@ -506,6 +546,18 @@ func (a *Agent) capturePreflight(ctx context.Context, ranks, companions []*corev
 	var fs []PreflightFinding
 	for _, m := range members {
 		fs = append(fs, a.podPreflight(m.pod, m.container, m.rank)...)
+	}
+	// The capture's rule (nixlSpansNodes): an engine whose GPU ranks run on
+	// more than one node is not paused. One rank with its companions is.
+	// Only a rank opted in (nixlOptInFromPod) is paused: a rank annotated
+	// but admitted without the marker is captured as not opted in.
+	if n := rankNodes(ranks); n > 1 && a.nixlPauseOn() {
+		for _, r := range ranks {
+			if opted, _ := nixlOptInFromPod(a.nixlPauseOn(), r, gpuContainer(r)); opted {
+				fs = append(fs, PreflightFinding{Pod: r.Name, Container: gpuContainer(r), Severity: preflightBlock, Check: "nixl-pause",
+					Detail: fmt.Sprintf("the pod opted in to nixl-pause, but its engine spans nodes (its GPU ranks run on %d nodes); nixl-pause is not supported for an engine that spans nodes yet", n)})
+			}
+		}
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup

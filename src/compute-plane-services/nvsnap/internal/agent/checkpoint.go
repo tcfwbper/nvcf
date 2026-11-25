@@ -223,6 +223,11 @@ type CheckpointRequest struct {
 	// by them.
 	GPUShareGroupIndex int `json:"gpushareGroupIndex,omitempty"`
 	GPUShareGroupSize  int `json:"gpushareGroupSize,omitempty"`
+	// GPUShareRankNodes is how many nodes the instance's GPU ranks run on,
+	// as the session's driver saw them (rankNodes): nixl-pause is refused
+	// for an engine on more than one, and when a driver from before the
+	// field leaves it 0 in a session.
+	GPUShareRankNodes int `json:"gpushareRankNodes,omitempty"`
 	// Companion captures a member of a group checkpoint that has no GPUs
 	// (criu_companion.go): it takes the group's place (GroupSession and
 	// the index and size above) without the fabric session.
@@ -777,7 +782,7 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 	// legacy path — the artifact contract is identical.
 	_, criuSpan := tracing.Tracer().Start(ctx, "checkpoint.criu_dump")
 	criuSpan.SetAttributes(attribute.String("nvsnap.criu.mode", "v2-inns"))
-	dopts := dumpV2Opts{LeaveRunning: req.LeaveRunning, FabricSession: req.GPUShareFabricSession,
+	dopts := dumpV2Opts{LeaveRunning: req.LeaveRunning, FabricSession: req.GPUShareFabricSession, RankNodes: req.GPUShareRankNodes,
 		SyncOpen: req.GPUShareSyncOpen, Snapshot: snapshot}
 	var (
 		frozenAt, dumpAt clocks

@@ -111,10 +111,25 @@ func TestDeleteMembers(t *testing.T) {
 // shortRetries makes the agent's retries fast for a test.
 func shortRetries(t *testing.T) {
 	t.Helper()
-	pd, pr := deleteRetry, recoverRetry
-	deleteRetry.first, deleteRetry.max, deleteRetry.total = time.Millisecond, 5*time.Millisecond, 2*time.Second
+	pr := recoverRetry
+	setDeleteRetry(t, time.Millisecond, 5*time.Millisecond, 2*time.Second)
 	recoverRetry.first, recoverRetry.max, recoverRetry.total = time.Millisecond, 5*time.Millisecond, 2*time.Second
-	t.Cleanup(func() { deleteRetry, recoverRetry = pd, pr })
+	t.Cleanup(func() { recoverRetry = pr })
+}
+
+// setDeleteRetry sets deleteRetry for a test, under its lock, and puts it
+// back after.
+func setDeleteRetry(t *testing.T, first, most, total time.Duration) {
+	t.Helper()
+	deleteRetryMu.Lock()
+	prev := deleteRetry
+	deleteRetry.first, deleteRetry.max, deleteRetry.total = first, most, total
+	deleteRetryMu.Unlock()
+	t.Cleanup(func() {
+		deleteRetryMu.Lock()
+		deleteRetry = prev
+		deleteRetryMu.Unlock()
+	})
 }
 
 // A delete that fails for a reason that may pass is retried until it goes

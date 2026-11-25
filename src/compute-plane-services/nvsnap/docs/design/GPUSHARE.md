@@ -217,7 +217,9 @@ node, and their tools must vote on the quiesce and exchange fabric handles
 fabric session:
 
 1. The webhook turns fabric on for a pod whose engine spans pods (a
-   multi-node flag, or a group of more than one pod) and sets
+   multi-node flag, or a group of more than one pod; `--nnodes 1` and
+   `--node-rank 0` alone are a single-node engine's, `multiNodeEngineArg`)
+   and sets
    `NVSNAP_GPUSHARE_FABRIC=1` unless the container's `env` list names it;
    `nvsnap.io/gpushare-fabric` overrides the webhook's choice, and a value in
    the container's `env` list wins over both. The webhook does not read
@@ -689,8 +691,16 @@ rollback.
   A source whose GPU resume failed gets no `mx-resume`: it is replaced.
   `internal/agent/gpushare_mx.go`.
 - vLLM's NIXL KV connector (`NixlConnector` in pull mode, KV in GPU
-  memory) can release its RDMA devices with `nixl-pause`, but the agent does
-  not call it yet, so these workloads are still refused.
+  memory) can release its RDMA devices with `nixl-pause`. The agent calls it
+  for a pod annotated `nvsnap.io/nixl-pause` on a cluster that enables it
+  (`webhook.nixlPause.enabled`), right before the suspend, and calls
+  `nixl-resume` after the restore, as for ModelExpress, except that a paused
+  engine serves nothing: a source that does not resume is replaced, and a
+  restore whose resume fails starts cold. NIXL-PAUSE.md. The capture side is
+  `internal/agent/checkpoint_v2.go` `dumpAroundSuspend` (through
+  `pauseNIXLFor`); the restore side is `internal/agent/gpushare_nixl.go`
+  `nixlResumeFor`, run by `restoreTail.run` in
+  `internal/agent/restore_v2.go`.
   `nvsnap-gpu-suspend nixl-pause`, before the suspend, makes the engine take
   no new requests, waits up to 60 s for KV transfers in flight, stops the
   handshake listener and shuts the connector down on every TP worker, which

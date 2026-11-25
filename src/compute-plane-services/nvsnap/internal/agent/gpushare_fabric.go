@@ -54,6 +54,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -1126,6 +1127,7 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 	bases := make([]string, len(req.Members))
 	uids := make([]types.UID, len(req.Members))
 	baselines := make([]memberBaseline, len(req.Members))
+	var rankPods []*corev1.Pod
 	for i, m := range req.Members {
 		if m.Namespace == "" || m.PodName == "" {
 			return nil, fmt.Errorf("member %d: namespace and podName required", i)
@@ -1136,6 +1138,9 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 		}
 		uids[i] = pod.UID
 		baselines[i] = baselineOf(pod)
+		if !m.Companion {
+			rankPods = append(rankPods, pod)
+		}
 		if pod.Spec.NodeName == "" {
 			return nil, fmt.Errorf("member %s/%s is not scheduled", m.Namespace, m.PodName)
 		}
@@ -1172,6 +1177,7 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 			m.GPUShareSyncOpen = req.LeaveRunning
 		}
 		m.GPUShareGroupIndex, m.GPUShareGroupSize = i, len(req.Members)
+		m.GPUShareRankNodes = rankNodes(rankPods)
 		m.GroupFreeze = true
 		wg.Add(1)
 		go func(i int, m CheckpointRequest) {

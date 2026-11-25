@@ -392,6 +392,118 @@ func TestGPUSharePatches_FabricAnnotation(t *testing.T) {
 	}
 }
 
+// nvsnap.io/nixl-pause adds the opt-in marker and the early control
+// socket to the GPU containers only when the cluster honors it, never to a
+// sidecar, never to a pod that is not under gpushare, and never over a
+// value the pod sets itself.
+func TestGPUSharePatches_NIXLPause(t *testing.T) {
+	both := []string{nixlPauseEnv, gpushareCtlOnCUDAUseEnv}
+	annotated := func(gpushare bool, env []corev1.EnvVar) *corev1.Pod {
+		p := gpushareTestPod(gpushare, env)
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		p.Annotations[NIXLPauseAnnotation] = "true"
+		return p
+	}
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		pod     *corev1.Pod
+		want    map[string]string // env on the GPU container; "" = absent
+	}{
+		{"on, annotated", true, annotated(true, nil), map[string]string{nixlPauseEnv: "1", gpushareCtlOnCUDAUseEnv: "1"}},
+		{"off, annotated", false, annotated(true, nil), map[string]string{nixlPauseEnv: "", gpushareCtlOnCUDAUseEnv: ""}},
+		{"on, not annotated", true, gpushareTestPod(true, nil), map[string]string{nixlPauseEnv: "", gpushareCtlOnCUDAUseEnv: ""}},
+		{"on, annotated, own value kept", true,
+			annotated(true, []corev1.EnvVar{{Name: gpushareCtlOnCUDAUseEnv, Value: "0"}}),
+			map[string]string{nixlPauseEnv: "1", gpushareCtlOnCUDAUseEnv: "0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Mutator{NIXLPause: tc.enabled}
+			got := applyPatches(t, tc.pod, m.gpusharePatches(context.Background(), tc.pod))
+			for _, name := range both {
+				e, want := envOf(got.Spec.Containers[1], name), tc.want[name]
+				switch {
+				case want == "" && e != nil:
+					t.Errorf("%s = %q, want unset", name, e.Value)
+				case want != "" && (e == nil || e.Value != want):
+					t.Errorf("%s = %+v, want %q", name, e, want)
+				}
+				if e := envOf(got.Spec.Containers[0], name); e != nil {
+					t.Errorf("sidecar got %s=%q", name, e.Value)
+				}
+			}
+		})
+	}
+
+	// An opt-in added to a pod that already carries the placement (a
+	// manifest written from an admitted pod) adds only the env.
+	placed := applyPatches(t, gpushareTestPod(true, nil), (&Mutator{}).gpusharePatches(context.Background(), gpushareTestPod(true, nil)))
+	placed.Annotations[NIXLPauseAnnotation] = "true"
+	m0 := &Mutator{NIXLPause: true}
+	got := applyPatches(t, placed, m0.gpusharePatches(context.Background(), placed))
+	if e := envOf(got.Spec.Containers[1], nixlPauseEnv); e == nil || e.Value != "1" {
+		t.Errorf("placed pod: %s = %+v, want 1", nixlPauseEnv, e)
+	}
+	if len(got.Spec.Volumes) != len(placed.Spec.Volumes) || len(got.Spec.Containers[1].VolumeMounts) != len(placed.Spec.Containers[1].VolumeMounts) {
+		t.Errorf("placed pod: the placement was repeated: %d volumes (was %d)", len(got.Spec.Volumes), len(placed.Spec.Volumes))
+	}
+	if ops := m0.gpusharePatches(context.Background(), got); len(ops) != 0 {
+		t.Errorf("placed pod with the env: patched again: %+v", ops)
+	}
+
+	// A pod opted out of gpushare gets nothing, annotation or not.
+	m := &Mutator{NIXLPause: true, GPUShareByDefault: true}
+	pod := annotated(false, nil)
+	pod.Annotations[GPUShareAnnotation] = "false"
+	if ops := m.gpusharePatches(context.Background(), pod); len(ops) != 0 {
+		t.Errorf("a pod opted out of gpushare was patched: %+v", ops)
+	}
+}
+
+// With the cluster's switch off, a pod that sets NVSNAP_NIXL_PAUSE=1
+// itself does not keep it: the GPU container's value is replaced with "0",
+// annotated or not, placed or not, so the agent does not see an opt-in the
+// cluster did not grant. With the switch on and the annotation, the pod's
+// own value stands, as before.
+func TestGPUSharePatches_NIXLPauseEnvWithTheSwitchOff(t *testing.T) {
+	own := func(v string) []corev1.EnvVar { return []corev1.EnvVar{{Name: nixlPauseEnv, Value: v}} }
+	annotate := func(p *corev1.Pod) *corev1.Pod { p.Annotations[NIXLPauseAnnotation] = "true"; return p }
+	for _, tc := range []struct {
+		name string
+		on   bool
+		pod  *corev1.Pod
+		want string
+	}{
+		{"off, not annotated", false, gpushareTestPod(true, own("1")), "0"},
+		{"off, annotated", false, annotate(gpushareTestPod(true, own("1"))), "0"},
+		{"off, from a reference", false, gpushareTestPod(true, []corev1.EnvVar{{Name: nixlPauseEnv,
+			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}}), "0"},
+		{"on, annotated", true, annotate(gpushareTestPod(true, own("1"))), "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Mutator{NIXLPause: tc.on}
+			got := applyPatches(t, tc.pod, m.gpusharePatches(context.Background(), tc.pod))
+			if e := envOf(got.Spec.Containers[1], nixlPauseEnv); e == nil || e.Value != tc.want || e.ValueFrom != nil {
+				t.Errorf("%s = %+v, want %q", nixlPauseEnv, e, tc.want)
+			}
+			// Admitted again (a manifest written from the admitted pod): unchanged.
+			if ops := m.gpusharePatches(context.Background(), got); len(ops) != 0 {
+				t.Errorf("admitted again: patched: %+v", ops)
+			}
+		})
+	}
+
+	// A pod that already carries the placement is corrected too.
+	placed := applyPatches(t, gpushareTestPod(true, nil), (&Mutator{}).gpusharePatches(context.Background(), gpushareTestPod(true, nil)))
+	placed.Spec.Containers[1].Env = append(placed.Spec.Containers[1].Env, own("1")...)
+	got := applyPatches(t, placed, (&Mutator{}).gpusharePatches(context.Background(), placed))
+	if e := envOf(got.Spec.Containers[1], nixlPauseEnv); e == nil || e.Value != "0" {
+		t.Errorf("placed pod: %s = %+v, want 0", nixlPauseEnv, e)
+	}
+}
+
 // A pod annotated nvsnap.io/gpushare-ibv gets NCCL pointed at the bundled
 // verbs library, unless it names one itself; without the annotation, NCCL
 // keeps its own.
@@ -644,5 +756,58 @@ func TestGPUShareMounted(t *testing.T) {
 		if got := GPUShareMounted(tc.pod, tc.container); got != tc.want {
 			t.Errorf("%s: GPUShareMounted = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// EngineSpansPods reads the pod's spec only: the fabric annotation "true",
+// a multi-node engine flag, or a group size above one.
+func TestEngineSpansPods(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		edit  func(*corev1.Pod)
+		spans bool
+	}{
+		{"single pod", func(*corev1.Pod) {}, false},
+		{"fabric annotated true", func(p *corev1.Pod) { p.Annotations[GPUShareFabricAnnotation] = "true" }, true},
+		{"fabric false, group of two", func(p *corev1.Pod) {
+			p.Annotations[GPUShareFabricAnnotation] = "false"
+			p.Annotations[lwsSizeAnnotation] = "2"
+		}, true},
+		{"group of one", func(p *corev1.Pod) { p.Annotations[lwsSizeAnnotation] = "1" }, false},
+		{"headless engine", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--headless"} }, true},
+		{"scaling group", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Env = append(p.Spec.Containers[1].Env, corev1.EnvVar{Name: groveScalingGroupSizeEnv, Value: "2"})
+		}, true},
+		{"scaling group size from a reference", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Env = append(p.Spec.Containers[1].Env, corev1.EnvVar{Name: groveScalingGroupSizeEnv,
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['n']"}}})
+		}, true},
+		{"Ray cluster pod", func(p *corev1.Pod) { p.Labels = map[string]string{"ray.io/node-type": "worker"} }, true},
+		{"--num-nodes 2", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--num-nodes", "2"} }, true},
+		{"--nnodes=1", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--nnodes=1"} }, false},
+		{"--node-rank 1", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--node-rank", "1"} }, true},
+		{"data-parallel leader of an engine spanning nodes", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-size", "4", "--data-parallel-size-local=2", "--data-parallel-address", "10.0.0.1"}
+		}, true},
+		{"data-parallel node after the first", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-start-rank", "2"}
+		}, true},
+		{"single node data-parallel engine", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-size", "2", "--data-parallel-size-local", "2", "--data-parallel-start-rank=0"}
+		}, false},
+		{"single node, data-parallel address", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-address", "127.0.0.1"}
+		}, false},
+		{"single node, master address", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Command = []string{"/bin/sh", "-c", "torchrun --master-addr=127.0.0.1 serve.py"}
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := gpushareTestPod(true, nil)
+			tc.edit(p)
+			if why := EngineSpansPods(p); (why != "") != tc.spans {
+				t.Errorf("EngineSpansPods = %q, want spans %v", why, tc.spans)
+			}
+		})
 	}
 }
