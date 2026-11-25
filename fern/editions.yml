@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Registry for approved docs sources. Legacy release branches remain immutable.
 schema_version: 1
-default: 1.0.4
+default: 1.1.1
 editions:
     - version: 1.0.3
       ref: docs/releases/1.0.3
@@ -34,3 +34,12 @@ editions:
             - 3d89c1b74c595711a143a7a5ee92290fa40e5546
             - 0f68ca343e884104162e2c73bcb096234cbe3000
             - 7040758936fd6510fe6687576027ab2e98a43cfe
+    - version: 1.1.1
+      ref: docs/versions/1.1.1
+      commit: 4871271fccf00fc64f5341c303c4dd0a1058b377
+      mode: umbrella
+      umbrella:
+        product_commit: 2034fdcabd36f9119d4be9ff1ecd4ca9dd3e06b6
+        manifest_sha256: sha256:e05095b005c18c091655a5f37fb796cd20ca420d48f0f7875c1f8f4f318fe9ec
+        revisions:
+            - 4871271fccf00fc64f5341c303c4dd0a1058b377
