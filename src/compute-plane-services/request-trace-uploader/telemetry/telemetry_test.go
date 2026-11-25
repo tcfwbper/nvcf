@@ -30,8 +30,8 @@ func TestCatalogNamesAreUniqueAndLabelsBounded(t *testing.T) {
 			if !allowedLabelKeys[key] {
 				t.Fatalf("instrument %q uses label %q outside the bounded set", instrument.Name, key)
 			}
-			if key == BackendLabel {
-				t.Fatalf("instrument %q lists %q; every series carries it already", instrument.Name, BackendLabel)
+			if key == BackendLabel || key == PodLabel {
+				t.Fatalf("instrument %q lists %q; every series carries it already", instrument.Name, key)
 			}
 		}
 		for key := range instrument.Values {

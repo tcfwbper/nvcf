@@ -106,7 +106,9 @@ func (c Config) Validate() error {
 // blocks on the network: a periodic reader exports in the background, and a
 // failed export costs that export only.
 type Exporter struct {
-	backend    attribute.KeyValue
+	// fixed are the attributes every series carries: the backend, and the
+	// pod when it is known.
+	fixed      []attribute.KeyValue
 	provider   *sdkmetric.MeterProvider
 	counters   map[string]metric.Float64Counter
 	gauges     map[string]metric.Float64Gauge
@@ -143,7 +145,7 @@ func New(ctx context.Context, cfg Config, backend string) (*Exporter, error) {
 	}
 	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.Interval), sdkmetric.WithTimeout(readTimeout))
 	e := &Exporter{
-		backend:    attribute.String(telemetry.BackendLabel, backend),
+		fixed:      append([]attribute.KeyValue{attribute.String(telemetry.BackendLabel, backend)}, podLabel(res)...),
 		provider:   sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithResource(res)),
 		counters:   map[string]metric.Float64Counter{},
 		gauges:     map[string]metric.Float64Gauge{},
@@ -198,6 +200,28 @@ func newResource(ctx context.Context) (*resource.Resource, error) {
 		err = nil
 	}
 	return res, err
+}
+
+// podLabel returns the fixed pod attribute every series carries: the
+// k8s.pod.name resource attribute when set, else HOSTNAME, else none. The
+// collector may not copy resource attributes onto datapoints, so without it
+// series from the pods of one function would collide. A set value that is
+// not a short lowercase token is left out, with a warning, rather than
+// changed or replaced by HOSTNAME.
+func podLabel(res *resource.Resource) []attribute.KeyValue {
+	value, _ := res.Set().Value("k8s.pod.name")
+	pod := value.AsString()
+	if pod == "" {
+		pod = os.Getenv("HOSTNAME")
+	}
+	if pod == "" {
+		return nil
+	}
+	if telemetry.ValidLabelValue(pod) != nil {
+		slog.Warn("the pod name is not a short lowercase token, so metrics carry no pod label")
+		return nil
+	}
+	return []attribute.KeyValue{attribute.String(telemetry.PodLabel, pod)}
 }
 
 // functionIdentity returns the function and function version NVCF sets in a
@@ -315,8 +339,8 @@ func (e *Exporter) admit(kind telemetry.Kind, name string, value float64, labels
 		e.dropped++
 		return attribute.Set{}, false
 	}
-	attrs := make([]attribute.KeyValue, 0, len(labels)+1)
-	attrs = append(attrs, e.backend)
+	attrs := make([]attribute.KeyValue, 0, len(labels)+len(e.fixed))
+	attrs = append(attrs, e.fixed...)
 	for k, v := range labels {
 		attrs = append(attrs, attribute.String(k, v))
 	}

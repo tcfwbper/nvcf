@@ -46,6 +46,10 @@ const (
 	// BackendLabel is added by the recorder to every series. Callers never
 	// set it.
 	BackendLabel = "backend"
+	// PodLabel is added by the OTLP exporter to every series when the pod
+	// the process runs in is known, so series from pods of one function stay
+	// apart. Callers never set it.
+	PodLabel = "pod"
 	// MaxSeriesPerInstrument bounds label cardinality. Observations that would
 	// add a series past it are dropped.
 	MaxSeriesPerInstrument = 64

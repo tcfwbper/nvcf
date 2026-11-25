@@ -169,6 +169,14 @@ Every instrument is
 named `dynamo.request_trace.<name>`, carries a `backend` attribute, and uses
 only bounded attributes; counters start at zero.
 
+Every datapoint also carries a `pod` attribute, so series from the pods of
+one function stay apart even when the collector does not copy resource
+attributes onto datapoints. Its value is the `k8s.pod.name` resource
+attribute when set, else `HOSTNAME`, read once at startup. With neither,
+there is no `pod` attribute. A set value that is not a short lowercase
+token is left out rather than changed, and a warning that does not quote
+it is logged.
+
 Rate, errors and duration of the export path:
 
 - `uploads` (`status`): jobs that finished, `success` or `failure`.
