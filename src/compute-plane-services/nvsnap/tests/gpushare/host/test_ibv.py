@@ -31,11 +31,13 @@ CUDA_INC names the one with cuda.h; default /usr/local/cuda/include.)
 """
 
 import os
+import re
 import selectors
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +46,7 @@ IBV_INC = os.environ.get("IBV_INC", "/usr/include")
 CUDA_INC = os.environ.get("CUDA_INC", "/usr/local/cuda/include")
 sys.path.insert(0, HERE)
 from test_rdma_nccl import STUB as CUDA_STUB  # noqa: E402  (libcuda for gpushare's quiesce)
+from test_sync_open import STUB as TOOL_CUDA_STUB  # noqa: E402  (libcuda for the tool: checkpoint states)
 
 FAKE = r"""
 #include <errno.h>
@@ -499,9 +502,11 @@ int main(int argc, char **argv)
 # verbs; each prints key=value words (see the test_ methods below).
 PROBE = r"""
 #define _GNU_SOURCE
+#include <malloc.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 /* asyncgen: the first poll of an async event wait runs a whole suspend,
  * restore and resume before it returns that the old descriptor is ready. */
 static int probe_poll(struct pollfd *p, nfds_t n, int t);
@@ -599,6 +604,109 @@ static int reconnect(void)
     return r;
 }
 
+/* reconnect() with the exchange changed: without the queue pair row of
+ * qpn ("omit"), without the port rows ("noport"), with another new number
+ * for qpn ("bump"), with a second row for qpn giving alt ("dupq"), with a
+ * second port row giving another LID ("dupp"), with a second row for each
+ * key giving another new key ("dupk"), without the first key row
+ * ("nokey"), without any key row ("nokeys"), without the key count rows
+ * ("nocount"), with every row twice ("twice"),
+ * with no file to read
+ * ("unreadable"), or as it is. */
+static char drop_gid[33];  /* "nogid": leave out every row of this old GID (hex) */
+static char add_row[96];   /* "addrow": one more line */
+/* "bump", "lidbump", "gidbump": the value the exchange had (installed by
+ * the first connect) and the one it gives instead, as a reply prints them. */
+static char edit_was[160], edit_now[160];
+static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
+{
+    char full[] = "/tmp/ibvmapXXXXXX", path[] = "/tmp/ibvmapXXXXXX", w1[160], w2[160];
+    FILE *f = fdopen(mkstemp(full), "w+");
+    FILE *o = fdopen(mkstemp(path), "w");
+    nvsnap_ibv_map(f);
+    rewind(f);
+    int keys = 0, silent = 0;
+    while (fscanf(f, "%159s %159s", w1, w2) == 2) {
+        /* ibvq:<32 hex>:<qpn>[:<sender>] */
+        int row = !strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 && strtoul(w1 + 38, NULL, 10) == qpn;
+        /* "silent": a queue pair row from a second sender on the port, which
+         * sends no key count row. */
+        if (!strncmp(w1, "ibvq:", 5) && !strcmp(how, "silent") && !silent++) fprintf(o, "%.38s99999:7 12345\n", w1);
+        if ((row && !strcmp(how, "omit")) || (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "noport"))) continue;
+        if (!strcmp(how, "nogid") && !strncmp(w1 + 5, drop_gid, 32)) continue;
+        if (!strncmp(w1, "ibvk:", 5) && ((!strcmp(how, "nokey") && !keys++) || !strcmp(how, "nokeys"))) continue;
+        if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "nocount")) continue;
+        if (row && !strcmp(how, "bump")) {
+            snprintf(edit_was, sizeof(edit_was), "%s", w2);
+            snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
+            snprintf(edit_now, sizeof(edit_now), "%s", w2);
+        }
+        if (row && !strcmp(how, "qjunk")) strncat(w2, "junk", sizeof(w2) - strlen(w2) - 1);  /* "1101junk" */
+        /* "lidbump" / "gidbump": the port's new LID, or the last byte of its new GID, changed */
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "lidbump")) {
+            char *lid = strrchr(w2, ':');
+            snprintf(edit_was, sizeof(edit_was), "%s", lid + 1);
+            snprintf(lid + 1, sizeof(w2) - (lid + 1 - w2), "%lu", strtoul(lid + 1, NULL, 10) + 7);
+            snprintf(edit_now, sizeof(edit_now), "%s", lid + 1);
+        }
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "gidbump")) {
+            snprintf(edit_was, sizeof(edit_was), "%.32s", w2);
+            w2[31] = w2[31] == 'f' ? 'e' : 'f';
+            snprintf(edit_now, sizeof(edit_now), "%.32s", w2);
+        }
+        /* "nosep": qpn's row with no blank between its two words: the name
+         * padded to 159 characters with zeros before the sender token, the
+         * value right after it. */
+        if (row && !strcmp(how, "nosep")) {
+            char *tok = strrchr(w1, ':') + 1;
+            fprintf(o, "%.*s%0*lu%s\n", (int)(tok - w1), w1, (int)(159 - (tok - w1)), strtoul(tok, NULL, 10), w2);
+            continue;
+        }
+        /* "wrapcount": 256 more senders on the port, each counting 0xffffff
+         * key rows, and one counting 256: 2^32 more key rows in all, which a
+         * 32-bit total would read as none. "growcount": 40 more senders
+         * counting 0 key rows (a count of 0 is valid), so the count table
+         * outgrows its first allocation, then a malformed row. */
+        if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "wrapcount") && !silent++) {
+            for (int i = 0; i < 256; i++) fprintf(o, "%.38s%d 16777215\n", w1, 1000 + i);
+            fprintf(o, "%.38s1256 256\n", w1);
+        }
+        if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "growcount") && !silent++)
+            for (int i = 0; i < 40; i++) fprintf(o, "%.38s%d 0\n", w1, 2000 + i);
+        fprintf(o, "%s %s\n", w1, w2);
+        if (row && !strcmp(how, "dupq")) fprintf(o, "%s %u\n", w1, alt);
+        if (!strcmp(how, "twice")) fprintf(o, "%s %s\n", w1, w2);
+        /* "portshort": the port row again with a cut value; "maxtoken": a
+         * queue pair row whose sender is the table's empty-slot value. */
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "portshort")) fprintf(o, "%s 0\n", w1);
+        if (!strncmp(w1, "ibvq:", 5) && !strcmp(how, "maxtoken") && !silent++) fprintf(o, "%.38s99999:4294967295 12345\n", w1);
+        if (!strncmp(w1, "ibvk:", 5) && !strcmp(how, "dupk")) fprintf(o, "%s %lu\n", w1, strtoul(w2, NULL, 10) + 1);
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "dupp")) {
+            char *lid = strrchr(w2, ':');
+            fprintf(o, "%s %.*s:%lu\n", w1, (int)(lid - w2), w2, strtoul(lid + 1, NULL, 10) + 7);
+        }
+    }
+    /* "dangling": a last queue pair row with no value; "foreign": a line
+     * of another record type (fabric handles share the file). */
+    if (!strcmp(how, "dangling")) fprintf(o, "ibvq:%s:99999\n", drop_gid[0] ? drop_gid : "00000000000000000000000000000000");
+    if (!strcmp(how, "wsdangling") || !strcmp(how, "growcount"))
+        fprintf(o, "  ibvq:%s:99999\n", "00000000000000000000000000000000");
+    if (!strcmp(how, "foreign")) fprintf(o, "fabric:0123456789abcdef 42\n");
+    if (!strcmp(how, "addrow")) fprintf(o, "%s\n", add_row);
+    fclose(f);
+    fclose(o);
+    unlink(full);
+    if (!strcmp(how, "unreadable")) unlink(path);
+    char dir[] = "/tmp/ibvmapXXXXXX";
+    const char *cpath = path;
+    if (!strcmp(how, "dir")) cpath = mkdtemp(dir);  /* opens, but reading it fails (EISDIR) */
+    int r = nvsnap_ibv_connect(cpath, rep, sizeof(rep));
+    if (!strcmp(how, "dir")) rmdir(dir);
+    unlink(path);
+    if (r) printf("connect: %s\n", rep);
+    return r;
+}
+
 /* suspend, "move to another node", restore, exchange, reconnect, resume */
 static int cycle(void)
 {
@@ -655,6 +763,7 @@ static void *send_t(void *a)
     __atomic_store_n(&sent, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
+static void *leave_later(void *a) { (void)a; usleep(100000); __atomic_sub_fetch(&inflight, 1, __ATOMIC_SEQ_CST); return NULL; }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
 /* maprace: a reader looks up a key that is always there while the table grows. */
@@ -832,6 +941,418 @@ int main(int argc, char **argv)
         a->attr[2].qp_state = IBV_QPS_RTS;
         int r2 = reconnect();
         printf("first=%d retry=%d state_rts=%d\n", r1, r2, fake_qp_state(a->real) == IBV_QPS_RTS);
+        return 0;
+    }
+    if (!strcmp(c, "stalemap")) {
+        /* A second restore whose exchange (argv[2]) lacks what a queue
+         * pair needs: the first restore's numbers must not be used, and no
+         * queue pair may move past INIT. */
+        const char *how = argc > 2 ? argv[2] : "";
+        up(1);
+        if (cycle()) return 1;  /* the first restore, with every row */
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        /* qa's row: qb (connected after qa) lacks its peer, so a check
+         * made queue pair by queue pair would already have moved qa. */
+        /* dupq: a second row for qa's number gives qb's own: qb, qa's
+         * peer, would be connected to itself. */
+        int k = reconnect_edited(how, qa->qp_num, ((struct vqp *)qb)->real->qp_num);
+        struct vqp *a = (struct vqp *)qa, *b = (struct vqp *)qb;
+        int untouched = fake_qp_state(a->real) == IBV_QPS_INIT && fake_qp_state(b->real) == IBV_QPS_INIT;
+        int ok = 0;
+        if (!k) {
+            nvsnap_ibv_open();
+            send_t(NULL);
+            struct ibv_wc wc[8];
+            int n = cq->context->ops.poll_cq(cq, 8, wc);
+            for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        }
+        printf("connect=%d untouched=%d completed=%d\n", k, untouched, ok);
+        return 0;
+    }
+    if (!strcmp(c, "leakretry")) {
+        /* Refused retries whose exchange outgrows a count table before its
+         * malformed row: the memory in use must not grow with them. */
+        up(1);
+        if (cycle()) return 1;
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        int refused = reconnect_edited("growcount", qa->qp_num, 0) != 0;  /* warm up stdio and the tables */
+        size_t before = mallinfo2().uordblks;
+        for (int i = 0; i < 200; i++) refused += reconnect_edited("growcount", qa->qp_num, 0) != 0;
+        size_t after = mallinfo2().uordblks;
+        printf("refused=%d grew=%ld\n", refused, (long)after - (long)before);
+        return 0;
+    }
+    if (!strcmp(c, "remapnorelease")) {
+        /* A remap with nothing re-created (a rollback after a refused
+         * fence: NCCL's calls run) leaves NCCL's mapping alone, whatever
+         * the exchange says. */
+        up(1);
+        if (cycle()) return 1;
+        int k = reconnect_edited("unreadable", 0, 0);
+        send_t(NULL);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("connect=%d completed=%d\n", k, ok);
+        return 0;
+    }
+    if (!strcmp(c, "reopenpending")) {
+        /* qb's RTS fails, so it still needs connecting; a fence then fails
+         * (reopen(), not nvsnap_ibv_open). NCCL's calls must stay held, and
+         * qa keeps its record. A retry and an open then let them go. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        struct vqp *b = (struct vqp *)qb;
+        b->attr[2].qp_state = IBV_QPS_RTR;  /* its RTS fails */
+        int k1 = reconnect();
+        b->attr[2].qp_state = IBV_QPS_RTS;
+        fake_fail_marker(1);
+        int f = nvsnap_ibv_fence(rep, sizeof(rep));
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST), rtr_a = ((struct vqp *)qa)->rtr.set;
+        if (!held) return printf("first=%d fence=%d held_after_fence=0 rtr_a=%d\n", k1, f, rtr_a), 0;
+        int k2 = reconnect();
+        if (k2) return printf("retry failed\n"), 1;
+        nvsnap_ibv_open();
+        int held2 = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        printf("first=%d fence=%d held_after_fence=%d rtr_a=%d retry=%d held_after_open=%d\n", k1, f, held, rtr_a, k2, held2);
+        return 0;
+    }
+    if (!strcmp(c, "refusedretry")) {
+        /* The remap succeeds; a second remap of the same restore is refused
+         * (its exchange lacks the key rows). The tables of the first stay:
+         * after the open, a write with NCCL's keys lands. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        if (reconnect()) return 1;
+        int k2 = reconnect_edited("nokeys", 0, 0);
+        nvsnap_ibv_open();
+        if (__atomic_load_n(&suspended, __ATOMIC_SEQ_CST)) return printf("held after the open\n"), 1;
+        send_t(NULL);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("retry=%d completed=%d\n", k2, ok);
+        return 0;
+    }
+    if (!strcmp(c, "stalertr")) {
+        /* A restore and its remap finish, and NCCL is then let go by a
+         * failed fence (reopen(), not nvsnap_ibv_open). A later remap with
+         * nothing re-created (a rollback) must be the no-op it is after an
+         * open, not refuse because this restore's records are still set. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        int k = reconnect();
+        fake_fail_marker(1);
+        int f = nvsnap_ibv_fence(rep, sizeof(rep));
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int noop = nvsnap_ibv_connect(NULL, rep, sizeof(rep));
+        if (noop) printf("connect: %s\n", rep);
+        printf("connect=%d fence=%d held=%d rtr_a=%d noop=%d\n", k, f, held, ((struct vqp *)qa)->rtr.set, noop);
+        return 0;
+    }
+    if (!strcmp(c, "midconnect")) {
+        /* Captured mid-connect: qd is at RTS targeting qc, and qc is still
+         * at INIT (NCCL had not connected it yet). qc sends no row, so the
+         * remap refuses (a cold start). The alternative, a row for qc,
+         * reconnects qd, but NCCL then connects qc itself with qd's old
+         * numbers (ibv_modify_qp does not translate them): qc's write fails
+         * after a restore that reported success. */
+        up(1);
+        struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+                                       .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+        struct ibv_qp *qc = ibv_create_qp(pd, &ia), *qd = ibv_create_qp(pd, &ia);
+        union ibv_gid gid;
+        ibv_query_gid(ctx, 1, 3, &gid);
+        struct ibv_port_attr pa;
+        (ibv_query_port)(ctx, 1, (struct _compat_ibv_port_attr *)&pa);
+        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+        ibv_modify_qp(qc, &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        ibv_modify_qp(qd, &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = qc->qp_num,
+                                 .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                              .grh = { .dgid = gid, .sgid_index = 3 } } };
+        ibv_modify_qp(qd, &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+        struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+        ibv_modify_qp(qd, &z, IBV_QP_STATE);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        int refused = reconnect();
+        char hex[33];
+        hex16(&gid, hex);
+        snprintf(add_row, sizeof(add_row), "ibvq:%s:%u:%u %u", hex, qc->qp_num, map_token, ((struct vqp *)qc)->real->qp_num);
+        int alt = reconnect_edited("addrow", 0, 0);
+        if (alt) return printf("refused=%d alt_connect=%d\n", refused, alt), 0;  /* held: no verbs call */
+        nvsnap_ibv_open();
+        /* NCCL connects qc as it would have: to qd's number and GID as qd
+         * sent them before the capture. */
+        struct ibv_qp_attr y2 = { .qp_state = IBV_QPS_RTR, .dest_qp_num = qd->qp_num,
+                                  .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                               .grh = { .dgid = gid, .sgid_index = 3 } } };
+        int nc = ibv_modify_qp(qc, &y2, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN) || ibv_modify_qp(qc, &z, IBV_QP_STATE);
+        struct ibv_sge sg = { (uintptr_t)buf, 4, mr->lkey };
+        struct ibv_send_wr w = { .wr_id = 12, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                                 .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)buf + 32, mr->rkey } } }, *b;
+        qc->context->ops.post_send(qc, &w, &b);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 12 && wc[i].status == IBV_WC_SUCCESS;
+        printf("refused=%d alt_connect=%d nccl_connect=%d alt_completed=%d\n", refused, alt, nc, ok);
+        return 0;
+    }
+    if (!strcmp(c, "partialkeys")) {
+        /* Two devices, each with two queue pairs connected to each other.
+         * The first connect brings three to RTS and fails the last one's
+         * RTS. The retry's exchange has only the second device's rows: it
+         * must fail, not finish the last queue pair and let NCCL run with
+         * the first device's peer keys gone. A retry with every row then
+         * finishes it without moving the others again, and a write on the
+         * first device lands. */
+        int nd;
+        struct ibv_device **l = ibv_get_device_list(&nd);
+        static char b2[2][64];
+        struct ibv_context *cx[2];
+        struct ibv_mr *m2[2];
+        struct ibv_qp *q2[2][2];
+        struct ibv_cq *c2[2];
+        for (int d = 0; d < 2; d++) {
+            cx[d] = ibv_open_device(l[d]);
+            if (!d) fakes();
+            struct ibv_pd *p2 = ibv_alloc_pd(cx[d]);
+            m2[d] = ibv_reg_mr(p2, b2[d], sizeof(b2[d]), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+            c2[d] = ibv_create_cq(cx[d], 64, NULL, NULL, 0);
+            struct ibv_qp_init_attr ia = { .send_cq = c2[d], .recv_cq = c2[d], .qp_type = IBV_QPT_RC,
+                                           .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+            q2[d][0] = ibv_create_qp(p2, &ia), q2[d][1] = ibv_create_qp(p2, &ia);
+            union ibv_gid gid;
+            ibv_query_gid(cx[d], 1, 3, &gid);
+            struct ibv_port_attr pa;
+            (ibv_query_port)(cx[d], 1, (struct _compat_ibv_port_attr *)&pa);
+            for (int i = 0; i < 2; i++) {
+                struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+                ibv_modify_qp(q2[d][i], &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+                struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = q2[d][!i]->qp_num,
+                                         .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                                      .grh = { .dgid = gid, .sgid_index = 3 } } };
+                ibv_modify_qp(q2[d][i], &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+                struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+                ibv_modify_qp(q2[d][i], &z, IBV_QP_STATE);
+            }
+            if (!d) hex16(&gid, drop_gid);
+        }
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        struct vqp *last = (struct vqp *)q2[1][1];
+        last->attr[2].qp_state = IBV_QPS_RTR;  /* its RTS fails: RTR from RTR */
+        int first = reconnect();
+        last->attr[2].qp_state = IBV_QPS_RTS;
+        int partial = reconnect_edited("nogid", 0, 0);
+        nvsnap_ibv_open();
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int full = reconnect();
+        /* A failed remap leaves NCCL held: a send would wait for good. */
+        if (full) return printf("first=%d partial=%d held_after_partial=%d full=%d\n", first, partial, held, full), 0;
+        nvsnap_ibv_open();
+        struct ibv_sge sg = { (uintptr_t)b2[0], 4, m2[0]->lkey };
+        struct ibv_send_wr w = { .wr_id = 11, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                                 .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)b2[0] + 32, m2[0]->rkey } } }, *b;
+        q2[0][0]->context->ops.post_send(q2[0][0], &w, &b);
+        struct ibv_wc wc[8];
+        int ok = 0, n = c2[0]->context->ops.poll_cq(c2[0], 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("first=%d partial=%d held_after_partial=%d full=%d completed=%d\n", first, partial, held, full, ok);
+        return 0;
+    }
+    if (!strcmp(c, "rtschanged")) {
+        /* qa reaches RTS and qb's RTS fails; the retry's exchange gives qa's
+         * peer (qb) another number. qa is connected to the old one: the
+         * retry must fail. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        struct vqp *b = (struct vqp *)qb;
+        b->attr[2].qp_state = IBV_QPS_RTR;
+        int r1 = reconnect();
+        b->attr[2].qp_state = IBV_QPS_RTS;
+        int qa_rts = fake_qp_state(((struct vqp *)qa)->real) == IBV_QPS_RTS;
+        int r2 = reconnect_edited(argc > 2 ? argv[2] : "bump", qb->qp_num, 0);
+        printf("first=%d qa_rts=%d retry=%d was=%s now=%s\n", r1, qa_rts, r2, edit_was, edit_now);
+        return 0;
+    }
+    if (!strcmp(c, "lateqp")) {
+        /* qc is created and at INIT when the process is captured; NCCL
+         * connects it itself after the restore. It is then connected: an
+         * open without a release (a refused fence, a catch-up hold) lets
+         * NCCL's calls go, and a remap with nothing re-created is a no-op. */
+        up(1);
+        struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+                                       .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+        struct ibv_qp *qc = ibv_create_qp(pd, &ia);
+        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+        ibv_modify_qp(qc, &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        if (cycle()) return 1;
+        union ibv_gid gid;
+        ibv_query_gid(ctx, 1, 3, &gid);
+        struct ibv_port_attr pa;
+        (ibv_query_port)(ctx, 1, (struct _compat_ibv_port_attr *)&pa);
+        struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = qa->qp_num,
+                                 .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                              .grh = { .dgid = gid, .sgid_index = 3 } } };
+        int r1 = ibv_modify_qp(qc, &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+        struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+        int r2 = ibv_modify_qp(qc, &z, IBV_QP_STATE);
+        if (stop_calls(rep, sizeof(rep))) return printf("stop: %s\n", rep), 1;
+        nvsnap_ibv_open();
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int k = reconnect();
+        printf("nccl_connect=%d held_after_open=%d remap=%d\n", r1 || r2, held, k);
+        return 0;
+    }
+    if (!strcmp(c, "mapnoav")) {
+        /* qc is at INIT (no RTR address) at the capture, and NCCL read GID
+         * index 0, which no connected queue pair uses: the restore does not
+         * pick that entry again, so the exchange must not send it, nor rows
+         * for qc (no peer can be connected to it). qa and qb's rows stay. */
+        up(1);
+        struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+                                       .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+        struct ibv_qp *qc = ibv_create_qp(pd, &ia);
+        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+        ibv_modify_qp(qc, &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        union ibv_gid g0;
+        ibv_query_gid(ctx, 1, 0, &g0);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        char *buf = NULL, w1[160], w2[160], hex0[33];
+        size_t len = 0;
+        FILE *f = open_memstream(&buf, &len);
+        nvsnap_ibv_map(f);
+        fclose(f);
+        hex16(&g0, hex0);
+        int rows_qc = 0, port0 = 0, rows_qa = 0, ports = 0, off = 0, k;
+        while (sscanf(buf + off, "%159s %159s%n", w1, w2, &k) == 2) {
+            off += k;
+            uint32_t q = !strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 ? strtoul(w1 + 38, NULL, 10) : 0;
+            rows_qc += q == qc->qp_num, rows_qa += q == qa->qp_num;
+            if (!strncmp(w1, "ibvp:", 5)) ports++, port0 += !strncmp(w1 + 5, hex0, 32);
+        }
+        free(buf);
+        int k2 = reconnect();
+        printf("rows_qc=%d port0=%d rows_qa=%d ports=%d connect=%d\n", rows_qc, port0, rows_qa, ports, k2);
+        return 0;
+    }
+    if (!strcmp(c, "forktoken")) {
+        /* A process that forks after its first exchange: the child sends
+         * its key counts under a token of its own. */
+        up(1);
+        FILE *f = fopen("/dev/null", "w");
+        nvsnap_ibv_map(f);
+        uint32_t parent = map_token;
+        int pfd[2];
+        if (pipe(pfd)) return printf("pipe: %s\n", strerror(errno)), 1;
+        pid_t ch = fork();
+        if (ch < 0) return printf("fork: %s\n", strerror(errno)), 1;
+        if (!ch) {
+            close(pfd[0]);
+            nvsnap_ibv_map(f);
+            uint32_t t = map_token;
+            _exit(write(pfd[1], &t, sizeof(t)) == (ssize_t)sizeof(t) ? 0 : 1);
+        }
+        close(pfd[1]);  /* the read below sees EOF if the child dies first */
+        uint32_t child = 0;
+        ssize_t got = read(pfd[0], &child, sizeof(child));
+        close(pfd[0]);
+        int st = 0;
+        waitpid(ch, &st, 0);
+        if (got != (ssize_t)sizeof(child) || !WIFEXITED(st) || WEXITSTATUS(st))
+            return printf("child: read %zd byte(s), status %d\n", got, st), 1;
+        nvsnap_ibv_map(f);
+        printf("child_token_set=%d distinct=%d parent_kept=%d\n", child != 0, child != parent, map_token == parent);
+        return 0;
+    }
+    if (!strcmp(c, "connectpass")) {
+        /* A call passes through the gate (enter) while "connect" starts: it
+         * waits for that call instead of refusing. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        __atomic_add_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
+        pthread_create(&t, NULL, leave_later, NULL);
+        int k = reconnect();
+        pthread_join(t, NULL);
+        printf("connect=%d\n", k);
+        return 0;
+    }
+    if (!strcmp(c, "openfresh")) {
+        /* An open after the restore and before "connect": NCCL's calls
+         * stay held while its queue pairs are not connected. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        nvsnap_ibv_open();
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int k = reconnect();
+        if (k) return printf("held_after_open=%d connect=%d\n", held, k), 0;  /* held: no verbs call */
+        nvsnap_ibv_open();
+        int held_after = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        send_t(NULL);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("held_after_open=%d connect=%d held_after_connect_open=%d completed=%d\n", held, k, held_after, ok);
+        return 0;
+    }
+    if (!strcmp(c, "connectunheld")) {
+        /* "connect" with NCCL's calls let go (reopen), or with a call in
+         * progress (inflight): it must refuse and change nothing. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        __atomic_add_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
+        int k_inflight = reconnect();
+        __atomic_sub_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
+        /* NCCL's calls let go some other way than reopen() (which keeps
+         * them held while queue pairs need connecting). */
+        __atomic_store_n(&suspended, 0, __ATOMIC_SEQ_CST);
+        int k_open = reconnect();
+        printf("connect_inflight=%d connect_open=%d untouched=%d\n", k_inflight, k_open,
+               fake_qp_state(((struct vqp *)qa)->real) == IBV_QPS_INIT && fake_qp_state(((struct vqp *)qb)->real) == IBV_QPS_INIT);
+        return 0;
+    }
+    if (!strcmp(c, "remapchanged")) {
+        /* "connect" fails moving qa to RTS after its RTR; the retry's
+         * exchange gives qa's peer another number. qa is connected to the
+         * old one: the retry must fail, not finish qa from RTR. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        struct vqp *a = (struct vqp *)qa;
+        a->attr[2].qp_state = IBV_QPS_RTR;  /* fails: RTR from RTR */
+        int r1 = reconnect();
+        a->attr[2].qp_state = IBV_QPS_RTS;
+        /* "open": something asks NCCL's calls to run between the tries
+         * (a hold, a gate opening); they must stay held. */
+        if (argc > 2 && !strcmp(argv[2], "open")) nvsnap_ibv_open();
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int r2 = reconnect_edited("bump", qb->qp_num, 0);
+        printf("first=%d retry=%d still_rtr=%d held=%d\n", r1, r2, fake_qp_state(a->real) == IBV_QPS_RTR, held);
         return 0;
     }
     if (!strcmp(c, "fenceheld")) {
@@ -1066,12 +1587,17 @@ ROLLBACK = r"""
 #include <infiniband/verbs.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #define S(f) __typeof__(&f) p_##f = dlvsym(h, #f, "IBVERBS_1.1")
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* "clean": every destroy succeeds (no failure set up), and the tool
+     * may freeze this process (ptrace; Yama scope 1 honours this). */
+    int clean = argc > 1 && !strcmp(argv[1], "clean");
+    if (clean) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
     /* A driver lookup starts the library's control thread
      * (NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1): a process with NCCL's verbs and
      * no GPU memory of its own still takes part in the suspend. */
@@ -1113,22 +1639,27 @@ int main(void)
         struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
         p_ibv_modify_qp(pair[i][0], &z, IBV_QP_STATE);
     }
-    fail_destroy(1);  /* a's */
+    if (!clean) fail_destroy(1);  /* a's */
     printf("ready\n");
     fflush(stdout);
     char line[16];
-    if (!fgets(line, sizeof(line), stdin)) return 3;
-    /* NCCL writes from a to b with the numbers and keys it had. */
-    snprintf(src, sizeof(src), "rolled");
-    struct ibv_sge sg = { (uintptr_t)src, 6, ms->lkey };
-    struct ibv_send_wr w = { .wr_id = 5, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
-                             .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)dst, md->rkey } } }, *wb;
-    int posted = !a->context->ops.post_send(a, &w, &wb), ok = 0;
-    struct ibv_wc wc[8];
-    int got = posted ? cq->context->ops.poll_cq(cq, 8, wc) : 0;
-    for (int i = 0; i < got; i++) ok += wc[i].wr_id == 5 && wc[i].status == IBV_WC_SUCCESS;
-    printf("written=%d data=%s\n", ok, strncmp(dst, "rolled", 6) ? "wrong" : "ok");
-    return 0;
+    int rounds = 0;
+    /* Each line: NCCL writes from a to b with the numbers and keys it had. */
+    while (fgets(line, sizeof(line), stdin)) {
+        rounds++;
+        memset(dst, 0, sizeof(dst));
+        snprintf(src, sizeof(src), "rolled");
+        struct ibv_sge sg = { (uintptr_t)src, 6, ms->lkey };
+        struct ibv_send_wr w = { .wr_id = 5, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                                 .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)dst, md->rkey } } }, *wb;
+        int posted = !a->context->ops.post_send(a, &w, &wb), ok = 0;
+        struct ibv_wc wc[8];
+        int got = posted ? cq->context->ops.poll_cq(cq, 8, wc) : 0;
+        for (int i = 0; i < got; i++) ok += wc[i].wr_id == 5 && wc[i].status == IBV_WC_SUCCESS;
+        printf("written=%d data=%s\n", ok, strncmp(dst, "rolled", 6) ? "wrong" : "ok");
+        fflush(stdout);
+    }
+    return rounds ? 0 : 3;
 }
 """
 
@@ -1169,6 +1700,12 @@ class Ibv(unittest.TestCase):
             f.write(ROLLBACK)
         subprocess.run(["gcc", "-shared", "-fPIC", "-I", CUDA_INC, "-o", os.path.join(t, "libcuda.so.1"),
                         os.path.join(t, "cuda.c")], check=True)
+        cls.tool_lib = os.path.join(t, "toolcuda")
+        os.mkdir(cls.tool_lib)
+        with open(os.path.join(t, "toolcuda.c"), "w") as f:
+            f.write(TOOL_CUDA_STUB)
+        subprocess.run(["gcc", "-shared", "-fPIC", "-o", os.path.join(cls.tool_lib, "libcuda.so.1"),
+                        os.path.join(t, "toolcuda.c")], check=True)
         subprocess.run(["gcc", "-O2", "-Wall", "-Werror", *inc, "-o", os.path.join(t, "rollback"),
                         os.path.join(t, "rollback.c"), "-ldl"],
                        check=True)
@@ -1212,12 +1749,42 @@ class Ibv(unittest.TestCase):
         moved = [x for x in rounds if "lines" in x]
         self.assertGreaterEqual(int(moved[0]["lines"]), 10, p.stdout)  # per device: a port, 2 keys, 2 queue pairs
 
-    def probe(self, case, **env):
+    def probe(self, case, how=None, **env):
         e = dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake)
         e.update(env)
-        p = subprocess.run([os.path.join(self.tmp, "probe"), case], capture_output=True, text=True, timeout=60, env=e)
+        p = subprocess.run([os.path.join(self.tmp, "probe"), case] + ([how] if how else []), capture_output=True,
+                           text=True, timeout=60, env=e)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.probe_stdout = p.stdout  # with the "connect: <reply>" lines
         return dict(kv.split("=", 1) for line in p.stdout.splitlines() for kv in line.split() if "=" in kv)
+
+    # The connect replies the probe prints ("connect: <reply>"), exactly.
+    GID = r"[0-9a-f]{32}"
+    REFUSAL = {
+        "dangling": r"err the verbs exchange has a malformed row: ibvq:[0-9a-f]{32}:99999",
+        "wsdangling": r"err the verbs exchange has a malformed row: ibvq:0{32}:99999",
+        "portshort": r"err the verbs exchange has a malformed row: ibvp:%s:\d+ 0" % GID,
+        "qjunk": r"err the verbs exchange has a malformed row: ibvq:%s:\d+:\d+ \d+junk" % GID,
+        "maxtoken": r"err the verbs exchange has a malformed row: ibvq:%s:99999:4294967295 12345" % GID,
+        "nosep": r"err the verbs exchange has a malformed row: ibvq:%s:\d+:0+" % GID,
+        "wrapcount": r"err the verbs exchange has \d+ of the 4294967\d{3} key rows for the peer of queue pair \d+",
+        "dir": r"err cannot read the verbs exchange /tmp/ibvmap\w{6}: Is a directory",
+        "omit": r"err the verbs exchange has no queue pair row for the peer of queue pair \d+ \(peer qpn \d+\)",
+        "noport": r"err the verbs exchange has no port row for the peer of queue pair \d+ \(peer qpn \d+\)",
+        "unreadable": r"err cannot read the verbs exchange /tmp/ibvmap\w{6} \(No such file or directory\): "
+                      r"no new number for the peer of queue pair \d+",
+        "dupq": r"err the verbs exchange has two different rows for ibvq:%s:\d+:\d+ \(\d+ and \d+\)" % GID,
+        "silent": r"err the verbs exchange has queue pair rows from a sender \(7\) with no key count row, for the peer "
+                  r"of queue pair \d+",
+        "dupp": r"err the verbs exchange has two different rows for ibvp:%s:\d+" % GID,
+        "dupk": r"err the verbs exchange has two different rows for ibvk:%s:\d+ \(\d+ and \d+\)" % GID,
+        "nokey": r"err the verbs exchange has 0 of the 1 key rows for the peer of queue pair \d+",
+        "nokeys": r"err the verbs exchange has 0 of the 1 key rows for the peer of queue pair \d+",
+        "nocount": r"err the verbs exchange has no key count row for the peer of queue pair \d+",
+    }
+
+    def assertRefused(self, how, out):
+        self.assertRegex(self.probe_stdout, r"(?m)^connect: %s$" % self.REFUSAL[how])
 
     def test_lookup_sees_one_table_while_it_grows(self):
         out = self.probe("maprace")
@@ -1277,6 +1844,155 @@ class Ibv(unittest.TestCase):
         out = self.probe("remapretry")
         self.assertNotEqual(out["first"], "0", out)
         self.assertEqual((out["retry"], out["state_rts"]), ("0", "1"), out)
+
+    def test_second_restore_never_uses_the_first_restores_numbers(self):
+        # The second restore's exchange lacks qa's peer: its queue pair
+        # row, its port row, or the whole file. The connect must fail
+        # before any queue pair leaves INIT.
+        for how in ("omit", "noport", "unreadable", "dangling", "dir", "wsdangling", "portshort", "qjunk", "maxtoken",
+                    "nosep"):
+            with self.subTest(how=how):
+                out = self.probe("stalemap", how=how)
+                self.assertNotEqual(out["connect"], "0",
+                                    "connected with the previous restore's mapping (%s): %s" % (how, out))
+                self.assertEqual(out["untouched"], "1", out)
+                self.assertRefused(how, out)
+
+    def test_missing_key_rows_fail_the_connect(self):
+        # A peer's key rows, or their count, missing from the exchange: a
+        # key NCCL sends would otherwise go out untranslated.
+        for how in ("nokey", "nokeys", "nocount", "silent", "wrapcount"):
+            with self.subTest(how=how):
+                out = self.probe("stalemap", how=how)
+                self.assertNotEqual(out["connect"], "0", "connected without the peer's keys (%s): %s" % (how, out))
+                self.assertEqual(out["untouched"], "1", out)
+                self.assertRefused(how, out)
+
+    def test_refused_retries_free_the_tables_they_outgrow(self):
+        # 40 count rows outgrow the first count table, then a malformed row
+        # refuses the exchange: 200 such retries must not grow the heap
+        # (each kept a superseded table before).
+        out = self.probe("leakretry")
+        self.assertEqual(out["refused"], "201", self.probe_stdout)
+        self.assertLess(int(out["grew"]), 16384, "the heap grew %s bytes over 200 refused retries" % out["grew"])
+
+    def test_conflicting_duplicate_rows_fail_the_connect(self):
+        # Two rows for one queue pair (or one port) with different values:
+        # the last one must not win.
+        for how in ("dupq", "dupp", "dupk"):
+            with self.subTest(how=how):
+                out = self.probe("stalemap", how=how)
+                self.assertNotEqual(out["connect"], "0", "a conflicting duplicate row was used (%s): %s" % (how, out))
+                self.assertEqual(out["untouched"], "1", out)
+                self.assertRefused(how, out)
+
+    def test_second_restore_with_a_complete_exchange_connects(self):
+        # As it is, and with every row twice (two processes on one port
+        # both send its rows): identical duplicates are fine.
+        for how in ("complete", "twice", "foreign"):
+            with self.subTest(how=how):
+                out = self.probe("stalemap", how=how)
+                self.assertEqual((out["connect"], out["untouched"], out["completed"]), ("0", "0", "1"), out)
+
+    def test_remap_without_a_restore_keeps_the_mapping(self):
+        out = self.probe("remapnorelease")
+        self.assertEqual((out["connect"], out["completed"]), ("0", "1"), out)
+
+    def test_retried_connect_with_another_mapping_fails(self):
+        # Also when something asked NCCL's calls to run between the tries.
+        for how in (None, "open"):
+            with self.subTest(how=how):
+                out = self.probe("remapchanged", how=how)
+                self.assertNotEqual(out["first"], "0", out)
+                self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
+                self.assertEqual((out["still_rtr"], out["held"]), ("1", "1"), out)
+
+    def test_failed_fence_keeps_nccl_held_while_a_queue_pair_needs_connecting(self):
+        out = self.probe("reopenpending")
+        self.assertNotEqual(out["first"], "0", out)
+        self.assertNotEqual(out["fence"], "0", out)
+        self.assertEqual((out["held_after_fence"], out["rtr_a"]), ("1", "1"), "NCCL let go with qb unconnected: %s" % out)
+        self.assertEqual((out["retry"], out["held_after_open"]), ("0", "0"), out)
+
+    def test_refused_retry_keeps_the_last_valid_tables(self):
+        out = self.probe("refusedretry")
+        self.assertNotEqual(out["retry"], "0", out)
+        self.assertEqual(out["completed"], "1", "a refused remap left the peer tables cleared: %s" % out)
+
+    def test_remap_after_nccl_was_let_go_without_an_open_is_a_noop(self):
+        out = self.probe("stalertr")
+        self.assertEqual((out["connect"], out["held"]), ("0", "0"), out)
+        self.assertNotEqual(out["fence"], "0", out)
+        self.assertEqual((out["rtr_a"], out["noop"]), ("0", "0"), "a stale record made a no-op remap refuse: %s" % out)
+
+    def test_remap_refuses_a_queue_pair_captured_mid_connect(self):
+        out = self.probe("midconnect")
+        self.assertNotEqual(out["refused"], "0", out)
+        self.assertRegex(self.probe_stdout, r"(?m)^connect: err the verbs exchange has no queue pair row for the peer "
+                                            r"of queue pair \d+ \(peer qpn \d+\)$")
+        # Why refuse: with a row for the INIT side, the remap succeeds, and
+        # the connection NCCL then makes itself does not work.
+        self.assertEqual(out["alt_connect"], "0", self.probe_stdout)
+        self.assertEqual((out["nccl_connect"], out["alt_completed"]), ("0", "0"), out)
+
+    def test_retry_checks_queue_pairs_already_at_rts(self):
+        out = self.probe("partialkeys")
+        self.assertNotEqual(out["first"], "0", out)
+        self.assertNotEqual(out["partial"], "0", "a retry without the first device's rows finished: %s" % out)
+        self.assertEqual(out["held_after_partial"], "1", out)
+        self.assertEqual(out["full"], "0", self.probe_stdout)
+        self.assertEqual(out["completed"], "1", out)
+
+    def test_retry_with_another_peer_for_a_queue_pair_at_rts_fails(self):
+        # The peer's queue pair number, LID or GID changes; the reply names
+        # the field and both values.
+        field = {"bump": r"qpn \d+", "lidbump": r"LID \d+", "gidbump": r"GID [0-9a-f]{32}"}
+        for how in ("bump", "lidbump", "gidbump"):
+            with self.subTest(how=how):
+                out = self.probe("rtschanged", how=how)
+                self.assertEqual((out["qa_rts"]), "1", out)
+                self.assertNotEqual(out["first"], "0", out)
+                self.assertNotEqual(out["retry"], "0", "qa at RTS kept its old peer while the retry gave another: %s" % out)
+                # The values the exchange had and gives instead, not only
+                # their shape: the installed one first.
+                self.assertNotEqual(out["was"], out["now"], out)
+                self.assertRegex(out["now"], {"bump": r"^\d+$", "lidbump": r"^\d+$", "gidbump": r"^[0-9a-f]{32}$"}[how], out)
+                self.assertRegex(self.probe_stdout, r"(?m)^connect: err queue pair \d+ was connected to peer %s %s in this "
+                                                    r"restore, and this exchange gives %s$"
+                                 % (field[how].split(" ", 1)[0], re.escape(out["was"]), re.escape(out["now"])))
+
+    def test_queue_pair_nccl_connects_after_the_restore_is_not_pending(self):
+        out = self.probe("lateqp")
+        self.assertEqual(out["nccl_connect"], "0", out)
+        self.assertEqual(out["held_after_open"], "0", "NCCL's calls stayed held for a queue pair NCCL connected: %s" % out)
+        self.assertEqual(out["remap"], "0", out)
+
+    def test_exchange_sends_only_connected_queue_pairs_and_their_ports(self):
+        out = self.probe("mapnoav")
+        self.assertEqual((out["rows_qc"], out["port0"]), ("0", "0"),
+                         "rows for a queue pair without an RTR address, or a GID the restore did not pick: %s" % out)
+        self.assertEqual((out["rows_qa"], out["ports"], out["connect"]), ("1", "1", "0"), out)
+
+    def test_forked_process_sends_its_own_key_count_token(self):
+        out = self.probe("forktoken")
+        self.assertEqual((out["child_token_set"], out["distinct"], out["parent_kept"]), ("1", "1", "1"), out)
+
+    def test_connect_waits_for_a_call_passing_the_gate(self):
+        self.assertEqual(self.probe("connectpass")["connect"], "0", self.probe_stdout)
+
+    def test_open_before_connect_keeps_nccl_held(self):
+        out = self.probe("openfresh")
+        self.assertEqual(out["held_after_open"], "1", "NCCL's calls ran on queue pairs not yet connected: %s" % out)
+        self.assertEqual(out["connect"], "0", self.probe_stdout)
+        self.assertEqual((out["held_after_connect_open"], out["completed"]), ("0", "1"), out)
+
+    def test_connect_refuses_while_nccl_can_run(self):
+        out = self.probe("connectunheld")
+        self.assertNotEqual(out["connect_inflight"], "0", out)
+        self.assertNotEqual(out["connect_open"], "0", out)
+        self.assertEqual(out["untouched"], "1", out)
+        held = r"(?m)^connect: err NCCL's verbs calls are not held \(or one is in progress\): cannot reconnect 2 queue pair\(s\)$"
+        self.assertEqual(len(re.findall(held, self.probe_stdout)), 2, self.probe_stdout)
 
     def test_sends_after_the_fence_wait_for_the_restore(self):
         out = self.probe("fenceheld")
@@ -1344,6 +2060,84 @@ class Ibv(unittest.TestCase):
         res, _ = w.communicate("go\n", timeout=60)
         self.assertIn("written=1 data=ok", res,
                       "after the tool's rollback, the queue pair whose destroy failed does not reach its peer:\n" + out + res)
+
+    def test_tool_remap_with_an_incomplete_exchange_fails(self):
+        # The GPU tool's own path (resume --fabric-map: fabmap, then
+        # gpushare "remap <file>"), this test as the driver that merges the
+        # nodes' lists. The first restore gets the whole list; the second
+        # one's lacks a queue pair row and must fail, not connect with the
+        # first restore's numbers.
+        env = dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake, NVSNAP_GPUSHARE_CTL_ON_CUDA_USE="1",
+                   LD_PRELOAD=os.path.join(self.tmp, "libnvsnap_gpushare.so"))
+        w = subprocess.Popen([os.path.join(self.tmp, "rollback"), "clean"], env=env, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, text=True)
+        self.addCleanup(w.stdout.close)
+        self.addCleanup(w.stdin.close)
+        self.addCleanup(w.wait)
+        self.addCleanup(w.kill)
+        sel = selectors.DefaultSelector()
+        sel.register(w.stdout, selectors.EVENT_READ)
+        self.addCleanup(sel.close)
+
+        def worker_line():
+            return w.stdout.readline().strip() if sel.select(30) else "<nothing in 30 s>"
+
+        self.assertEqual(worker_line(), "ready")
+        try:
+            with open("/proc/sys/kernel/yama/ptrace_scope") as f:
+                if int(f.read()) > 1:
+                    self.skipTest("Yama ptrace_scope above 1: the tool cannot freeze the worker")
+        except FileNotFoundError:
+            pass
+        d = tempfile.mkdtemp(dir=self.tmp)
+        tenv = dict(os.environ, LD_LIBRARY_PATH=self.tool_lib)
+
+        def cycle(edit):
+            s = subprocess.run([self.tool, "suspend", str(w.pid)], capture_output=True, text=True, timeout=120, env=tenv)
+            self.assertEqual(s.returncode, 0, s.stdout + s.stderr)
+            # As the agent before a dump: the holder leaves the pid stopped
+            # and exits, and "resume" then restores it itself.
+            st = subprocess.run([self.tool, "stop", str(w.pid)], capture_output=True, text=True, timeout=60, env=tenv)
+            self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
+            for name in ("in", "out"):  # the previous cycle's lists
+                if os.path.exists(os.path.join(d, name)):
+                    os.unlink(os.path.join(d, name))
+            r = subprocess.Popen([self.tool, "--fabric-map", d, "resume", str(w.pid)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, env=tenv)
+            self.addCleanup(r.kill)
+            out = os.path.join(d, "out")
+            for _ in range(600):
+                if os.path.exists(out) or r.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if not os.path.exists(out):
+                r.kill()
+                self.fail("no %s: %s" % (out, r.communicate()[0]))
+            with open(out) as f:
+                lines = f.read().splitlines()
+            with open(os.path.join(d, "in.tmp"), "w") as f:
+                f.write("".join(x + "\n" for x in edit(lines)))
+            os.rename(os.path.join(d, "in.tmp"), os.path.join(d, "in"))
+            return r.wait(timeout=120), r.communicate()[0], lines
+
+        rc, res, lines = cycle(lambda l: l)
+        self.assertEqual(rc, 0, res)
+        self.assertEqual(sum(x.startswith("ibvq:") for x in lines), 2, lines)
+        w.stdin.write("go\n")
+        w.stdin.flush()
+        self.assertEqual(worker_line(), "written=1 data=ok", res)
+        first_q = None
+
+        def drop_first_queue_pair(l):
+            nonlocal first_q
+            first_q = next(x for x in l if x.startswith("ibvq:"))
+            return [x for x in l if x != first_q]
+
+        rc, res, _ = cycle(drop_first_queue_pair)
+        self.assertNotEqual(rc, 0, "the second remap connected without a queue pair row:\n" + res)
+        self.assertIn("remap failed; pids left SIGSTOPped", res)
+        self.assertRegex(res, r"err the verbs exchange has no queue pair row for the peer of queue pair \d+ "
+                              r"\(peer qpn %s\)" % first_q.split()[0].split(":")[2])
 
     def test_queue_pair_left_by_a_failed_destroy_reaches_its_new_peer(self):
         out = self.probe("destroyfail")

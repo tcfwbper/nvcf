@@ -222,7 +222,24 @@ RDMA devices block a capture (the preflight's `rdma` check), with one
 exception: a process that maps `libnvsnap_ibv.so`, the verbs library the
 webhook gives NCCL (`webhook.gpushareIBV` or `nvsnap.io/gpushare-ibv`),
 only warns. That library releases NCCL's RDMA state at `release` and
-creates it again at `load`. RDMA anything else holds (UCX, NIXL) cannot
+creates it again at `load`. At `remap`, `nvsnap_ibv_connect` reconnects
+NCCL's queue pairs with their peers' new numbers. When it has queue pairs
+to reconnect, it requires NCCL's verbs calls to be held, and it checks this
+restore's verbs exchange for every one of them before it changes any. It
+fails on any of these:
+
+- a row is missing or does not parse;
+- a key count is missing;
+- two rows conflict;
+- a retry gives other peer numbers.
+
+A refused `remap` keeps the last validated peer table. `nvsnap_ibv_open`,
+and any other release of NCCL's calls, keeps them held until those queue
+pairs are connected. A `remap` that reconnects queue pairs fails when any process in
+the restore that holds queue pairs runs an older library: its `ibvq` rows carry no
+sender token, so `nvsnap_ibv_connect` rejects them as malformed. An older process with
+no queue pairs writes no such rows and does not trigger it; a `remap` with nothing to
+reconnect reads no exchange. RDMA anything else holds (UCX, NIXL) cannot
 be told apart from the host, so the process's own `quiesce` refuses its
 open RDMA files (device files and verbs event files) and its mappings of
 other devices before anything stops, and the workload runs on
