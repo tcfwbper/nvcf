@@ -76,10 +76,19 @@ const statusConfig: Record<
 
 const fallbackConfig: StatusConfig = { color: "gray", icon: CircleMinus };
 
+export function getStatusDisplay(
+	status: NonNullable<GetClusterResponse["status"]>,
+) {
+	const config = Object.hasOwn(statusConfig, status)
+		? statusConfig[status]
+		: fallbackConfig;
+	return { ...config, label: config.label ?? toTitleCase(status) };
+}
+
 export function getStatusLabel(
 	status: NonNullable<GetClusterResponse["status"]>,
 ) {
-	return (statusConfig[status] ?? fallbackConfig).label ?? toTitleCase(status);
+	return getStatusDisplay(status).label;
 }
 
 export function StatusBadge({
@@ -87,11 +96,11 @@ export function StatusBadge({
 }: {
 	status?: GetClusterResponse["status"];
 }) {
-	const { color, icon: Icon } = statusConfig[status] ?? fallbackConfig;
+	const { color, icon: Icon, label } = getStatusDisplay(status);
 	return (
 		<Badge color={color} kind="outline">
 			<Icon size={12} />
-			{getStatusLabel(status)}
+			{label}
 		</Badge>
 	);
 }

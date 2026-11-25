@@ -97,7 +97,7 @@ describe("ClusterDetails", () => {
 		server.use(
 			getGetClusterForNcaIdAndClusterIdMockHandler({
 				...baseClstr,
-				status: GetClusterResponseStatus.NOT_READY,
+				status: GetClusterResponseStatus.READY,
 			}),
 		);
 
@@ -111,6 +111,69 @@ describe("ClusterDetails", () => {
 		expect(
 			screen.getByText("No Instance Configuration Yet"),
 		).toBeInTheDocument();
+	});
+
+	it("shows no health banner for a ready cluster", async () => {
+		server.use(
+			getGetClusterForNcaIdAndClusterIdMockHandler({
+				...baseClstr,
+				status: GetClusterResponseStatus.READY,
+			}),
+		);
+
+		renderWithRouter({ initialLocation: `/clusters/${CLUSTER_ID}` });
+
+		expect(await screen.findByText("Overview")).toBeInTheDocument();
+		expect(screen.queryByText("No contact")).not.toBeInTheDocument();
+	});
+
+	it("shows the no contact banner and no GPU utilization for an unhealthy cluster", async () => {
+		server.use(
+			getGetClusterForNcaIdAndClusterIdMockHandler({
+				...baseClstr,
+				status: GetClusterResponseStatus.UNHEALTHY,
+				gpuUsage: undefined,
+			}),
+		);
+
+		renderWithRouter({ initialLocation: `/clusters/${CLUSTER_ID}` });
+
+		expect(await screen.findByText("No contact")).toBeInTheDocument();
+		expect(screen.getByText("GPU Utilization")).toBeInTheDocument();
+		expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+	});
+
+	it("keeps showing GPU utilization for a cluster in maintenance", async () => {
+		server.use(
+			getGetClusterForNcaIdAndClusterIdMockHandler({
+				...baseClstr,
+				status: GetClusterResponseStatus.CORDON,
+				gpuUsage: { A100: { capacity: 10, available: 5 } },
+			}),
+		);
+
+		renderWithRouter({ initialLocation: `/clusters/${CLUSTER_ID}` });
+
+		expect(await screen.findByText("In maintenance")).toBeInTheDocument();
+		expect(
+			screen.getByRole("progressbar", { name: "A100" }),
+		).toBeInTheDocument();
+	});
+
+	it("shows the awaiting handshake banner and hides instance configuration for a pending cluster", async () => {
+		server.use(
+			getGetClusterForNcaIdAndClusterIdMockHandler({
+				...baseClstr,
+				status: GetClusterResponseStatus.NOT_READY,
+			}),
+		);
+
+		renderWithRouter({ initialLocation: `/clusters/${CLUSTER_ID}` });
+
+		expect(await screen.findByText("Awaiting handshake")).toBeInTheDocument();
+		expect(
+			screen.queryByText("Instance Configuration"),
+		).not.toBeInTheDocument();
 	});
 
 	it("renders instance configuration tabs when gpus are present", async () => {

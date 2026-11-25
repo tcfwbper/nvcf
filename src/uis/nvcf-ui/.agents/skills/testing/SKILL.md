@@ -12,7 +12,8 @@ license: Apache-2.0
 
 # Testing
 
-Adding or changing a component means adding or updating its tests.
+Adding or changing a component means covering it with tests, at the page or
+component level. See [What to test](#what-to-test).
 
 ## How to render
 
@@ -60,6 +61,26 @@ beforeEach(() => {
 
 Scenario files export a `handlers` array. Reuse them instead of duplicating
 handler logic.
+
+## What to test
+
+Test use cases where users meet them. "The more your tests resemble the way
+your software is used, the more confidence they can give you"
+([guiding principles](https://testing-library.com/docs/guiding-principles)).
+Prefer integration over isolated units
+([Write tests](https://kentcdodds.com/blog/write-tests)).
+
+- Start at the page. A component used on one page is covered by that page's
+  tests. Add a component test for behavior a page cannot reach cheaply, such
+  as a shared component's edge cases.
+- Name each test after a use case or a decision it guards ("keeps showing GPU
+  utilization for a cluster in maintenance"), not after a prop or a branch.
+- Do not restate static data. A test that repeats a copy or config map fails
+  on every copy change and catches nothing.
+- Skip states the API never produces.
+- An absence assertion passes by default. Use the same accessible query a
+  presence test uses for that element, so a wrong role or name fails there
+  instead of passing here.
 
 ## Guidelines
 

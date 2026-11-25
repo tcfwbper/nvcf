@@ -19,6 +19,7 @@ import { Breadcrumbs, PageHeader, Panel } from "@nvidia/foundations-react-core";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { DetailList } from "~/components/DetailList";
 import { getActiveNcaId } from "~/features/accounts/getActiveNcaId";
+import { ClusterHealthBanner } from "~/features/clusters/components/ClusterHealthBanner";
 import { GpuUtilization } from "~/features/clusters/components/GpuUtilization";
 import { InstanceConfigPanel } from "~/features/clusters/components/InstanceConfigPanel";
 import { StatusBadge } from "~/features/clusters/components/StatusBadge";
@@ -26,6 +27,7 @@ import {
 	getGetClusterForNcaIdAndClusterIdQueryOptions,
 	useGetClusterForNcaIdAndClusterIdSuspense,
 } from "~/generated/api/clusters/clusters";
+import { GetClusterResponseStatus } from "~/generated/model/getClusterResponseStatus";
 import { DETAIL_REFETCH_INTERVAL } from "~/lib/queryClient";
 import { formatDateTime } from "~/utils/formatters";
 
@@ -56,6 +58,7 @@ function ClusterDetails() {
 	);
 
 	const cfg = cluster.clusterConfigurations ?? {};
+	const gpuUsage = Object.entries(cluster.gpuUsage ?? {});
 
 	return (
 		<div className="flex flex-col gap-6">
@@ -77,60 +80,54 @@ function ClusterDetails() {
 				}
 				slotHeading={cluster.clusterName ?? clusterId}
 			/>
+			<ClusterHealthBanner status={cluster.status} />
 			<div className="grid grid-cols-1 gap-6 lg:grid-cols-2 lg:gap-x-8 lg:items-start">
 				<div className="flex flex-col gap-6">
 					<Panel elevation="high" slotHeading="Overview">
-						<div className="flex flex-col gap-6">
-							<DetailList
-								items={[
-									{
-										label: "Status",
-										value: <StatusBadge status={cluster.status} />,
-									},
-									{
-										label: "Cluster Description",
-										value: cluster.clusterDescription,
-									},
-									{
-										label: "Cluster Agent Version",
-										value: cluster.nvcaVersion,
-									},
-									{ label: "Cluster Group", value: cluster.clusterGroupName },
-									{ label: "Region", value: cluster.region },
-									{
-										label: "Last Updated",
-										value: formatDateTime(cluster.nvcaLastConnected),
-									},
-								]}
-							/>
-							{cluster.gpuUsage && Object.keys(cluster.gpuUsage).length > 0 && (
-								<DetailList
-									items={[
-										{
-											label: "GPU Utilization",
-											value: (
-												<div className="flex flex-col gap-6">
-													{Object.entries(cluster.gpuUsage ?? {}).map(
-														([name, usage]) => (
-															<GpuUtilization
-																key={name}
-																name={name}
-																usage={usage}
-															/>
-														),
-													)}
-												</div>
-											),
-										},
-									]}
-								/>
-							)}
-						</div>
+						<DetailList
+							items={[
+								{
+									label: "Status",
+									value: <StatusBadge status={cluster.status} />,
+								},
+								{
+									label: "Cluster Description",
+									value: cluster.clusterDescription,
+								},
+								{
+									label: "Cluster Agent Version",
+									value: cluster.nvcaVersion,
+								},
+								{ label: "Cluster Group", value: cluster.clusterGroupName },
+								{ label: "Region", value: cluster.region },
+								{
+									label: "GPU Utilization",
+									value:
+										gpuUsage.length > 0 ? (
+											<div className="flex flex-col gap-6">
+												{gpuUsage.map(([name, usage]) => (
+													<GpuUtilization
+														key={name}
+														name={name}
+														usage={usage}
+													/>
+												))}
+											</div>
+										) : undefined,
+								},
+								{
+									label: "Last Updated",
+									value: formatDateTime(cluster.nvcaLastConnected),
+								},
+							]}
+						/>
 					</Panel>
-					<InstanceConfigPanel
-						gpus={cluster.gpus ?? []}
-						usage={cluster.gpuUsage || {}}
-					/>
+					{cluster.status !== GetClusterResponseStatus.NOT_READY && (
+						<InstanceConfigPanel
+							gpus={cluster.gpus ?? []}
+							usage={cluster.gpuUsage || {}}
+						/>
+					)}
 				</div>
 
 				<Panel elevation="high" slotHeading="Configuration">
