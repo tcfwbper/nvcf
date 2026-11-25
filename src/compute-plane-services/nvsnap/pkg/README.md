@@ -7,6 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 Importable Go packages — the public surface other modules may depend on.
 Everything else is repo-private under [`../internal/`](../internal/).
 
+Nothing in this repository imports these packages, and no binary links them.
+
 ## Package map
 
 - [`discovery/`](discovery/) — container information (rootfs, spec) resolved
@@ -18,5 +20,5 @@ Everything else is repo-private under [`../internal/`](../internal/).
 
 ## Rules
 
-Keep the API stable and minimal — external code imports these. If something is
+Keep the API stable and minimal: these are the packages meant for import. If something is
 only used inside nvsnap, put it in `internal/` instead.

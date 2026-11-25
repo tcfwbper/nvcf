@@ -343,11 +343,13 @@ func (m *Mutator) cacheDirSubdirMounts(main *corev1.Container) []PatchOp {
 
 // tryL2CacheDir injects a cachedir RESTORE: the rox PVC mounted
 // read-only at m.CacheDir directly (no overlayfs), the cache/model env
-// vars set identically to capture, and nvsnap-rootfs-restore as the
-// entrypoint in no-overlay mode (prewarm the tree, then exec the
-// workload). Returns (patches, nil) on success, (nil, ErrNotFound) when
-// the rox isn't Bound (caller falls back to L1) or the capture predates
-// EntryArgv recording.
+// vars set identically to capture, a nvsnap-seed-cache init container
+// that copies the cache subtree into a writable emptyDir, and, when
+// prewarm is on (storage profile default, or the pod's NVSNAP_PREWARM), a
+// nvsnap-prewarm init container that reads the tree into the page cache.
+// The pod's command is left as authored (cacheDirRestorePatches). Returns
+// (patches, nil) on success and (nil, ErrNotFound) when the rox isn't
+// Bound (caller falls back to L1).
 func (m *Mutator) tryL2CacheDir(ctx context.Context, pod *corev1.Pod, hash string, manifest checkpointstore.Manifest) ([]PatchOp, error) {
 	ctx, span := tracing.Tracer().Start(ctx, "webhook.cachedir_restore")
 	defer span.End()
@@ -360,11 +362,6 @@ func (m *Mutator) tryL2CacheDir(ctx context.Context, pod *corev1.Pod, hash strin
 		return nil, fmt.Errorf("MainContainer index %d out of range (have %d containers)",
 			m.MainContainer, len(pod.Spec.Containers))
 	}
-	// The shim execs the workload's recorded source entrypoint after
-	// prewarm. Same rule as the overlay path: never fall back to the
-	// pod's command/args (ENTRYPOINT-only images carry neither). If the
-	// capture predates EntryArgv, fall through to L1.
-
 	// Resolve the rox PVC (ErrNotFound = not Bound → caller falls to L1).
 	pm, err := m.L2Backend.Mount(ctx, hash, cacheDirVolumeMeta(m.CacheDir, pod.Namespace))
 	if err != nil {
