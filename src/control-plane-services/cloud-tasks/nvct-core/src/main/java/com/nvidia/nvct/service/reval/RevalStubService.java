@@ -44,6 +44,31 @@ public interface RevalStubService {
         ObjectNode imageRegistryAuthConfig;
 
         ObjectNode helmRegistryAuthConfig;
+
+        List<ValidationPolicy> validationPolicies;
+    }
+
+    @Value
+    @Jacksonized
+    @Builder
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    class ValidationPolicy {
+        String id;
+
+        String name;
+
+        List<KubernetesType> allowedExtraKubernetesTypes;
+    }
+
+    @Value
+    @Jacksonized
+    @Builder
+    class KubernetesType {
+        String group;
+
+        String version;
+
+        String kind;
     }
 
     @Value
@@ -55,6 +80,19 @@ public interface RevalStubService {
         List<String> validationErrors;
 
         List<String> internalErrors;
+
+        List<ValidationPolicyResult> validationPolicies;
+    }
+
+    @Value
+    @Jacksonized
+    @Builder
+    class ValidationPolicyResult {
+        String id;
+
+        boolean valid;
+
+        List<String> validationErrors;
     }
 
     @PostExchange("/v1/validate")

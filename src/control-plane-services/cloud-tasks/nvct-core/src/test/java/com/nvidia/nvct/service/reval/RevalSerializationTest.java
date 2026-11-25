@@ -20,7 +20,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.SerializationFeature;
+import com.nvidia.nvct.service.reval.RevalStubService.KubernetesType;
 import com.nvidia.nvct.service.reval.RevalStubService.RevalValidateResponse;
+import com.nvidia.nvct.service.reval.RevalStubService.ValidationPolicy;
+import com.nvidia.nvct.service.reval.RevalStubService.ValidationPolicyResult;
 import java.util.Arrays;
 import java.util.List;
 import lombok.SneakyThrows;
@@ -64,6 +67,55 @@ class RevalSerializationTest {
         assertThat(jsonMapper.readTree(requestJson)).isEqualTo(jsonMapper.readTree(expectedJson));
     }
 
+    @Test
+    @SneakyThrows
+    void testRequestSerializationWithValidationPolicies() {
+        var jsonMapper = JsonMapper.builder().build();
+
+        var request = RevalStubService.RevalValidateRequest.builder()
+                .helmChart("my_helm_chart")
+                .validationPolicies(List.of(ValidationPolicy.builder()
+                        .id("task")
+                        .name("Default")
+                        .allowedExtraKubernetesTypes(List.of(KubernetesType.builder()
+                                .group("example.com")
+                                .version("v1")
+                                .kind("Widget")
+                                .build()))
+                        .build()))
+                .build();
+
+        var requestJson = jsonMapper.writeValueAsString(request);
+        var expectedJson = """
+                {"helmChart":"my_helm_chart","validationPolicies":[{"id":"task","name":"Default",
+                "allowedExtraKubernetesTypes":[{"group":"example.com","version":"v1","kind":"Widget"}]}]}""";
+
+        assertThat(jsonMapper.readTree(requestJson)).isEqualTo(jsonMapper.readTree(expectedJson));
+    }
+
+    @Test
+    @SneakyThrows
+    void testResponseDeserializationWithValidationPolicies() {
+        var json = """
+            {
+                "valid": false,
+                "validationErrors": [],
+                "validationPolicies": [
+                    {"id": "task", "valid": false, "validationErrors": ["Policy error"]}
+                ]
+            }
+            """;
+
+        var jsonMapper = JsonMapper.builder().build();
+        var validationResult = jsonMapper.readValue(json, RevalValidateResponse.class);
+
+        assertThat(validationResult.getValidationPolicies()).containsExactly(
+                ValidationPolicyResult.builder()
+                        .id("task")
+                        .valid(false)
+                        .validationErrors(List.of("Policy error"))
+                        .build());
+    }
 
     @Test
     @SneakyThrows

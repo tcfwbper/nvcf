@@ -153,6 +153,10 @@ To permit additional resource types beyond the default set, supply them in
 }
 ```
 
+Task creation validates the chart with the default rules plus the listed
+`extraKubernetesTypes`, for either policy name. The target cluster must also
+allow each extra type in its validation policy.
+
 ## Differences from container tasks
 
 | | Container task | Helm task |

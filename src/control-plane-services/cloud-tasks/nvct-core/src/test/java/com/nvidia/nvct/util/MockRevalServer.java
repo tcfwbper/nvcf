@@ -22,16 +22,23 @@ import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import java.net.URI;
+import java.util.List;
 import lombok.experimental.UtilityClass;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 @UtilityClass
 public class MockRevalServer {
+    public static final String POLICY_REJECTED_KIND = "PolicyRejectedKind";
+    public static final String POLICY_REJECTED_ERROR = "policy rejected " + POLICY_REJECTED_KIND;
+    public static final String POLICY_FAILED_SILENTLY_KIND = "PolicyFailedSilentlyKind";
+
     private static WireMockServer wireMockServer;
 
     public static void start(URI listenUrl) {
@@ -60,6 +67,35 @@ public class MockRevalServer {
                         .willReturn(validationError));
         wireMockServer.stubFor(
                 post("/v1/validate")
+                        .atPriority(1)
+                        .withRequestBody(
+                                matchingJsonPath(
+                                        "$.validationPolicies[0].allowedExtraKubernetesTypes[0].kind",
+                                        equalTo(POLICY_REJECTED_KIND)))
+                        .willReturn(aResponse()
+                                .withStatus(200)
+                                .withHeader("Content-Type", "application/json")
+                                .withBody("""
+                                {"valid": false, "validationErrors": [],
+                                 "validationPolicies": [{"id": "task", "valid": false,
+                                 "validationErrors": ["%s"]}]}
+                                """.formatted(POLICY_REJECTED_ERROR))));
+        wireMockServer.stubFor(
+                post("/v1/validate")
+                        .atPriority(1)
+                        .withRequestBody(
+                                matchingJsonPath(
+                                        "$.validationPolicies[0].allowedExtraKubernetesTypes[0].kind",
+                                        equalTo(POLICY_FAILED_SILENTLY_KIND)))
+                        .willReturn(aResponse()
+                                .withStatus(200)
+                                .withHeader("Content-Type", "application/json")
+                                .withBody("""
+                                {"valid": true, "validationErrors": [],
+                                 "validationPolicies": [{"id": "task", "valid": false, "validationErrors": []}]}
+                                """)));
+        wireMockServer.stubFor(
+                post("/v1/validate")
                         .atPriority(4)
                         .withRequestBody(
                                 matchingJsonPath("$.configuration.fail", equalTo("fail")))
@@ -82,6 +118,16 @@ public class MockRevalServer {
 
         wireMockServer.start();
 
+    }
+
+    public static List<String> validateRequestBodies() {
+        return wireMockServer.findAll(postRequestedFor(urlEqualTo("/v1/validate"))).stream()
+                .map(r -> r.getBodyAsString())
+                .toList();
+    }
+
+    public static void resetRequests() {
+        wireMockServer.resetRequests();
     }
 
     public static void stop() {

@@ -74,6 +74,7 @@ import org.springframework.boot.resttestclient.autoconfigure.AutoConfigureTestRe
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.RequestEntity;
+import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.ContextConfiguration;
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -281,6 +282,106 @@ class TaskWithHelmValidationPolicyTest {
         assertThat(responseBody.task().gpuSpecification()).isNotNull();
         assertThat(responseBody.task().gpuSpecification().helmValidationPolicy())
                 .isEqualTo(helmValidationPolicy);
+    }
+
+    @Test
+    void shouldForwardExtraKubernetesTypesToReval() {
+        var policy = HelmValidationPolicyDto.builder()
+                .name(ValidationPolicyNameEnum.UNRESTRICTED)
+                .extraKubernetesTypes(List.of(HelmValidationPolicyDto.KubernetesType.builder()
+                        .group("example.com")
+                        .version("v1")
+                        .kind("Widget")
+                        .build()))
+                .build();
+        MockRevalServer.resetRequests();
+
+        var response = createTask(policy, TaskResponse.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var bodies = MockRevalServer.validateRequestBodies();
+        assertThat(bodies).hasSize(1);
+        assertThat(jsonMapper.readTree(bodies.getFirst()).get("validationPolicies"))
+                .isEqualTo(jsonMapper.readTree("""
+                        [{"id": "task", "name": "Default", "allowedExtraKubernetesTypes":
+                          [{"group": "example.com", "version": "v1", "kind": "Widget"}]}]"""));
+    }
+
+    @Test
+    void shouldNotSendRevalPoliciesWithoutExtraTypes() {
+        var policy = HelmValidationPolicyDto.builder()
+                .name(ValidationPolicyNameEnum.UNRESTRICTED)
+                .build();
+        MockRevalServer.resetRequests();
+
+        var response = createTask(policy, TaskResponse.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var bodies = MockRevalServer.validateRequestBodies();
+        assertThat(bodies).hasSize(1);
+        assertThat(jsonMapper.readTree(bodies.getFirst()).has("validationPolicies")).isFalse();
+    }
+
+    @Test
+    void shouldReportPerPolicyRevalErrors() {
+        var policy = HelmValidationPolicyDto.builder()
+                .name(ValidationPolicyNameEnum.DEFAULT)
+                .extraKubernetesTypes(List.of(HelmValidationPolicyDto.KubernetesType.builder()
+                        .group("example.com")
+                        .version("v1")
+                        .kind(MockRevalServer.POLICY_REJECTED_KIND)
+                        .build()))
+                .build();
+
+        var response = createTask(policy, String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).contains(MockRevalServer.POLICY_REJECTED_ERROR);
+    }
+
+    @Test
+    void shouldRejectFailedPolicyWithoutErrors() {
+        var policy = HelmValidationPolicyDto.builder()
+                .name(ValidationPolicyNameEnum.DEFAULT)
+                .extraKubernetesTypes(List.of(HelmValidationPolicyDto.KubernetesType.builder()
+                        .group("example.com")
+                        .version("v1")
+                        .kind(MockRevalServer.POLICY_FAILED_SILENTLY_KIND)
+                        .build()))
+                .build();
+
+        var response = createTask(policy, String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).contains("Helm chart validation failure. Unknown error.");
+    }
+
+    private <T> ResponseEntity<T> createTask(HelmValidationPolicyDto policy, Class<T> responseType) {
+        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
+                                                    List.of(SCOPE_LAUNCH_TASK, SCOPE_LIST_TASKS),
+                                                    100);
+        var gpuSpec = GpuSpecificationDto.builder()
+                .gpu(TEST_OCI_GPU_SPEC_WITH_HELM_POLICY_DTO.gpu())
+                .instanceType(TEST_OCI_GPU_SPEC_WITH_HELM_POLICY_DTO.instanceType())
+                .backend(TEST_OCI_GPU_SPEC_WITH_HELM_POLICY_DTO.backend())
+                .helmValidationPolicy(policy)
+                .build();
+        var requestBody = CreateTaskRequest.builder()
+                .name(TEST_TASK_NAME_1)
+                .helmChart(TEST_HELM_CHART)
+                .gpuSpecification(gpuSpec)
+                .maxRuntimeDuration(Duration.ofHours(2))
+                .maxQueuedDuration(Duration.ofHours(1))
+                .terminationGracePeriodDuration(Duration.ofHours(1))
+                .resultsLocation(TEST_RESULTS_LOCATION_1)
+                .resultHandlingStrategy(ResultHandlingStrategyEnum.UPLOAD)
+                .secrets(TEST_SECRETS)
+                .build();
+        var requestEntity = RequestEntity.post(URI.create("/v1/nvct/tasks"))
+                .contentType(MediaType.APPLICATION_JSON)
+                .header("Authorization", "Bearer " + token)
+                .body(requestBody);
+        return testRestTemplate.exchange(requestEntity, responseType);
     }
 
     @Test
