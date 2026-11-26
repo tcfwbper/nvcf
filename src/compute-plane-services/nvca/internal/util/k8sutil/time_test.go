@@ -98,8 +98,14 @@ func TestTimeConfigComplete(t *testing.T) {
 	if tCfg.FailingObjectsBackoffRequeueInterval != defaultFailingObjectsBackoffRequeueInterval {
 		t.Errorf("Expected FailingObjectsBackoffRequeueInterval to be %v, got %v", defaultFailingObjectsBackoffRequeueInterval, tCfg.FailingObjectsBackoffRequeueInterval)
 	}
+	if tCfg.WorkerContainerRestartScoreDecayPeriod != defaultWorkerContainerRestartScoreDecayPeriod {
+		t.Errorf("Expected WorkerContainerRestartScoreDecayPeriod to be %v, got %v", defaultWorkerContainerRestartScoreDecayPeriod, tCfg.WorkerContainerRestartScoreDecayPeriod)
+	}
 	if tCfg.WorkerContainerRestartCountToFailInstance != defaultWorkerContainerRestartCountToFailInstance {
 		t.Errorf("Expected WorkerContainerRestartCountToFailInstance to be %v, got %v", defaultWorkerContainerRestartCountToFailInstance, tCfg.WorkerContainerRestartCountToFailInstance)
+	}
+	if tCfg.CountAllWorkerRestarts {
+		t.Errorf("Expected CountAllWorkerRestarts to stay off by default")
 	}
 }
 
@@ -107,7 +113,7 @@ func zeroFields(tCfg *TimeConfig) []string {
 	var zeroFields []string
 	v := reflect.ValueOf(tCfg).Elem()
 	for i := range v.Type().NumField() {
-		if v.Field(i).IsZero() {
+		if v.Field(i).IsZero() && !optionalTimeConfigFields[v.Type().Field(i).Name] {
 			zeroFields = append(zeroFields, v.Type().Field(i).Name)
 		}
 	}

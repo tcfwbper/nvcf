@@ -2184,6 +2184,147 @@ func TestGetICMSRequestUpdatesForCreatePodRequest_ContainerRestarts(t *testing.T
 	}
 }
 
+// The worker restart score only changes when a crash-looping worker is reported. The instance states and termination
+// cause reported for the instance stay the same.
+func TestGetICMSRequestUpdatesForCreatePodRequest_WorkerRestartScore(t *testing.T) {
+	now := time.Now()
+	lastExit := now.Add(-20 * time.Second)
+	decayedScore, err := json.Marshal(k8sutil.WorkerRestartScore{Score: 0, RestartCount: 3, RecordedAt: now})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		countAll      bool
+		container     string
+		restarts      int32
+		wantPurge     bool
+		wantInstState types.ICMSInstanceState
+	}{
+		{
+			name:          "count all restarts ignores the decayed score",
+			countAll:      true,
+			container:     common.UtilsContainerName,
+			restarts:      3,
+			wantPurge:     true,
+			wantInstState: types.ICMSInstanceTerminated,
+		},
+		{
+			name:          "default keeps a worker whose score decayed",
+			container:     common.UtilsContainerName,
+			restarts:      3,
+			wantInstState: types.ICMSInstanceStarted,
+		},
+		{
+			name:          "default reports a worker whose new restarts reach the threshold",
+			container:     common.UtilsContainerName,
+			restarts:      6,
+			wantPurge:     true,
+			wantInstState: types.ICMSInstanceTerminated,
+		},
+		{
+			name:          "default keeps the fixed limit for the model container",
+			container:     "inference",
+			restarts:      k8sutil.RestartCountToFailInstance,
+			wantPurge:     true,
+			wantInstState: types.ICMSInstanceTerminated,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newTestContext()
+			clients := mockKubeClients()
+			ns := RequestsNamespace
+
+			bc := &BackendK8sCache{
+				podInstanceNamespace: ns,
+				systemNamespace:      SystemNamespace,
+				featureFlagFetcher:   &featureflagmock.Fetcher{},
+				clients:              clients,
+				k8sTimeConfig:        (&k8sutil.TimeConfig{CountAllWorkerRestarts: tt.countAll}).Complete(),
+			}
+			kb := K8sComputeBackend{
+				clients: clients,
+				bk8s:    bc,
+			}
+
+			running := v1.ContainerState{Running: &v1.ContainerStateRunning{StartedAt: metav1.NewTime(now.Add(-72 * time.Hour))}}
+			statuses := map[string]v1.ContainerStatus{
+				"inference":               {Name: "inference", Ready: true, State: running},
+				common.UtilsContainerName: {Name: common.UtilsContainerName, Ready: true, State: running},
+			}
+			statuses[tt.container] = v1.ContainerStatus{
+				Name:         tt.container,
+				RestartCount: tt.restarts,
+				State:        v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				LastTerminationState: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{
+					ExitCode:   2,
+					Reason:     "Error",
+					StartedAt:  metav1.NewTime(lastExit.Add(-time.Minute)),
+					FinishedAt: metav1.NewTime(lastExit),
+				}},
+			}
+
+			podName := "0-sr-worker-restarts"
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        podName,
+					Namespace:   ns,
+					Annotations: map[string]string{k8sutil.WorkerRestartScoreAnnotationKey: string(decayedScore)},
+				},
+				Spec: v1.PodSpec{Containers: []v1.Container{
+					{Name: "inference"},
+					{Name: common.UtilsContainerName, Env: []v1.EnvVar{{Name: k8sutil.InstanceIDEnvKey, Value: podName}}},
+				}},
+				Status: v1.PodStatus{
+					Phase:     v1.PodRunning,
+					StartTime: &metav1.Time{Time: now.Add(-72 * time.Hour)},
+					Conditions: []v1.PodCondition{
+						{Type: v1.PodScheduled, Status: v1.ConditionTrue},
+						{Type: v1.PodInitialized, Status: v1.ConditionTrue},
+						{Type: v1.ContainersReady, Status: v1.ConditionFalse, LastTransitionTime: metav1.NewTime(lastExit)},
+						{Type: v1.PodReady, Status: v1.ConditionFalse, LastTransitionTime: metav1.NewTime(lastExit)},
+					},
+					ContainerStatuses: []v1.ContainerStatus{statuses["inference"], statuses[common.UtilsContainerName]},
+				},
+			}
+			_, err := clients.K8s.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			req := &nvcav2beta1.ICMSRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: "sr-worker-restarts", Namespace: ns},
+				Spec: nvcav2beta1.ICMSRequestSpec{
+					RequestID: "req-worker-restarts",
+					Action:    common.FunctionCreationAction,
+				},
+				Status: nvcav2beta1.ICMSRequestStatus{
+					Instances: map[string]nvcav2beta1.InstanceStatus{
+						podName: {
+							ID:                 podName,
+							Type:               nvcav2beta1.InstanceTypePod,
+							Status:             string(types.ICMSInstanceRunning),
+							LastReportedStatus: string(types.ICMSInstanceRunning),
+						},
+					},
+				},
+			}
+
+			update, err := kb.GetICMSRequestUpdatesForCreatePodRequest(ctx, req.Status.Instances[podName], req)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantInstState, update.Payload.InstanceState)
+
+			_, err = clients.K8s.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+			if tt.wantPurge {
+				assert.True(t, errors.IsNotFound(err), "pod should be deleted, got err %v", err)
+				assert.Equal(t, types.ICMSInstanceFailedContainerRestartLoop, update.Payload.TerminationCause)
+			} else {
+				require.NoError(t, err, "pod should be kept")
+				assert.Empty(t, update.Payload.TerminationCause)
+			}
+		})
+	}
+}
+
 func TestImageCredentialUpdater(t *testing.T) {
 	ctx := newTestContext()
 

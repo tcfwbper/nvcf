@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -577,12 +578,35 @@ func withAgentConfigMapper() clusterMapper {
 			}
 		}
 
+		var workerContainerRestartScoreDecayPeriod time.Duration
+		if minutesStr := src.ClusterConfigurations[NVCAWorkerContainerRestartScoreDecayPeriodMinutesConfig]; minutesStr != "" {
+			// An invalid value is ignored rather than returned as an error, so it does not block the other cluster
+			// settings from being reconciled.
+			log := core.GetLogger(ctx).WithFields(logrus.Fields{
+				"cluster_id": src.ID,
+				"config_key": NVCAWorkerContainerRestartScoreDecayPeriodMinutesConfig,
+				"value":      minutesStr,
+			})
+			minutes, err := strconv.ParseInt(minutesStr, 10, 64)
+			switch {
+			case err != nil:
+				log.WithError(err).Warn("ignoring invalid cluster configuration override for the worker restart score decay period")
+			case minutes < 0:
+				log.Warn("ignoring negative cluster configuration override for the worker restart score decay period")
+			case minutes > int64(math.MaxInt64/time.Minute):
+				log.Warn("ignoring out of range cluster configuration override for the worker restart score decay period")
+			default:
+				workerContainerRestartScoreDecayPeriod = time.Duration(minutes) * time.Minute
+			}
+		}
+
 		// Map NVCFWorkerConfig
 		dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig = nvidiaiov1.NVCFWorkerConfig{
 			CacheMountOptionsEnabled:                  cacheMountOptionsEnabled,
 			CacheMountOptions:                         cacheMountOptions,
 			WorkerDegradationPeriod:                   workerDegradationPeriod,
 			WorkerContainerRestartCountToFailInstance: workerContainerRestartCountToFailInstance,
+			WorkerContainerRestartScoreDecayPeriod:    workerContainerRestartScoreDecayPeriod,
 		}
 
 		return nil

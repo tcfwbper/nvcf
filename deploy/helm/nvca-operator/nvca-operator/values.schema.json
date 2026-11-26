@@ -752,6 +752,12 @@
                     "minimum": 0,
                     "maximum": 2147483647
                 },
+                "workerContainerRestartScoreDecayPeriod": {
+                    "type": "string",
+                    "description": "How long it takes the NVCA worker (utils) container restart score to drop by 1. Each worker restart adds 1, and NVCA replaces the instance when the score reaches workerContainerRestartCountToFailInstance (e.g., \"30m\", \"2h\"). Empty uses the NVCA default of 1h. To count every worker restart instead, add the CountAllWorkerRestarts feature flag to worker.featureFlags",
+                    "pattern": "^$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$",
+                    "default": ""
+                },
                 "secretMirrorNamespace": {
                     "type": "string",
                     "description": "Default namespace to mirror custom secrets for nvcf workloads",

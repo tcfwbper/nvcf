@@ -130,7 +130,9 @@ type AgentOptions struct {
 	NVCAWorkerDegradationPeriod  time.Duration
 	// NVCAWorkerContainerRestartCountToFailInstance overrides the NVCA worker container restart threshold. Zero uses the NVCA default.
 	NVCAWorkerContainerRestartCountToFailInstance int32
-	NVCAWorkloadTolerations                       []corev1.Toleration
+	// NVCAWorkerContainerRestartScoreDecayPeriod overrides the NVCA worker container restart score decay period. Zero uses the NVCA default.
+	NVCAWorkerContainerRestartScoreDecayPeriod time.Duration
+	NVCAWorkloadTolerations                    []corev1.Toleration
 	// NVCAAgentTolerations is the helm-supplied fallback for NVCA agent pod
 	// tolerations, used when the NVCFBackend CR does not surface them
 	// (notably ngc-managed clusters whose CR is sourced from the NGC API).
@@ -251,6 +253,7 @@ func (o *AgentOptions) sanitizedString() string {
 	sanitized.NVCACacheMountOptions = o.NVCACacheMountOptions
 	sanitized.NVCAWorkerDegradationPeriod = o.NVCAWorkerDegradationPeriod
 	sanitized.NVCAWorkerContainerRestartCountToFailInstance = o.NVCAWorkerContainerRestartCountToFailInstance
+	sanitized.NVCAWorkerContainerRestartScoreDecayPeriod = o.NVCAWorkerContainerRestartScoreDecayPeriod
 	sanitized.NVCAWorkloadTolerations = append([]corev1.Toleration(nil), o.NVCAWorkloadTolerations...)
 	sanitized.NVCAAgentTolerations = append([]corev1.Toleration(nil), o.NVCAAgentTolerations...)
 	sanitized.NVCASecretMirrorSourceNamespace = o.NVCASecretMirrorSourceNamespace
@@ -355,6 +358,7 @@ func (a *Agent) backendK8sCacheBuilder(
 			CacheMountOptions:                         a.NVCACacheMountOptions,
 			WorkerDegradationPeriod:                   a.NVCAWorkerDegradationPeriod,
 			WorkerContainerRestartCountToFailInstance: a.NVCAWorkerContainerRestartCountToFailInstance,
+			WorkerContainerRestartScoreDecayPeriod:    a.NVCAWorkerContainerRestartScoreDecayPeriod,
 		},
 		AgentResources:   &a.AgentResources,
 		WebhookResources: &a.WebhookResources,
@@ -377,7 +381,7 @@ func (a *Agent) backendK8sCacheBuilder(
 		WithDispatchReconcileClusterFunc(a.dispatchReconcileCluster).
 		WithContainerResources(a.AgentResources, a.WebhookResources, a.OTelCollectorResources).
 		WithNVCFWorkerConfig(a.NVCACacheMountOptionsEnabled, a.NVCACacheMountOptions, a.NVCAWorkerDegradationPeriod,
-			a.NVCAWorkerContainerRestartCountToFailInstance).
+			a.NVCAWorkerContainerRestartCountToFailInstance, a.NVCAWorkerContainerRestartScoreDecayPeriod).
 		WithWorkloadTolerations(a.NVCAWorkloadTolerations).
 		WithGenerateImagePullSecret(a.GenerateImagePullSecret).
 		WithAdditionalImagePullSecrets(a.AdditionalImagePullSecrets).

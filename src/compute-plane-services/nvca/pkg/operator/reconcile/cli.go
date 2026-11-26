@@ -286,6 +286,14 @@ func NewOperatorCommand() *cli.Command {
 				EnvVars: []string{"NVCA_WORKER_CONTAINER_RESTART_COUNT_TO_FAIL_INSTANCE"},
 				Value:   0,
 			},
+			&cli.DurationFlag{
+				Name: "nvca-worker-container-restart-score-decay-period",
+				Usage: "How long it takes the NVCA worker (utils) container restart score to drop by 1; each worker " +
+					"restart adds 1 and the instance fails at the restart threshold (e.g., 2h; 0 uses the NVCA default of 1h). " +
+					"The CountAllWorkerRestarts feature flag turns this off so every worker restart counts",
+				EnvVars: []string{"NVCA_WORKER_CONTAINER_RESTART_SCORE_DECAY_PERIOD"},
+				Value:   0,
+			},
 			&cli.StringFlag{
 				Name:    "nvca-secret-mirror-source-namespace",
 				Usage:   "Namespace to source secrets from for mirroring",
@@ -488,6 +496,12 @@ func doAction(c *cli.Context) error {
 			restartCountToFailInstance)
 		restartCountToFailInstance = 0
 	}
+	restartScoreDecayPeriod := c.Duration("nvca-worker-container-restart-score-decay-period")
+	if restartScoreDecayPeriod < 0 {
+		log.Warnf("ignoring negative nvca-worker-container-restart-score-decay-period %s, using the NVCA default",
+			restartScoreDecayPeriod)
+		restartScoreDecayPeriod = 0
+	}
 
 	opts := &AgentOptions{
 		NCAID:                         c.String("nca-id"),
@@ -524,6 +538,7 @@ func doAction(c *cli.Context) error {
 		NVCACacheMountOptions:         c.String("nvca-cache-mount-options"),
 		NVCAWorkerDegradationPeriod:   c.Duration("nvca-worker-degradation-period"),
 		NVCAWorkerContainerRestartCountToFailInstance: int32(restartCountToFailInstance),
+		NVCAWorkerContainerRestartScoreDecayPeriod:    restartScoreDecayPeriod,
 		NVCAWorkloadTolerations:                       workloadTolerations,
 		NVCAAgentTolerations:                          agentTolerations,
 		NVCASecretMirrorSourceNamespace:               c.String("nvca-secret-mirror-source-namespace"),

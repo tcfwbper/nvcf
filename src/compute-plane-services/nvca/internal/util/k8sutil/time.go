@@ -41,6 +41,7 @@ const (
 	defaultFailingObjectsBackoffTimeout              = 90 * time.Second
 	defaultFailingObjectsBackoffRequeueInterval      = 30 * time.Second
 	defaultWorkerContainerRestartCountToFailInstance = RestartCountToFailInstance
+	defaultWorkerContainerRestartScoreDecayPeriod    = time.Hour
 )
 
 type TimeConfig struct {
@@ -80,6 +81,18 @@ type TimeConfig struct {
 	// WorkerContainerRestartCountToFailInstance is the NVCA worker container restart count at which a Pod is
 	// considered to be in a restart loop and its instance is marked failed. Other containers always use 3.
 	WorkerContainerRestartCountToFailInstance int32
+	// WorkerContainerRestartScoreDecayPeriod is how long it takes the NVCA worker container restart score to drop
+	// by 1. Each worker restart adds 1, and the Pod is in a restart loop when the score reaches
+	// WorkerContainerRestartCountToFailInstance.
+	WorkerContainerRestartScoreDecayPeriod time.Duration
+	// CountAllWorkerRestarts turns off the worker restart score. When true, every worker restart counts toward
+	// WorkerContainerRestartCountToFailInstance and no score is recorded.
+	CountAllWorkerRestarts bool
+}
+
+// optionalTimeConfigFields are the TimeConfig fields whose zero value is a valid setting.
+var optionalTimeConfigFields = map[string]bool{
+	"CountAllWorkerRestarts": true,
 }
 
 // workerRestartCountToFailInstance returns the configured worker container restart threshold, or the default when
@@ -89,6 +102,15 @@ func (t *TimeConfig) workerRestartCountToFailInstance() int32 {
 		return defaultWorkerContainerRestartCountToFailInstance
 	}
 	return t.WorkerContainerRestartCountToFailInstance
+}
+
+// workerRestartScoreDecayPeriod returns the configured worker restart score decay period, or the default when the
+// TimeConfig was not completed.
+func (t *TimeConfig) workerRestartScoreDecayPeriod() time.Duration {
+	if t.WorkerContainerRestartScoreDecayPeriod <= 0 {
+		return defaultWorkerContainerRestartScoreDecayPeriod
+	}
+	return t.WorkerContainerRestartScoreDecayPeriod
 }
 
 // Complete sets defaults on TimeConfig. It panics if some field is not set or defaulted.
@@ -144,12 +166,15 @@ func (t *TimeConfig) Complete() *TimeConfig {
 	if t.WorkerContainerRestartCountToFailInstance <= 0 {
 		t.WorkerContainerRestartCountToFailInstance = defaultWorkerContainerRestartCountToFailInstance
 	}
+	if t.WorkerContainerRestartScoreDecayPeriod <= 0 {
+		t.WorkerContainerRestartScoreDecayPeriod = defaultWorkerContainerRestartScoreDecayPeriod
+	}
 
 	// Detect unset fields, which could cause downstream errors.
 	var zeroFields []string
 	v := reflect.ValueOf(t).Elem()
 	for i := range v.Type().NumField() {
-		if v.Field(i).IsZero() {
+		if v.Field(i).IsZero() && !optionalTimeConfigFields[v.Type().Field(i).Name] {
 			zeroFields = append(zeroFields, v.Type().Field(i).Name)
 		}
 	}

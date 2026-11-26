@@ -18,6 +18,7 @@ limitations under the License.
 package k8sutil
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -1877,4 +1878,215 @@ func TestPodSpecRequestsGPU_CustomResourceNames(t *testing.T) {
 
 	// Custom resource names should match
 	assert.True(t, PodSpecRequestsGPU(podSpec, "custom.io/accelerator"))
+}
+
+func newWorkerRestartScorePod(t *testing.T, score *WorkerRestartScore, statuses ...corev1.ContainerStatus) *corev1.Pod {
+	t.Helper()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "fn-pod", Namespace: "nvcf-backend"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "inference"},
+			{Name: common.UtilsContainerName, Env: []corev1.EnvVar{{Name: InstanceIDEnvKey, Value: "instance-1"}}},
+		}},
+		Status: corev1.PodStatus{
+			StartTime:         &metav1.Time{Time: time.Now().Add(-72 * time.Hour)},
+			ContainerStatuses: statuses,
+		},
+	}
+	if score != nil {
+		value, err := json.Marshal(score)
+		require.NoError(t, err)
+		pod.Annotations = map[string]string{WorkerRestartScoreAnnotationKey: string(value)}
+	}
+	return pod
+}
+
+func crashLoopingContainer(name string, restarts int32) corev1.ContainerStatus {
+	return corev1.ContainerStatus{
+		Name:         name,
+		RestartCount: restarts,
+		State:        corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode:   2,
+			StartedAt:  metav1.NewTime(time.Now().Add(-time.Minute)),
+			FinishedAt: metav1.NewTime(time.Now().Add(-10 * time.Second)),
+		}},
+	}
+}
+
+func TestIsContainerInRestartLoopWorkerRestartScore(t *testing.T) {
+	now := time.Now()
+	utils := common.UtilsContainerName
+
+	tests := []struct {
+		name        string
+		score       *WorkerRestartScore
+		status      corev1.ContainerStatus
+		decayPeriod time.Duration
+		want        bool
+	}{
+		{name: "no recorded score counts every restart", status: crashLoopingContainer(utils, 5), want: true},
+		{
+			name:   "recorded score decays over time",
+			score:  &WorkerRestartScore{Score: 4, RestartCount: 5, RecordedAt: now.Add(-2 * time.Hour)},
+			status: crashLoopingContainer(utils, 5),
+		},
+		{
+			name:   "new restarts add to the recorded score",
+			score:  &WorkerRestartScore{Score: 4.5, RestartCount: 5, RecordedAt: now},
+			status: crashLoopingContainer(utils, 6),
+			want:   true,
+		},
+		{
+			name:   "score does not decay below zero",
+			score:  &WorkerRestartScore{Score: 1, RestartCount: 10, RecordedAt: now.Add(-10 * time.Hour)},
+			status: crashLoopingContainer(utils, 14),
+		},
+		{
+			name:        "configured decay period",
+			score:       &WorkerRestartScore{Score: 6, RestartCount: 6, RecordedAt: now.Add(-2 * time.Hour)},
+			status:      crashLoopingContainer(utils, 6),
+			decayPeriod: 4 * time.Hour,
+			want:        true,
+		},
+		{
+			name:   "recorded score above the restart count is ignored",
+			score:  &WorkerRestartScore{Score: 0, RestartCount: 9, RecordedAt: now},
+			status: crashLoopingContainer(utils, 5),
+			want:   true,
+		},
+		{
+			name:   "score does not apply to other containers",
+			score:  &WorkerRestartScore{Score: 0, RestartCount: 3, RecordedAt: now},
+			status: crashLoopingContainer("inference", 3),
+			want:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeConfig := (&TimeConfig{
+				WorkerContainerRestartCountToFailInstance: 5,
+				WorkerContainerRestartScoreDecayPeriod:    tt.decayPeriod,
+			}).Complete()
+			pod := newWorkerRestartScorePod(t, tt.score)
+			assert.Equal(t, tt.want, IsContainerInRestartLoop(pod, tt.status, timeConfig))
+		})
+	}
+
+	t.Run("invalid recorded score counts every restart", func(t *testing.T) {
+		pod := newWorkerRestartScorePod(t, nil)
+		pod.Annotations = map[string]string{WorkerRestartScoreAnnotationKey: "five"}
+		timeConfig := (&TimeConfig{WorkerContainerRestartCountToFailInstance: 5}).Complete()
+		assert.True(t, IsContainerInRestartLoop(pod, crashLoopingContainer(utils, 5), timeConfig))
+	})
+
+	t.Run("count all restarts ignores the recorded score", func(t *testing.T) {
+		pod := newWorkerRestartScorePod(t, &WorkerRestartScore{Score: 0, RestartCount: 5, RecordedAt: now})
+		timeConfig := (&TimeConfig{WorkerContainerRestartCountToFailInstance: 5, CountAllWorkerRestarts: true}).Complete()
+		assert.True(t, IsContainerInRestartLoop(pod, crashLoopingContainer(utils, 5), timeConfig))
+	})
+}
+
+// The worker restarts at a steady interval and NVCA records its score after each restart.
+func TestWorkerRestartScoreOverRestarts(t *testing.T) {
+	tests := []struct {
+		name          string
+		interval      time.Duration
+		restarts      int
+		wantInLoop    bool
+		wantLastScore float64
+	}{
+		{name: "occasional crashes every two hours are kept", interval: 2 * time.Hour, restarts: 10, wantLastScore: 1},
+		{name: "fast loop is replaced", interval: time.Minute, restarts: 6, wantInLoop: true, wantLastScore: 5.92},
+		{name: "slow loop every 15 minutes is replaced", interval: 15 * time.Minute, restarts: 7, wantInLoop: true, wantLastScore: 5.5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeConfig := (&TimeConfig{WorkerContainerRestartCountToFailInstance: 5}).Complete()
+			pod := newWorkerRestartScorePod(t, nil)
+			now := time.Now()
+			var score float64
+			for restart := 1; restart <= tt.restarts; restart++ {
+				now = now.Add(tt.interval)
+				pod.Status.ContainerStatuses = []corev1.ContainerStatus{crashLoopingContainer(common.UtilsContainerName, int32(restart))}
+				value, ok := WorkerRestartScoreToRecord(pod, now, timeConfig)
+				require.True(t, ok)
+				pod.Annotations = map[string]string{WorkerRestartScoreAnnotationKey: value}
+				score = workerRestartScore(pod, int32(restart), now, time.Hour)
+			}
+			assert.InDelta(t, tt.wantLastScore, score, 0.01)
+			assert.Equal(t, tt.wantInLoop, score >= 5)
+		})
+	}
+}
+
+func TestWorkerRestartScoreToRecord(t *testing.T) {
+	now := time.Now()
+	utils := common.UtilsContainerName
+	running := func(name string, restarts int32) corev1.ContainerStatus {
+		return corev1.ContainerStatus{Name: name, RestartCount: restarts}
+	}
+
+	tests := []struct {
+		name       string
+		score      *WorkerRestartScore
+		status     corev1.ContainerStatus
+		wantRecord bool
+		want       WorkerRestartScore
+	}{
+		{name: "worker never restarted", status: running(utils, 0)},
+		{
+			name:       "first restart is recorded",
+			status:     running(utils, 1),
+			wantRecord: true,
+			want:       WorkerRestartScore{Score: 1, RestartCount: 1},
+		},
+		{
+			name:       "restarts from before the score was recorded count",
+			status:     running(utils, 4),
+			wantRecord: true,
+			want:       WorkerRestartScore{Score: 4, RestartCount: 4},
+		},
+		{
+			name:   "restart count unchanged",
+			score:  &WorkerRestartScore{Score: 2, RestartCount: 4, RecordedAt: now.Add(-time.Hour)},
+			status: running(utils, 4),
+		},
+		{
+			name:       "new restart adds to the decayed score",
+			score:      &WorkerRestartScore{Score: 3, RestartCount: 4, RecordedAt: now.Add(-time.Hour)},
+			status:     running(utils, 5),
+			wantRecord: true,
+			want:       WorkerRestartScore{Score: 3, RestartCount: 5},
+		},
+		{
+			name:       "recorded score above the restart count is replaced",
+			score:      &WorkerRestartScore{Score: 1, RestartCount: 9, RecordedAt: now},
+			status:     running(utils, 2),
+			wantRecord: true,
+			want:       WorkerRestartScore{Score: 2, RestartCount: 2},
+		},
+		{name: "other containers are ignored", status: running("inference", 4)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := newWorkerRestartScorePod(t, tt.score, tt.status)
+			value, ok := WorkerRestartScoreToRecord(pod, now, (&TimeConfig{}).Complete())
+			require.Equal(t, tt.wantRecord, ok)
+			if !ok {
+				return
+			}
+			var got WorkerRestartScore
+			require.NoError(t, json.Unmarshal([]byte(value), &got))
+			assert.InDelta(t, tt.want.Score, got.Score, 0.001)
+			assert.Equal(t, tt.want.RestartCount, got.RestartCount)
+			assert.True(t, now.Equal(got.RecordedAt))
+		})
+	}
+
+	t.Run("count all restarts records nothing", func(t *testing.T) {
+		pod := newWorkerRestartScorePod(t, nil, running(utils, 4))
+		_, ok := WorkerRestartScoreToRecord(pod, now, (&TimeConfig{CountAllWorkerRestarts: true}).Complete())
+		assert.False(t, ok)
+	})
 }

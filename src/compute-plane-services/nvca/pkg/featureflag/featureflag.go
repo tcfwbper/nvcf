@@ -99,6 +99,10 @@ var (
 	// kick-off. Disabled by default. Per-cluster + per-function-version
 	// overrides land in a follow-up CRD update.
 	NvSnapCheckpointRestore = newFeatureFlag("NvSnapCheckpointRestore", newBool(false))
+
+	// CountAllWorkerRestarts counts every NVCA worker container restart toward the worker restart threshold. When
+	// off, the worker restart score drops by 1 every worker restart score decay period.
+	CountAllWorkerRestarts = newFeatureFlag("CountAllWorkerRestarts", newBool(false))
 )
 
 // Feature flags for migrating resource limits.

@@ -563,6 +563,9 @@ type NVCFWorkerConfig struct {
 	// WorkerContainerRestartCountToFailInstance overrides the NVCA worker (utils) container restart count at
 	// which NVCA marks an instance failed. Other containers always use 3. Zero uses the NVCA default.
 	WorkerContainerRestartCountToFailInstance int32 `json:"workerContainerRestartCountToFailInstance,omitempty"`
+	// WorkerContainerRestartScoreDecayPeriod overrides how long it takes the NVCA worker (utils) container restart
+	// score to drop by 1. Zero uses the NVCA default.
+	WorkerContainerRestartScoreDecayPeriod time.Duration `json:"workerContainerRestartScoreDecayPeriod,omitempty"`
 }
 
 type AgentConfig struct {

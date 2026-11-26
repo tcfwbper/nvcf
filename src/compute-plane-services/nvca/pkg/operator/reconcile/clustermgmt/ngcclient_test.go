@@ -22,11 +22,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"encoding/base64"
 
@@ -955,6 +958,39 @@ func TestWithAgentConfigMapper(t *testing.T) {
 			require.NoError(t, err, value)
 			assert.Equal(t, int32(0), dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance, value)
 			assert.Equal(t, "high-priority", dest.NVCFBackend.Spec.AgentConfig.DeploymentConfig.PriorityClassName, value)
+		}
+	})
+
+	t.Run("worker container restart score decay period minutes", func(t *testing.T) {
+		maxMinutes := int64(math.MaxInt64 / time.Minute)
+		tests := []struct {
+			name  string
+			value string
+			want  time.Duration
+		}{
+			{name: "maps minutes", value: "45", want: 45 * time.Minute},
+			{name: "largest value that fits a duration", value: strconv.FormatInt(maxMinutes, 10), want: time.Duration(maxMinutes) * time.Minute},
+			{name: "zero is unset", value: "0"},
+			{name: "negative is unset", value: "-5"},
+			{name: "duration string is unset", value: "30m"},
+			{name: "value past the duration range is unset", value: strconv.FormatInt(maxMinutes+1, 10)},
+			{name: "value past int64 is unset", value: "99999999999999999999"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				src := &clusterDTO{
+					ClusterConfigurations: CaseInsensitiveClusterConfigMap{
+						NVCAWorkerContainerRestartScoreDecayPeriodMinutesConfig: tt.value,
+						NVCFWorkerDegradationPeriodMinutesConfig:                "90",
+					},
+				}
+				dest := &Cluster{NVCFBackend: &nvidiaiov1.NVCFBackend{}}
+
+				require.NoError(t, withAgentConfigMapper()(ctx, nvidiaiov1.EnvTypeProd, src, dest))
+				workerConfig := dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig
+				assert.Equal(t, tt.want, workerConfig.WorkerContainerRestartScoreDecayPeriod)
+				assert.Equal(t, 90*time.Minute, workerConfig.WorkerDegradationPeriod, "other settings are still mapped")
+			})
 		}
 	})
 

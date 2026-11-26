@@ -18,6 +18,7 @@ limitations under the License.
 package k8sutil
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -37,7 +38,20 @@ const (
 	ImagePullIssueReason          = "ErrImagePull"
 	ImagePullIssueAlternateReason = "ImagePullBackOff"
 	RestartCountToFailInstance    = int32(3)
+	// WorkerRestartScoreAnnotationKey holds the NVCA worker container's WorkerRestartScore as JSON.
+	WorkerRestartScoreAnnotationKey = "nvca.nvcf.nvidia.io/worker-restart-score"
 )
+
+// WorkerRestartScore is the NVCA worker container restart score recorded on its Pod. Each worker restart adds 1, and
+// the score drops by 1 every WorkerContainerRestartScoreDecayPeriod, never below 0.
+type WorkerRestartScore struct {
+	// Score is the score at RecordedAt.
+	Score float64 `json:"score"`
+	// RestartCount is the worker container RestartCount included in Score.
+	RestartCount int32 `json:"restartCount"`
+	// RecordedAt is when Score was recorded.
+	RecordedAt time.Time `json:"recordedAt"`
+}
 
 // IsPodReady returns true if a pod is ready; false otherwise.
 func IsPodReady(podStatus corev1.PodStatus) bool {
@@ -297,21 +311,79 @@ type ContainerStuckInitializing struct {
 	Message string
 }
 
-// IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times, or
-// WorkerContainerRestartCountToFailInstance times for the NVCA worker container, in a Pod launched more than
-// PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during the Pod's lifetime, so a
-// container whose latest run exited with code 0 after the Pod became Ready is not counted: the app ended on purpose
-// (for example a streaming app that quits when its session ends) and the kubelet restarted it in place.
+// IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times in a
+// Pod launched more than PodLaunchThresholdSecondsOnFailedRestarts ago. For the NVCA worker container, its restart
+// score must reach WorkerContainerRestartCountToFailInstance instead, unless CountAllWorkerRestarts is set. RestartCount
+// is never reset during the Pod's lifetime, so a container whose latest run exited with code 0 after the Pod became
+// Ready is not counted: the app ended on purpose (for example a streaming app that quits when its session ends) and
+// the kubelet restarted it in place.
 func IsContainerInRestartLoop(pod *corev1.Pod, cs corev1.ContainerStatus, k8sTimeConfig *TimeConfig) bool {
 	threshold := RestartCountToFailInstance
+	restartScore := float64(cs.RestartCount)
 	if isWorkerContainer(pod, cs.Name) {
 		threshold = k8sTimeConfig.workerRestartCountToFailInstance()
+		if !k8sTimeConfig.CountAllWorkerRestarts {
+			restartScore = workerRestartScore(pod, cs.RestartCount, time.Now(), k8sTimeConfig.workerRestartScoreDecayPeriod())
+		}
 	}
-	if cs.RestartCount < threshold ||
+	if restartScore < float64(threshold) ||
 		!IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
 		return false
 	}
 	return !exitedCleanlyAfterPodReady(pod.Status, cs)
+}
+
+// WorkerRestartScoreToRecord returns the WorkerRestartScoreAnnotationKey value to record on the Pod, and false when
+// the recorded score already includes the worker container's RestartCount or CountAllWorkerRestarts is set.
+func WorkerRestartScoreToRecord(pod *corev1.Pod, now time.Time, k8sTimeConfig *TimeConfig) (string, bool) {
+	if k8sTimeConfig.CountAllWorkerRestarts {
+		return "", false
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if !isWorkerContainer(pod, cs.Name) {
+			continue
+		}
+		recorded, ok := recordedWorkerRestartScore(pod)
+		if (ok && recorded.RestartCount == cs.RestartCount) || (!ok && cs.RestartCount == 0) {
+			return "", false
+		}
+		value, err := json.Marshal(WorkerRestartScore{
+			Score:        workerRestartScore(pod, cs.RestartCount, now, k8sTimeConfig.workerRestartScoreDecayPeriod()),
+			RestartCount: cs.RestartCount,
+			RecordedAt:   now.UTC(),
+		})
+		if err != nil {
+			return "", false
+		}
+		return string(value), true
+	}
+	return "", false
+}
+
+// workerRestartScore returns the worker container restart score at now: the recorded score after decay, plus the
+// restarts since it was recorded. Without a valid recorded score, or with one above the current RestartCount (for
+// example after a node reboot reset the count), every restart counts.
+func workerRestartScore(pod *corev1.Pod, restartCount int32, now time.Time, decayPeriod time.Duration) float64 {
+	recorded, ok := recordedWorkerRestartScore(pod)
+	if !ok || recorded.RestartCount > restartCount {
+		return float64(restartCount)
+	}
+	decayed := recorded.Score - float64(max(now.Sub(recorded.RecordedAt), 0))/float64(decayPeriod)
+	return max(decayed, 0) + float64(restartCount-recorded.RestartCount)
+}
+
+// recordedWorkerRestartScore returns the score recorded on the Pod, and false when it is missing or invalid.
+func recordedWorkerRestartScore(pod *corev1.Pod) (WorkerRestartScore, bool) {
+	value, ok := pod.Annotations[WorkerRestartScoreAnnotationKey]
+	if !ok {
+		return WorkerRestartScore{}, false
+	}
+	var score WorkerRestartScore
+	if err := json.Unmarshal([]byte(value), &score); err != nil ||
+		score.Score < 0 || score.RestartCount < 0 || score.RecordedAt.IsZero() {
+		return WorkerRestartScore{}, false
+	}
+	return score, true
 }
 
 // exitedCleanlyAfterPodReady reports whether the container's latest run exited with code 0 and the Pod was

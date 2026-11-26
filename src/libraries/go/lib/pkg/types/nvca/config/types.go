@@ -1145,6 +1145,7 @@ const (
 	defaultFailingObjectsBackoffTimeout              = 90 * time.Second
 	defaultFailingObjectsBackoffRequeueInterval      = 30 * time.Second
 	defaultWorkerContainerRestartCountToFailInstance = int32(3)
+	defaultWorkerContainerRestartScoreDecayPeriod    = time.Hour
 )
 
 type WorkloadTimeConfig struct {
@@ -1181,6 +1182,10 @@ type WorkloadTimeConfig struct {
 	// WorkerContainerRestartCountToFailInstance is the NVCA worker container restart count at which a Pod is
 	// considered to be in a restart loop and its instance is marked failed. Other containers always use 3.
 	WorkerContainerRestartCountToFailInstance int32 `yaml:",omitempty"`
+	// WorkerContainerRestartScoreDecayPeriod is how long it takes the NVCA worker container restart score to drop
+	// by 1. Each worker restart adds 1, and the instance is marked failed when the score reaches
+	// WorkerContainerRestartCountToFailInstance.
+	WorkerContainerRestartScoreDecayPeriod time.Duration `yaml:",omitempty"`
 }
 
 // Complete sets defaults on WorkloadTimeConfig. It panics if some field is not set or defaulted.
@@ -1232,6 +1237,9 @@ func (t WorkloadTimeConfig) Complete() WorkloadTimeConfig {
 	}
 	if t.WorkerContainerRestartCountToFailInstance <= 0 {
 		t.WorkerContainerRestartCountToFailInstance = defaultWorkerContainerRestartCountToFailInstance
+	}
+	if t.WorkerContainerRestartScoreDecayPeriod <= 0 {
+		t.WorkerContainerRestartScoreDecayPeriod = defaultWorkerContainerRestartScoreDecayPeriod
 	}
 
 	panicOnUnsetFields(t)

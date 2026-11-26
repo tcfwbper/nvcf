@@ -121,6 +121,19 @@ agent:
 		assert.Empty(t, cfg.HelmReValStageOAuthTokenURL)
 	})
 
+	t.Run("maps oauth endpoints when the worker restart threshold is invalid", func(t *testing.T) {
+		cfg, found, err := AgentConfigFromClusterDTO(context.Background(), `
+agent:
+  helmReValStageOAuthTokenURL: "https://chart-stage-reval-oauth.example.test/token"
+clusterConfigurations:
+  NVCAWorkerContainerRestartCountToFailInstance: "five"
+`)
+		require.NoError(t, err)
+		require.True(t, found)
+		assert.Equal(t, "https://chart-stage-reval-oauth.example.test/token", cfg.HelmReValStageOAuthTokenURL)
+		assert.Zero(t, cfg.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance)
+	})
+
 	t.Run("invalid yaml returns an error", func(t *testing.T) {
 		_, found, err := AgentConfigFromClusterDTO(context.Background(), "agent: [")
 		require.Error(t, err)

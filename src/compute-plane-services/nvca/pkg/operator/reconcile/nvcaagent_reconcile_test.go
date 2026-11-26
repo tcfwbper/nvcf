@@ -1019,6 +1019,7 @@ func TestSetupNVCADeployment_SelfHosted(t *testing.T) {
 			CacheMountOptions:                         "ro",
 			WorkerDegradationPeriod:                   5 * time.Hour,
 			WorkerContainerRestartCountToFailInstance: 5,
+			WorkerContainerRestartScoreDecayPeriod:    45 * time.Minute,
 		},
 		workloadTolerations: []corev1.Toleration{{
 			Key:      "nvidia.com/test-workload",
@@ -1136,6 +1137,7 @@ func TestSetupNVCADeployment_SelfHosted(t *testing.T) {
 			WorkloadTimeConfig: nvcaconfig.WorkloadTimeConfig{
 				WorkerDegradationTimeout:                  5 * time.Hour,
 				WorkerContainerRestartCountToFailInstance: 5,
+				WorkerContainerRestartScoreDecayPeriod:    45 * time.Minute,
 			},
 			Tolerations: []corev1.Toleration{{
 				Key:      "nvidia.com/test-workload",
@@ -2849,16 +2851,18 @@ func TestBackendK8sCacheBuilder_WithNVCAConfig(t *testing.T) {
 		CacheMountOptions:                         "ro,noatime,nouuid",
 		WorkerDegradationPeriod:                   2 * time.Hour,
 		WorkerContainerRestartCountToFailInstance: 5,
+		WorkerContainerRestartScoreDecayPeriod:    45 * time.Minute,
 	}
 
 	newBuilder := builder.WithNVCFWorkerConfig(config.CacheMountOptionsEnabled, config.CacheMountOptions, config.WorkerDegradationPeriod,
-		config.WorkerContainerRestartCountToFailInstance)
+		config.WorkerContainerRestartCountToFailInstance, config.WorkerContainerRestartScoreDecayPeriod)
 
 	// Verify the builder was updated correctly
 	assert.Equal(t, config.CacheMountOptionsEnabled, newBuilder.nvcfWorkerConfig.CacheMountOptionsEnabled)
 	assert.Equal(t, config.CacheMountOptions, newBuilder.nvcfWorkerConfig.CacheMountOptions)
 	assert.Equal(t, config.WorkerDegradationPeriod, newBuilder.nvcfWorkerConfig.WorkerDegradationPeriod)
 	assert.Equal(t, config.WorkerContainerRestartCountToFailInstance, newBuilder.nvcfWorkerConfig.WorkerContainerRestartCountToFailInstance)
+	assert.Equal(t, config.WorkerContainerRestartScoreDecayPeriod, newBuilder.nvcfWorkerConfig.WorkerContainerRestartScoreDecayPeriod)
 
 	// Verify original builder was updated
 	assert.Equal(t, newBuilder.nvcfWorkerConfig, builder.nvcfWorkerConfig)
@@ -3295,6 +3299,40 @@ func TestNewAgentConfig_CRTolerationsTakePrecedence(t *testing.T) {
 	cfg, err := bc.newAgentConfig(ctx, nb)
 	require.NoError(t, err)
 	assert.Equal(t, crTolerations, cfg.Agent.Tolerations)
+}
+
+func TestMergeAgentConfigs_WorkerContainerRestartScoreDecayPeriod(t *testing.T) {
+	tests := []struct {
+		name          string
+		clusterSource nvcaoptypes.ClusterSource
+		specValue     time.Duration
+		helmValue     time.Duration
+		want          time.Duration
+	}{
+		{name: "ngc-managed falls back to the helm value", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, helmValue: time.Hour, want: time.Hour},
+		{name: "ngc-managed explicit value wins", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, specValue: 45 * time.Minute, helmValue: time.Hour, want: 45 * time.Minute},
+		{name: "ngc-managed with neither set stays unset", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, want: 0},
+		{name: "helm-managed uses the helm value", clusterSource: nvcaoptypes.ClusterSourceHelmManaged, specValue: 45 * time.Minute, helmValue: time.Hour, want: time.Hour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bc := &BackendK8sCache{
+				nvcfWorkerConfig: nvidiaiov1.NVCFWorkerConfig{WorkerContainerRestartScoreDecayPeriod: tt.helmValue},
+			}
+			nb := &nvidiaiov1.NVCFBackend{
+				Spec: nvidiaiov1.NVCFBackendSpec{
+					NVCFBackendSpecT: nvidiaiov1.NVCFBackendSpecT{
+						ClusterSource: tt.clusterSource,
+						AgentConfig: nvidiaiov1.AgentConfig{
+							NVCFWorkerConfig: nvidiaiov1.NVCFWorkerConfig{WorkerContainerRestartScoreDecayPeriod: tt.specValue},
+						},
+					},
+				},
+			}
+			got := bc.mergeAgentConfigs(nb).NVCFWorkerConfig.WorkerContainerRestartScoreDecayPeriod
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestMergeAgentConfigs_WorkerContainerRestartThreshold(t *testing.T) {

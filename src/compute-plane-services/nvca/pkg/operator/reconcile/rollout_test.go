@@ -20,6 +20,7 @@ package operator
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -1336,6 +1337,24 @@ func TestHasAgentWorkerConfigChanged_DynamicConfigNoRepeatedRollout(t *testing.T
 			},
 			expectedRollout: true,
 			description:     "Container restart threshold changed, should trigger rollout",
+		},
+		{
+			name:           "rollout when NGC worker restart score decay period changes",
+			version:        "v2.44.0",
+			bcWorkerConfig: nvidiaiov1.NVCFWorkerConfig{},
+			nbSpecWorkerConfig: nvidiaiov1.NVCFWorkerConfig{
+				CacheMountOptionsEnabled:               true,
+				CacheMountOptions:                      "local",
+				WorkerDegradationPeriod:                300000000000,
+				WorkerContainerRestartScoreDecayPeriod: 45 * time.Minute,
+			},
+			nbStatusWorkerConfig: nvidiaiov1.NVCFWorkerConfig{
+				CacheMountOptionsEnabled: true,
+				CacheMountOptions:        "local",
+				WorkerDegradationPeriod:  300000000000,
+			},
+			expectedRollout: true,
+			description:     "Worker restart score decay period changed, should trigger rollout",
 		},
 	}
 
