@@ -26,6 +26,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -102,34 +104,134 @@ func countDistinctGPUDevices(pids []int, log *logrus.Entry) int {
 // errNoNvidiaSMI: the node has no nvidia-smi, so no GPU to query.
 var errNoNvidiaSMI = errors.New("no nvidia-smi on this node")
 
-// hostNvidiaSMI runs the host's nvidia-smi with args, with the driver's
-// shared libraries it needs; errNoNvidiaSMI when the node has none.
+// nvidiaSMIRoots are the filesystem roots, seen from the agent, that may
+// hold the node's nvidia-smi, with its path in each: the driver
+// container's root, then the host's.
+var nvidiaSMIRoots = []struct{ root, bin string }{
+	{"/host/run/nvidia/driver", "usr/bin/nvidia-smi"},
+	{"/host", "usr/bin/nvidia-smi"},
+	{"/host", "usr/local/nvidia/bin/nvidia-smi"},
+}
+
+// hostNvidiaSMI runs the host's nvidia-smi with args; errNoNvidiaSMI when
+// the node has none.
+//
+// It runs under the dynamic loader of the root it is found in, with that
+// root's libraries: run by the agent image's loader, it would load the
+// root's libc against the image's loader, and a glibc of another version
+// fails every run (exit 127, "symbol lookup error ... GLIBC_PRIVATE",
+// seen on GB300 nodes whose driver runs in a container).
 func hostNvidiaSMI(args ...string) ([]byte, error) {
-	nvidiaSmi := ""
-	if p, err := exec.LookPath("nvidia-smi"); err == nil {
-		nvidiaSmi = p
+	name, argv, err := nvidiaSMICommand(nvidiaSMIRoots, args)
+	if err != nil {
+		return nil, err
 	}
-	for _, p := range []string{
-		"/host/run/nvidia/driver/usr/bin/nvidia-smi",
-		"/host/usr/bin/nvidia-smi",
-		"/host/usr/local/nvidia/bin/nvidia-smi",
-	} {
-		if _, err := os.Stat(p); err == nil {
-			nvidiaSmi = p
-			break
-		}
-	}
-	if nvidiaSmi == "" {
-		return nil, errNoNvidiaSMI
-	}
-	cmd := exec.Command(nvidiaSmi, args...) //nolint:gosec // a fixed binary path, fixed query arguments
-	cmd.Env = append(os.Environ(),
-		"LD_LIBRARY_PATH="+hostlibs.DriverDir("/host/run/nvidia/driver")+":/usr/local/nvidia/lib64")
+	cmd := exec.Command(name, argv...) //nolint:gosec // a fixed binary path, fixed query arguments
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", nvidiaSmi, strings.Join(args, " "), err)
+		return nil, fmt.Errorf("%s %s: %w", name, strings.Join(argv, " "), err)
 	}
 	return out, nil
+}
+
+// nvidiaSMICommand is the command that runs the first nvidia-smi found in
+// roots with args, under its root's loader; else the agent image's own
+// nvidia-smi, run directly.
+func nvidiaSMICommand(roots []struct{ root, bin string }, args []string) (string, []string, error) {
+	for _, r := range roots {
+		bin := resolveInRoot(r.root, r.bin)
+		if fi, err := os.Stat(bin); bin == "" || err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		loader := rootLoader(r.root)
+		if loader == "" {
+			return "", nil, fmt.Errorf("%s: no dynamic loader in %s to run it with", bin, r.root)
+		}
+		var dirs []string
+		for _, rel := range []string{
+			"usr/lib/" + hostlibs.Triplet(),
+			"lib/" + hostlibs.Triplet(),
+			"lib64",
+			"usr/lib64",
+			"usr/local/nvidia/lib64",
+		} {
+			d := resolveInRoot(r.root, rel)
+			if fi, err := os.Stat(d); d != "" && err == nil && fi.IsDir() && !slices.Contains(dirs, d) {
+				dirs = append(dirs, d)
+			}
+		}
+		return loader, append([]string{"--library-path", strings.Join(dirs, ":"), bin}, args...), nil
+	}
+	if p, err := exec.LookPath("nvidia-smi"); err == nil {
+		return p, args, nil
+	}
+	return "", nil, errNoNvidiaSMI
+}
+
+// rootLoader returns the dynamic loader of the filesystem at root for the
+// agent's own architecture (the node's), or "": a root may also hold
+// another architecture's loader, which cannot run here.
+func rootLoader(root string) string {
+	name := "ld-linux-x86-64.so.2"
+	if runtime.GOARCH == "arm64" {
+		name = "ld-linux-aarch64.so.1"
+	}
+	for _, dir := range []string{"lib", "lib64", "usr/lib/" + hostlibs.Triplet(), "lib/" + hostlibs.Triplet()} {
+		if p := resolveInRoot(root, dir+"/"+name); p != "" {
+			if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// resolveInRoot follows the symlinks of rel (relative to root), every
+// path component of it, as root's own processes would see them: an
+// absolute target is root's, not the agent's. It returns the path reached
+// (a regular file or a directory, seen from the agent), or "".
+func resolveInRoot(root, rel string) string {
+	root = filepath.Clean(root)
+	todo := strings.Split(filepath.Clean("/"+rel), "/")[1:]
+	cur := "" // resolved so far, relative to root, "/"-rooted
+	for hops := 0; len(todo) > 0; {
+		c := todo[0]
+		todo = todo[1:]
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir("/" + cur)
+			if cur == "/" {
+				cur = ""
+			}
+			continue
+		}
+		next := cur + "/" + c
+		fi, err := os.Lstat(root + next)
+		if err != nil {
+			return ""
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		if hops++; hops > 40 {
+			return ""
+		}
+		t, err := os.Readlink(root + next)
+		if err != nil {
+			return ""
+		}
+		if filepath.IsAbs(t) {
+			cur = ""
+		}
+		todo = append(strings.Split(t, "/"), todo...)
+	}
+	if fi, err := os.Lstat(root + cur); err == nil && (fi.Mode().IsRegular() || fi.IsDir()) && cur != "" {
+		return filepath.Join(root, cur)
+	}
+	return ""
 }
 
 // MappedFileEntry describes a memory-mapped file discovered during checkpoint.
