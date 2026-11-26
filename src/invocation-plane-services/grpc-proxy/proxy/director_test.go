@@ -43,6 +43,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -1942,5 +1944,32 @@ func TestHijackHandlerCountsShutdownRejection(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(counter) - before; got != 1 {
 		t.Fatalf("expected one %s CONNECT, got %v", metrics.ConnectRegisterFailed, got)
+	}
+}
+
+// A new session has no incoming request ID, so a dispatch failure logs the
+// minted request ID and the caller's NCA ID.
+func TestDispatchFailureLogsTheMintedRequest(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	t.Cleanup(zap.ReplaceGlobals(zap.New(core)))
+	minted := invocation.WorkerAuth{Token: "token", RequestId: uuid.New(), FunctionId: testFunctionId, FunctionVersionId: testFunctionVersionId, CallerNcaId: "caller-nca"}
+	director := NewStreamDirector(FunctionInvokerFunc(func(_ context.Context, _ net.Conn, _, _, _ string, _ *uuid.UUID, onWorkerAuth func(invocation.WorkerAuth)) (invocation.Result, context.CancelFunc, error) {
+		onWorkerAuth(minted)
+		return invocation.Result{}, nil, errors.New("publish failed")
+	}))
+	defer director.Close()
+
+	_, err := director.getAndInitWorkerConnection(context.Background(), worker.NewConnectionTrackingConn(&net.TCPConn{}), "Bearer test-auth", testFunctionId, testFunctionVersionId, nil)
+
+	if err == nil {
+		t.Fatal("expected the dispatch failure to be returned")
+	}
+	entries := logs.FilterMessage("failed to open stateful work request").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected one failure log, got %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["dispatched request id"] != minted.RequestId.String() || fields["caller_nca_id"] != "caller-nca" {
+		t.Errorf("failure log fields = %v", fields)
 	}
 }

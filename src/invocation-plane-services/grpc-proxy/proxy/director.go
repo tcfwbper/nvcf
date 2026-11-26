@@ -877,10 +877,14 @@ func (s *StreamDirector) getAndInitWorkerConnection(ctx context.Context, conn *w
 		if err != nil {
 			// An error after the callback is the dispatch failing. Earlier errors
 			// come from unverified or rejected callers and are not published.
+			fields := []zap.Field{zap.Error(err), zap.String("function id", functionId), zap.Stringer("request id", requestId)}
 			if minted.Token != "" {
 				s.eventLedger.Publish(ctx, newDispatchFailed(minted, time.Now()))
+				// A new session has no incoming request ID; the minted one
+				// identifies the request that failed to dispatch.
+				fields = append(fields, zap.Stringer("dispatched request id", minted.RequestId), zap.String("caller_nca_id", minted.CallerNcaId))
 			}
-			zap.L().Warn("failed to open stateful work request", zap.Error(err), zap.String("function id", functionId), zap.Stringer("request id", requestId))
+			zap.L().Warn("failed to open stateful work request", fields...)
 			return nil, fmt.Errorf("failed to open stateful work request: %w", err)
 		}
 		// Remembered until the worker CONNECTs back, so a shutdown can find the

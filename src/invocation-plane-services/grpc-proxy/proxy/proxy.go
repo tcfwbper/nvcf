@@ -159,10 +159,18 @@ func NewNVCFProxy(logger *logs.ZapLogger, config Config) (*NVCFProxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	nc, err := invocation.NewNatsConnection(config.NatsFqdn, config.NatsPrivateNKey, serviceName, config.OAuth2Fqdn, config.SecretsPath)
+	natsConns, err := invocation.NewNatsConnections(config.NatsFqdn, config.NatsPrivateNKey, serviceName, config.OAuth2Fqdn, config.SecretsPath)
 	if err != nil {
 		return nil, err
 	}
+	// The invoker closes the connections at shutdown. If setup fails first,
+	// close them here.
+	started := false
+	defer func() {
+		if !started {
+			natsConns.Close()
+		}
+	}()
 
 	var geoLookup interface {
 		LookupRegions(ctx context.Context, clientIP net.IP) []string
@@ -190,7 +198,7 @@ func NewNVCFProxy(logger *logs.ZapLogger, config Config) (*NVCFProxy, error) {
 		rateLimit = &ratelimit.NoOpRateLimitService{}
 	}
 
-	invoker, err := invocation.NewFunctionInvoker(nc, nvcfClient, connectPaths, config.JetstreamPlacementTag, config.AWSRegion, geoLookup, rateLimit)
+	invoker, err := invocation.NewFunctionInvoker(natsConns, nvcfClient, connectPaths, config.JetstreamPlacementTag, config.AWSRegion, geoLookup, rateLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +244,7 @@ func NewNVCFProxy(logger *logs.ZapLogger, config Config) (*NVCFProxy, error) {
 		},
 	}
 
-	healthManager, err := healthManager(config.NVCFFqdn, nc)
+	healthManager, err := healthManager(config.NVCFFqdn, natsConns)
 	if err != nil {
 		return nil, err
 	}
@@ -271,6 +279,7 @@ func NewNVCFProxy(logger *logs.ZapLogger, config Config) (*NVCFProxy, error) {
 	}
 
 	hostname, _ := os.Hostname()
+	started = true
 	return &NVCFProxy{
 		director:    director,
 		http3Server: http3Server,
@@ -309,7 +318,7 @@ func NewNVCFProxy(logger *logs.ZapLogger, config Config) (*NVCFProxy, error) {
 			servers.WithLogger(logger),
 			servers.WithRegisterServer(func(server *grpc.Server) {}),
 			servers.WithHttpHealthEndpoints("/health"),
-			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/livez": livenessHandler(nc)}),
+			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/livez": livenessHandler(natsConns)}),
 			servers.WithAdditionalServers(serverPairs...),
 		),
 	}, nil

@@ -27,18 +27,60 @@ import (
 	"math/rand"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/auth"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/credentials"
 
 	"nvcf-grpc-proxy/proxy/metrics"
 )
 
-func NewNatsConnection(natsFqdn, nKeySeed, serviceName, oauth2Fqdn, secretsPath string) (*nats.Conn, error) {
+// NatsConnections are the two NATS connections a proxy keeps.
+//
+// Shared carries lookups, purges and subscriptions and keeps nats.go's reconnect
+// buffer: a purge queued during an outage still removes dead work when it is
+// sent. Dispatch carries only the sends that must not go out late, which are LLS
+// dispatches, work items and session joins. It has no reconnect buffer, so
+// nats.go rejects a send made while it is reconnecting instead of keeping it and
+// sending it after the outage, when nobody is waiting for it. waitConnected only
+// keeps a send from trying while the connection is down; nats.go makes the final
+// decision under its own lock when the send is made.
+//
+// This does not bound how late a send goes out. A send can wait on nats.go's
+// lock while a reconnect attempt holds it and go out once that attempt
+// succeeds, after its caller's deadline.
+type NatsConnections struct {
+	Shared        *nats.Conn
+	SharedState   *ConnState
+	Dispatch      *nats.Conn
+	DispatchState *ConnState
+}
+
+// Connected reports whether both connections are up. A pod needs both to
+// serve: the dispatch connection to send work and the shared one to look up
+// and purge it.
+func (c *NatsConnections) Connected() bool {
+	return c.SharedState.Connected() && c.DispatchState.Connected()
+}
+
+// Closed reports whether either connection has closed. nats.go never reopens a
+// closed connection, so the pod cannot serve until it restarts.
+func (c *NatsConnections) Closed() bool {
+	return c.SharedState.Closed() || c.DispatchState.Closed()
+}
+
+// Close closes both connections.
+func (c *NatsConnections) Close() {
+	c.Dispatch.Close()
+	c.Shared.Close()
+}
+
+func NewNatsConnections(natsFqdn, nKeySeed, serviceName, oauth2Fqdn, secretsPath string) (*NatsConnections, error) {
 	var natsAuthOption nats.Option
 	if nKeySeed != "" {
 		var err error
@@ -55,17 +97,94 @@ func NewNatsConnection(natsFqdn, nKeySeed, serviceName, oauth2Fqdn, secretsPath 
 			return nil, err
 		}
 	}
+	return connectNats(natsFqdn, serviceName, natsAuthOption)
+}
 
-	nc, err := nats.Connect(natsFqdn, connectOptions(serviceName, natsAuthOption)...)
+// connectNats opens both connections, or neither: if the dispatch connection
+// fails, the shared one is closed. extra options apply to both.
+func connectNats(natsFqdn, serviceName string, authOption nats.Option, extra ...nats.Option) (*NatsConnections, error) {
+	sharedState := newConnState(metrics.NatsConnectionShared)
+	shared, err := nats.Connect(natsFqdn, append(connectOptions(serviceName, authOption, sharedState), extra...)...)
 	if err != nil {
 		recordNatsStartupFailure("nats initial connection failed", err)
 		return nil, err
 	}
-	metrics.SetNatsStatsConnection(nc)
-	return nc, nil
+	dispatchState := newConnState(metrics.NatsConnectionDispatch)
+	dispatch, err := nats.Connect(natsFqdn, append(dispatchConnectOptions(serviceName, authOption, dispatchState), extra...)...)
+	if err != nil {
+		shared.Close()
+		recordNatsStartupFailure("nats initial dispatch connection failed", err)
+		return nil, err
+	}
+	metrics.SetNatsStatsConnections(shared, dispatch)
+	return &NatsConnections{
+		Shared:        shared,
+		SharedState:   sharedState,
+		Dispatch:      dispatch,
+		DispatchState: dispatchState,
+	}, nil
 }
 
-func connectOptions(serviceName string, authOption nats.Option) []nats.Option {
+// ConnState mirrors a connection's state from nats.go's callbacks, so reading
+// it never takes the connection's lock. nats.go holds that lock through each
+// reconnect attempt, including the dial, the token fetch and the wait for the
+// server, so IsConnected, IsClosed and Status can block for seconds while
+// reconnecting. Callbacks are delivered in order on one goroutine, so the state
+// trails the connection only by that delivery delay, as long as no callback
+// blocks. The callbacks in connectOptions never call a method that takes the
+// lock.
+type ConnState struct {
+	name      string
+	connected atomic.Bool
+	closed    atomic.Bool
+	gauge     prometheus.Gauge
+}
+
+func newConnState(name string) *ConnState {
+	return &ConnState{name: name, gauge: metrics.NatsConnected.WithLabelValues(name)}
+}
+
+// Connected reports whether the connection is up.
+func (s *ConnState) Connected() bool {
+	return s.connected.Load()
+}
+
+// Closed reports whether the connection has closed. nats.go never reopens a
+// closed connection.
+func (s *ConnState) Closed() bool {
+	return s.closed.Load()
+}
+
+func (s *ConnState) setConnected(connected bool) {
+	s.connected.Store(connected)
+	if s.gauge == nil {
+		return
+	}
+	if connected {
+		s.gauge.Set(1)
+	} else {
+		s.gauge.Set(0)
+	}
+}
+
+// dispatchConnectOptions are connectOptions without the reconnect buffer, for
+// the dispatch connection.
+//
+// UseOldRequestStyle gives each request its own reply subscription, which
+// nats.go removes even when the publish fails. In the default style a request
+// whose publish fails leaves its reply handler registered until the connection
+// closes, and this connection rejects every publish made while it is
+// reconnecting and never closes.
+func dispatchConnectOptions(serviceName string, authOption nats.Option, state *ConnState) []nats.Option {
+	return append(connectOptions(serviceName+"-dispatch", authOption, state),
+		nats.ReconnectBufSize(-1),
+		nats.UseOldRequestStyle())
+}
+
+// connectOptions never call a method on the connection that takes its lock, such
+// as ConnectedServerName. A callback blocked on the lock would hold back the
+// callbacks queued behind it, leaving ConnState showing a stale state.
+func connectOptions(serviceName string, authOption nats.Option, state *ConnState) []nats.Option {
 	return []nats.Option{nats.PingInterval(10 * time.Second), authOption,
 		// Nothing replaces a closed connection, and readiness stays down while it is
 		// closed, so keep reconnecting through long outages. Without
@@ -78,12 +197,12 @@ func connectOptions(serviceName string, authOption nats.Option) []nats.Option {
 			go func() {
 				// TODO remove when the SDK natively handles reconnects on lame duck
 				time.Sleep(time.Duration(rand.Int63n(int64(time.Second * 10))))
-				zap.L().Info("got lame duck message, force reconnecting")
+				zap.L().Info("got lame duck message, force reconnecting", zap.String("connection", state.name))
 				_ = conn.ForceReconnect()
 			}()
-		}), nats.ReconnectHandler(func(conn *nats.Conn) {
-			// TODO maybe we want to lock the connection until we are reconnected to prevent errors
-			zap.L().Info("reconnected to nats", zap.String("server", conn.ConnectedServerName()), zap.String("cluster", conn.ConnectedClusterName()))
+		}), nats.ReconnectHandler(func(*nats.Conn) {
+			state.setConnected(true)
+			zap.L().Info("reconnected to nats", zap.String("connection", state.name))
 			metrics.NatsReconnectCounter.Inc()
 		}), nats.Name(serviceName),
 		nats.ErrorHandler(func(nc *nats.Conn, sub *nats.Subscription, err error) {
@@ -91,9 +210,15 @@ func connectOptions(serviceName string, authOption nats.Option) []nats.Option {
 		}), nats.ReconnectErrHandler(func(conn *nats.Conn, err error) {
 			recordNatsFailure("nats reconnect failed", err)
 		}), nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
+			state.setConnected(false)
 			recordNatsDisconnect(err)
-		}), nats.ConnectHandler(func(conn *nats.Conn) {
-			zap.L().Info("connected to nats", zap.String("server", conn.ConnectedServerName()), zap.String("cluster", conn.ConnectedClusterName()))
+		}), nats.ConnectHandler(func(*nats.Conn) {
+			state.setConnected(true)
+			zap.L().Info("connected to nats", zap.String("connection", state.name))
+		}), nats.ClosedHandler(func(*nats.Conn) {
+			state.setConnected(false)
+			state.closed.Store(true)
+			zap.L().Warn("nats connection closed", zap.String("connection", state.name))
 		})}
 }
 

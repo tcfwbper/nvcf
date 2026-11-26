@@ -110,60 +110,68 @@ var (
 			Help:      "time to deliver an event to the event ledger, including retries",
 		}, []string{"result"})
 
+	// NatsConnected is 1 while a connection is connected and 0 otherwise, by
+	// connection. The connections reconnect without limit, so this, not a
+	// restart, is the signal that a pod has lost NATS. It is set from nats.go's
+	// callbacks, so a scrape never waits on a connection's lock.
+	NatsConnected = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: NatsNamespace,
+		Name:      "connected",
+		Help:      "1 while the nats connection is connected, 0 while it is reconnecting or closed, by connection.",
+	}, []string{"connection"})
+	// NatsSendDuration times each dispatch-connection send from start to its
+	// final result, including the wait for the connection and any retries. Its
+	// count by result gives the send rate and error rate.
+	NatsSendDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: NatsNamespace,
+		Name:      "send_duration_seconds",
+		Help:      "Time from the start of a dispatch connection send to its final result, including the wait for the connection and retries, by send and result.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{"send", "result"})
+	// NatsSendFailures counts dispatch-connection sends that failed on the
+	// connection's state: in the wait before the send, or at the send. At the
+	// send, reconnecting means nats.go rejected the attempt before sending any
+	// bytes; closed means the connection closed during the attempt, which NATS
+	// may have received.
+	NatsSendFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: NatsNamespace,
+		Name:      "send_failures_total",
+		Help:      "dispatch connection sends that gave up waiting for the connection (stage wait), and send attempts that failed because the connection was reconnecting or closed (stage publish), by send, stage and reason. A reconnecting attempt sent nothing and is counted even when a retry later sends it; a closed attempt may have reached nats",
+	}, []string{"send", "stage", "reason"})
 	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: NatsNamespace,
 		Name:      "out_bytes",
-		Help:      "The number of output bytes for this nats connection.",
+		Help:      "The number of output bytes over this pod's nats connections.",
 	}, func() float64 {
-		nc := nc.Load()
-		if nc == nil {
-			return 0
-		}
-		return float64(nc.Stats().OutBytes)
+		return float64(loadNatsStats().OutBytes)
 	})
 	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: NatsNamespace,
 		Name:      "in_bytes",
-		Help:      "The number of input bytes for this nats connection.",
+		Help:      "The number of input bytes over this pod's nats connections.",
 	}, func() float64 {
-		nc := nc.Load()
-		if nc == nil {
-			return 0
-		}
-		return float64(nc.Stats().InBytes)
+		return float64(loadNatsStats().InBytes)
 	})
 	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: NatsNamespace,
 		Name:      "out_msgs",
-		Help:      "The number of output messages for this nats connection.",
+		Help:      "The number of output messages over this pod's nats connections.",
 	}, func() float64 {
-		nc := nc.Load()
-		if nc == nil {
-			return 0
-		}
-		return float64(nc.Stats().OutMsgs)
+		return float64(loadNatsStats().OutMsgs)
 	})
 	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: NatsNamespace,
 		Name:      "in_msgs",
-		Help:      "The number of input messages for this nats connection.",
+		Help:      "The number of input messages over this pod's nats connections.",
 	}, func() float64 {
-		nc := nc.Load()
-		if nc == nil {
-			return 0
-		}
-		return float64(nc.Stats().InMsgs)
+		return float64(loadNatsStats().InMsgs)
 	})
 	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: NatsNamespace,
 		Name:      "reconnects",
-		Help:      "The number of reconnect attempts for this nats connection.",
+		Help:      "The number of times this pod's nats connections reopened a network connection while reconnecting, counted before the handshake completes. Refused dials are not counted.",
 	}, func() float64 {
-		nc := nc.Load()
-		if nc == nil {
-			return 0
-		}
-		return float64(nc.Stats().Reconnects)
+		return float64(loadNatsStats().Reconnects)
 	})
 
 	// Worker tunnel lifecycle. The proxy closes worker tunnels for several
@@ -526,6 +534,42 @@ const (
 	NatsErrorReasonOther              = "other"
 )
 
+// The two NATS connections; see invocation.NatsConnections.
+const (
+	NatsConnectionShared   = "shared"
+	NatsConnectionDispatch = "dispatch"
+)
+
+var NatsConnectionNames = []string{NatsConnectionShared, NatsConnectionDispatch}
+
+// Labels of NatsSendFailures.
+const (
+	NatsSendWorkItem    = "work_item"
+	NatsSendDispatch    = "dispatch"
+	NatsSendSessionJoin = "session_join"
+
+	// NatsSendStageWait is the wait for the connection before a send.
+	NatsSendStageWait = "wait"
+	// NatsSendStagePublish is an attempt that failed at the send itself:
+	// rejected before sending (reconnecting) or with unknown delivery (closed).
+	NatsSendStagePublish = "publish"
+
+	NatsSendReasonCanceled     = "canceled"
+	NatsSendReasonTimeout      = "timeout"
+	NatsSendReasonClosed       = "closed"
+	NatsSendReasonReconnecting = "reconnecting"
+
+	NatsSendResultSuccess = "success"
+	NatsSendResultError   = "error"
+)
+
+var (
+	NatsSends       = []string{NatsSendWorkItem, NatsSendDispatch, NatsSendSessionJoin}
+	NatsSendStages  = []string{NatsSendStageWait, NatsSendStagePublish}
+	NatsSendReasons = []string{NatsSendReasonCanceled, NatsSendReasonTimeout, NatsSendReasonClosed, NatsSendReasonReconnecting}
+	NatsSendResults = []string{NatsSendResultSuccess, NatsSendResultError}
+)
+
 var NatsErrorReasons = []string{
 	NatsErrorReasonCertificateExpired,
 	NatsErrorReasonTLSVerification,
@@ -558,6 +602,19 @@ func init() {
 	for _, reason := range NatsErrorReasons {
 		NatsFailureCounter.WithLabelValues(reason)
 	}
+	for _, connection := range NatsConnectionNames {
+		NatsConnected.WithLabelValues(connection)
+	}
+	for _, send := range NatsSends {
+		for _, result := range NatsSendResults {
+			NatsSendDuration.WithLabelValues(send, result)
+		}
+		for _, stage := range NatsSendStages {
+			for _, reason := range NatsSendReasons {
+				NatsSendFailures.WithLabelValues(send, stage, reason)
+			}
+		}
+	}
 	for _, result := range PurgeResults {
 		for _, trigger := range PurgeTriggers {
 			PendingWorkPurgedTotal.WithLabelValues(result, trigger)
@@ -571,10 +628,78 @@ func init() {
 	}
 }
 
-var nc atomic.Pointer[nats.Conn]
+// natsStatsSampleInterval is how often the connections' statistics are sampled
+// for the gauges above, which report the sum over the connections. nc.Stats
+// takes the connection's lock, which nats.go holds through each reconnect
+// attempt, so reading it during a scrape could stall the whole metrics endpoint
+// for seconds. Sampling in the background keeps scrapes and callers off the
+// lock. The interval is how often a sample starts, not a bound on staleness: a
+// sample that waits on a reconnect's lock leaves the previous values in place
+// until it returns. The values read 0 until the first sample.
+const natsStatsSampleInterval = 5 * time.Second
 
-func SetNatsStatsConnection(newNc *nats.Conn) {
-	nc.Store(newNc)
+// statsGeneration is one SetNatsStatsConnections call: its connections and
+// its latest sample. A sampler writes only to its own generation and scrapes
+// read only the current one, so a retired sampler cannot bring back its totals.
+type statsGeneration struct {
+	conns  []*nats.Conn
+	sample atomic.Pointer[nats.Statistics]
+}
+
+var currentStats atomic.Pointer[statsGeneration]
+
+func loadNatsStats() nats.Statistics {
+	if generation := currentStats.Load(); generation != nil {
+		if stats := generation.sample.Load(); stats != nil {
+			return *stats
+		}
+	}
+	return nats.Statistics{}
+}
+
+// SetNatsStatsConnections samples the connections' statistics in the
+// background until they all close or another call replaces them. It never
+// takes a connection's lock itself, so it returns at once even while a
+// reconnect holds one.
+func SetNatsStatsConnections(conns ...*nats.Conn) {
+	generation := &statsGeneration{conns: conns}
+	currentStats.Store(generation)
+	if len(conns) == 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(natsStatsSampleInterval)
+		defer ticker.Stop()
+		for {
+			if currentStats.Load() != generation || allClosed(conns) {
+				return
+			}
+			sampleNatsStats(generation)
+			<-ticker.C
+		}
+	}()
+}
+
+func allClosed(conns []*nats.Conn) bool {
+	for _, nc := range conns {
+		if !nc.IsClosed() {
+			return false
+		}
+	}
+	return true
+}
+
+func sampleNatsStats(generation *statsGeneration) {
+	var sum nats.Statistics
+	for _, nc := range generation.conns {
+		stats := nc.Stats()
+		sum.InMsgs += stats.InMsgs
+		sum.OutMsgs += stats.OutMsgs
+		sum.InBytes += stats.InBytes
+		sum.OutBytes += stats.OutBytes
+		sum.Reconnects += stats.Reconnects
+	}
+	generation.sample.Store(&sum)
 }
 
 func IncrFunctionRequest(functionID, functionVersionID, ncaID string) {
