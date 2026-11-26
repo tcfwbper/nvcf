@@ -115,7 +115,9 @@ func TestDeletedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	ghosts := map[string]ghostFile{}
-	deletedFiles("/proc", os.Getpid(), ghosts)
+	if err := deletedFiles("/proc", os.Getpid(), ghosts); err != nil {
+		t.Fatal(err)
+	}
 	found := false
 	for _, g := range ghosts {
 		if g.path == f.Name() {

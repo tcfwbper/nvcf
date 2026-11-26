@@ -91,7 +91,7 @@ func TestGroupAliases(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.config.CheckpointDir = t.TempDir()
-	if _, err := a.retirableCheckpoints(ctx, nil, time.Now()); err != nil {
+	if _, err := a.retirableCheckpoints(ctx, nil, time.Now(), checkpointRetireAge); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := cms.Get(ctx, criuGroupConfigMapName(criuGroupKey("cache://a", "fv")), metav1.GetOptions{}); err == nil {

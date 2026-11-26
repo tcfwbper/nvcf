@@ -12,30 +12,47 @@ package agent
 //     checkpointRetireAge first, past any capture and L2 promote still
 //     running.
 // A checkpoint a pod on this node is restoring from or restored from is
-// kept either way.
+// kept either way, and so are the checkpoints of a capture still running
+// (its record capturing). A record abandoned before its verification
+// (verify_abandoned.go) names nothing: its namespace is gone, and it is
+// restored only there. While the checkpoint filesystem is low
+// (capture_disk.go) the age is pressureRetireAge. A retired instance
+// capture's catalog row goes with it, through a tombstone retried within
+// a budget after the sweep (a lone capture's row is its configuration's,
+// which a later capture may share: nvsnap-server deletes by hash).
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 const checkpointRetireAge = 3 * time.Hour
 
 // retirableCheckpoints returns the checkpoints under the agent's
-// checkpoint directory to retire, with their metadata.
-func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now time.Time) (map[string]*CheckpointMetadata, error) {
+// checkpoint directory to retire, with their metadata: an unnamed instance
+// capture once it is older than age.
+func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now time.Time, age time.Duration) (map[string]*CheckpointMetadata, error) {
 	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
 	blocked := map[string]bool{}
 	if cm, err := cms.Get(ctx, criuRestoreFailedConfigMap, metav1.GetOptions{}); err == nil {
@@ -62,7 +79,11 @@ func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now
 		}
 	}
 	for _, r := range records.Items {
-		if !strings.HasPrefix(r.Name, criuGroupConfigMapPrefix) || !recordUsable(r.Data) {
+		if !strings.HasPrefix(r.Name, criuGroupConfigMapPrefix) {
+			continue
+		}
+		capturing := r.Data["state"] == criuGroupStateCapturing
+		if !capturing && (!recordUsable(r.Data) || r.Data[groupAbandonedKey] != "") {
 			continue
 		}
 		for k, v := range r.Data {
@@ -96,7 +117,7 @@ func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now
 			continue
 		}
 		instance := md.CatalogInfo != nil && md.CatalogInfo.InstanceCapture
-		if blocked[id] || (instance && !named[id] && now.Sub(md.CreatedAt) > checkpointRetireAge) {
+		if blocked[id] || (instance && !named[id] && now.Sub(md.CreatedAt) > age) {
 			out[id] = &md
 		}
 	}
@@ -175,6 +196,29 @@ func (a *Agent) retirableCachedirCaptures(ctx context.Context, pods []corev1.Pod
 
 // reapCheckpoints retires this node's dead checkpoints and their L2 copies.
 func (a *Agent) reapCheckpoints(ctx context.Context, pods []corev1.Pod, now time.Time) {
+	age := checkpointRetireAge
+	if a.checkpointDiskLow() {
+		age = pressureRetireAge
+	}
+	// Local space first; the catalog retries after it, within a budget,
+	// so an unreachable nvsnap-server cannot hold up reclamation.
+	a.reapCheckpointsOlderThan(ctx, pods, now, age)
+	rctx, cancel := context.WithTimeout(ctx, catalogRetryBudget)
+	defer cancel()
+	a.retryCatalogDrops(rctx, now)
+}
+
+// catalogRetryBudget bounds one sweep's catalog retries, and
+// catalogRequestTimeout each request; what is left is tried on the next
+// sweep. Variables for tests.
+var (
+	catalogRetryBudget    = 2 * time.Minute
+	catalogRequestTimeout = 30 * time.Second
+)
+
+// reapCheckpointsOlderThan is reapCheckpoints with the age an unnamed
+// instance capture must have.
+func (a *Agent) reapCheckpointsOlderThan(ctx context.Context, pods []corev1.Pod, now time.Time, age time.Duration) {
 	if ids, err := a.retirableCachedirCaptures(ctx, pods, now); err != nil {
 		a.log.WithError(err).Warn("checkpoint reaper: cannot tell the dead cachedir captures; keeping all")
 	} else {
@@ -187,7 +231,7 @@ func (a *Agent) reapCheckpoints(ctx context.Context, pods []corev1.Pod, now time
 			a.log.WithField("capture", id).Info("checkpoint reaper: retired a cachedir capture that is never seeded from again")
 		}
 	}
-	dead, err := a.retirableCheckpoints(ctx, pods, now)
+	dead, err := a.retirableCheckpoints(ctx, pods, now, age)
 	if err != nil {
 		a.log.WithError(err).Warn("checkpoint reaper: cannot tell the dead checkpoints; keeping all")
 		return
@@ -208,10 +252,148 @@ func (a *Agent) reapCheckpoints(ctx context.Context, pods []corev1.Pod, now time
 				continue
 			}
 		}
+		// An instance capture's catalog row and its other nodes' copies go
+		// through nvsnap-server after the directory is gone: a tombstone
+		// keeps the request, sent after the sweep (retryCatalogDrops).
+		if instance {
+			a.writeCatalogTombstone(id, log)
+		}
 		if err := os.RemoveAll(filepath.Join(a.config.CheckpointDir, id)); err != nil {
 			log.WithError(err).Warn("checkpoint reaper: cannot remove the checkpoint")
 			continue
 		}
 		log.Info("checkpoint reaper: retired a checkpoint that is never restored again")
 	}
+}
+
+// catalogTombstoneDir holds, by checkpoint id, the retired checkpoints
+// whose catalog row is still to be deleted; a dot directory, which the
+// reaper's scan skips.
+const catalogTombstoneDir = ".catalog-pending"
+
+// catalogTombstoneMaxAge is how long a catalog delete is retried.
+const catalogTombstoneMaxAge = 7 * 24 * time.Hour
+
+func (a *Agent) writeCatalogTombstone(id string, log *logrus.Entry) {
+	if a.config.CatalogURL == "" {
+		return
+	}
+	dir := filepath.Join(a.config.CheckpointDir, catalogTombstoneDir)
+	if err := os.MkdirAll(dir, 0o755); err == nil {
+		// Its content is when it was first written (the retry's age); its
+		// modification time, when it was last tried (the retry order).
+		err = os.WriteFile(filepath.Join(dir, id), []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
+		if err == nil {
+			return
+		}
+	}
+	log.Warn("checkpoint reaper: cannot record the catalog delete to retry; it is tried once")
+}
+
+func (a *Agent) clearCatalogTombstone(id string) {
+	_ = os.Remove(filepath.Join(a.config.CheckpointDir, catalogTombstoneDir, id))
+}
+
+// retryCatalogDrops retries the catalog deletes of retired checkpoints
+// that failed, least recently tried first, so a few that keep failing do
+// not starve the rest; it drops one first written catalogTombstoneMaxAge
+// ago.
+func (a *Agent) retryCatalogDrops(ctx context.Context, now time.Time) {
+	if a.config.CatalogURL == "" {
+		return
+	}
+	dir := filepath.Join(a.config.CheckpointDir, catalogTombstoneDir)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type tomb struct {
+		id            string
+		tried, posted time.Time
+	}
+	tombs := make([]tomb, 0, len(ents))
+	for _, e := range ents {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		t := tomb{id: e.Name(), tried: info.ModTime(), posted: info.ModTime()}
+		if b, err := os.ReadFile(filepath.Join(dir, t.id)); err == nil {
+			if p, err := time.Parse(time.RFC3339, strings.TrimSpace(string(b))); err == nil {
+				t.posted = p
+			}
+		}
+		tombs = append(tombs, t)
+	}
+	sort.Slice(tombs, func(i, j int) bool { return tombs[i].tried.Before(tombs[j].tried) })
+	for _, t := range tombs {
+		if ctx.Err() != nil {
+			return // the sweep's budget is spent; the rest wait for the next
+		}
+		log := a.log.WithField("checkpoint", t.id)
+		if a.dropCatalogRow(ctx, t.id, log) {
+			a.clearCatalogTombstone(t.id)
+			continue
+		}
+		if now.Sub(t.posted) > catalogTombstoneMaxAge {
+			log.Warn("checkpoint reaper: gave up deleting the retired checkpoint's catalog row; delete it through nvsnap-server")
+			a.clearCatalogTombstone(t.id)
+			continue
+		}
+		_ = os.Chtimes(filepath.Join(dir, t.id), now, now) // tried: to the back of the queue
+	}
+}
+
+// dropCatalogRow deletes a retired checkpoint's catalog row, and its
+// copies on other nodes, through nvsnap-server (its delete cascades to
+// them); kept rows would list a checkpoint that no longer exists. A
+// failure leaves the row to nvsnap-server's own delete.
+func (a *Agent) dropCatalogRow(ctx context.Context, id string, log *logrus.Entry) bool {
+	if a.config.CatalogURL == "" {
+		return true
+	}
+	ctx, span := tracing.Tracer().Start(ctx, "checkpoint.drop_catalog_row")
+	defer span.End()
+	span.SetAttributes(attribute.String("nvsnap.checkpoint_id", id))
+	ctx, cancel := context.WithTimeout(ctx, catalogRequestTimeout)
+	defer cancel()
+	u := fmt.Sprintf("%s/api/v1/checkpoints/%s", a.config.CatalogURL, url.PathEscape(id))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		span.RecordError(err)
+		return false
+	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		span.RecordError(err)
+		log.WithError(err).Warn("checkpoint reaper: cannot delete the retired checkpoint's catalog row; retried on a later sweep")
+		return false
+	}
+	_ = resp.Body.Close()
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		log.WithField("status", resp.StatusCode).Warn("checkpoint reaper: nvsnap-server kept the retired checkpoint's catalog row; retried on a later sweep")
+		return false
+	}
+	return true
+}
+
+// podRestoringFrom returns a pod on this node that restores, or restored,
+// from checkpoint id; "" for none.
+func (a *Agent) podRestoringFrom(ctx context.Context, id string) (string, error) {
+	if a.kubeClient == nil || a.config.NodeName == "" {
+		return "", nil
+	}
+	pods, err := a.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + a.config.NodeName})
+	if err != nil {
+		return "", err
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp == nil && p.Annotations[webhook.CRIURestoreAnnotation] == id {
+			return p.Namespace + "/" + p.Name, nil
+		}
+	}
+	return "", nil
 }

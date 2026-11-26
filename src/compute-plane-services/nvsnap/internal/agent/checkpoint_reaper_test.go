@@ -54,7 +54,7 @@ func TestRetirableCheckpoints(t *testing.T) {
 	)
 	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir}}
 	pods := []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "p", Annotations: map[string]string{webhook.CRIURestoreAnnotation: "blocked-in-use"}}}}
-	dead, err := a.retirableCheckpoints(context.Background(), pods, now)
+	dead, err := a.retirableCheckpoints(context.Background(), pods, now, checkpointRetireAge)
 	if err != nil {
 		t.Fatal(err)
 	}

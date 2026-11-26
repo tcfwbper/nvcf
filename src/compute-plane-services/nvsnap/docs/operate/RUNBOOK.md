@@ -25,6 +25,7 @@ records are in `nvsnap-system`.
 - [NvsnapInventoryStale](#nvsnapinventorystale)
 - [NvsnapCaptureStuckVerifying](#nvsnapcapturestuckverifying)
 - [Workloads whose NCCL uses RDMA (`webhook.gpushareIBV`)](#workloads-whose-nccl-uses-rdma-webhookgpushareibv)
+- [Checkpoint disk (`agent.captureDiskKeepPercent`)](#checkpoint-disk-agentcapturediskkeeppercent)
 - [Node model cache](#node-model-cache)
 <!-- /toc -->
 
@@ -390,6 +391,40 @@ state"), and the configuration starts cold every time.
   library. Pods whose template sets `nvsnap.io/gpushare-ibv: "true"` still
   get the bundled library: remove the annotation, or set it to `"false"`,
   before recreating them.
+
+## Checkpoint disk (`agent.captureDiskKeepPercent`)
+
+A capture writes its pods' memory to the node's checkpoint directory, about 570 GB per rank of a large model. When that directory shares the kubelet's image filesystem, filling it past the kubelet's eviction threshold makes the kubelet evict every pod on the node, nvsnap's agent included. Evicting pods frees nothing, so the node stays in that state.
+
+What the agent does:
+
+- **Before a capture, before any member suspends:** on each member's node, the preflight estimates everything the capture writes there:
+  - anonymous memory, memfds and the deleted files the dump saves
+  - tmpfs contents
+  - the GPU memory the processes use
+  - the rootfs diff archive and replay-mount archives
+
+  The capture is skipped (finding `disk`) when:
+  - a member's dump would leave less than `agent.captureDiskKeepPercent` (default 20) of the filesystem free;
+  - the members on one node would do so together;
+  - any part can't be measured (GPU memory unreadable, for example);
+  - a member's host checks did not run, or its node sent no disk check (its agent has the check off or predates it).
+
+  The check keeps no state, and the on-demand preflight report changes nothing.
+- **While the filesystem has less than the setting plus 10 points free:** the reaper retires checkpoints no record names after 15 minutes instead of 3 hours. Checkpoints of a capture still running are kept.
+- **Records abandoned during verification** (their namespace is gone) no longer keep their checkpoints.
+- **A retired instance capture's catalog row** is deleted through nvsnap-server, from a tombstone in `<checkpoint dir>/.catalog-pending/`:
+  - It is retried after each sweep's local cleanup, least recently tried first, within 2 minutes per sweep, for up to 7 days.
+  - A lone capture's row is left alone: nvsnap-server deletes by hash, and a lone capture shares its hash with later captures of its configuration.
+  - An agent refuses (409) to delete a copy that a pod on its node restores from.
+
+Not covered: two instances captured on one node at the same time, and other writers (peer fetches, L2 pulls) between the preflight and the dump.
+
+Checks:
+
+- How full the filesystem is, from the agent: `kubectl -n nvsnap-system exec <agent> -c agent -- nsenter -t 1 -m -- df -h /var/lib/containers`.
+- What a capture would write, without capturing: the `disk` findings of `GET /v1/capture-preflight/<namespace>/<rank 0 pod>` on any agent.
+- Checkpoints still named by a `complete` record stay until that record is deleted. For a function that no longer exists, delete its record, then delete its checkpoints through nvsnap-server's `DELETE /api/v1/checkpoints/{id}`. That also removes the agents' and peers' copies and the catalog row.
 
 ## Node model cache
 

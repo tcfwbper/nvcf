@@ -20,6 +20,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -60,26 +61,9 @@ func countDistinctGPUDevices(pids []int, log *logrus.Entry) int {
 	// Output format: "pid, gpu_bus_id" per line (csv, no header).
 	// gpu_bus_id is unique per physical GPU (e.g., "00000000:04:00.0").
 	// nvidia-smi lives on the host — try common paths.
-	nvidiaSmi := "nvidia-smi"
-	for _, p := range []string{
-		"/host/run/nvidia/driver/usr/bin/nvidia-smi",
-		"/host/usr/bin/nvidia-smi",
-		"/host/usr/local/nvidia/bin/nvidia-smi",
-	} {
-		if _, err := os.Stat(p); err == nil {
-			nvidiaSmi = p
-			break
-		}
-	}
-	cmd := exec.Command(nvidiaSmi,
-		"--query-compute-apps=pid,gpu_bus_id",
-		"--format=csv,noheader")
-	// nvidia-smi needs the driver's shared libraries
-	cmd.Env = append(os.Environ(),
-		"LD_LIBRARY_PATH="+hostlibs.DriverDir("/host/run/nvidia/driver")+":/usr/local/nvidia/lib64")
-	out, err := cmd.Output()
+	out, err := hostNvidiaSMI("--query-compute-apps=pid,gpu_bus_id", "--format=csv,noheader")
 	if err != nil {
-		log.WithError(err).WithField("path", nvidiaSmi).Warn("nvidia-smi query failed, assuming single GPU")
+		log.WithError(err).Warn("nvidia-smi query failed, assuming single GPU")
 		return 1
 	}
 
@@ -113,6 +97,39 @@ func countDistinctGPUDevices(pids []int, log *logrus.Entry) int {
 
 	log.Debug("No matching compute processes in nvidia-smi, assuming single GPU")
 	return 1
+}
+
+// errNoNvidiaSMI: the node has no nvidia-smi, so no GPU to query.
+var errNoNvidiaSMI = errors.New("no nvidia-smi on this node")
+
+// hostNvidiaSMI runs the host's nvidia-smi with args, with the driver's
+// shared libraries it needs; errNoNvidiaSMI when the node has none.
+func hostNvidiaSMI(args ...string) ([]byte, error) {
+	nvidiaSmi := ""
+	if p, err := exec.LookPath("nvidia-smi"); err == nil {
+		nvidiaSmi = p
+	}
+	for _, p := range []string{
+		"/host/run/nvidia/driver/usr/bin/nvidia-smi",
+		"/host/usr/bin/nvidia-smi",
+		"/host/usr/local/nvidia/bin/nvidia-smi",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			nvidiaSmi = p
+			break
+		}
+	}
+	if nvidiaSmi == "" {
+		return nil, errNoNvidiaSMI
+	}
+	cmd := exec.Command(nvidiaSmi, args...) //nolint:gosec // a fixed binary path, fixed query arguments
+	cmd.Env = append(os.Environ(),
+		"LD_LIBRARY_PATH="+hostlibs.DriverDir("/host/run/nvidia/driver")+":/usr/local/nvidia/lib64")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", nvidiaSmi, strings.Join(args, " "), err)
+	}
+	return out, nil
 }
 
 // MappedFileEntry describes a memory-mapped file discovered during checkpoint.

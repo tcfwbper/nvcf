@@ -39,17 +39,41 @@ import (
 // end of the mirror (source pid at dump, placeholder pid at restore) —
 // no static path list, runtime-agnostic, hardware-agnostic.
 func excludeArgsForMountpoints(mps []string) []string {
+	pats := tarPatternsForMountpoints(mps)
+	if len(pats) == 0 {
+		return nil
+	}
+	args := make([]string, 0, len(pats))
+	for _, p := range pats {
+		args = append(args, "--exclude="+p)
+	}
+	return args
+}
+
+// tarPatternsForMountpoints are the tar --exclude patterns that leave out
+// mps and what is under them.
+func tarPatternsForMountpoints(mps []string) []string {
 	if len(mps) == 0 {
 		return nil
 	}
-	args := make([]string, 0, len(mps)*2)
+	pats := make([]string, 0, len(mps)*2)
 	for _, mp := range mps {
 		// mp is absolute ("/usr/bin/nvidia-smi"); archive is rooted at "."
 		// so the in-archive path is "." + mp.
 		entry := "." + mp
-		args = append(args, "--exclude="+entry, "--exclude="+entry+"/*")
+		pats = append(pats, entry, entry+"/*")
 	}
-	return args
+	return pats
+}
+
+// tarMountPatterns are the tar --exclude patterns tarMount gives for
+// exclude.
+func tarMountPatterns(exclude []string) []string {
+	pats := make([]string, 0, len(exclude))
+	for _, e := range exclude {
+		pats = append(pats, "./"+e)
+	}
+	return pats
 }
 
 // rootfsDiffExcludeGlobs returns tar --exclude patterns for large,
@@ -292,8 +316,8 @@ func tarMount(srcPID int, mp, outFile string, exclude []string, log *logrus.Entr
 		"--sparse",
 		"--one-file-system",
 	}
-	for _, e := range exclude {
-		args = append(args, "--exclude=./"+e)
+	for _, p := range tarMountPatterns(exclude) {
+		args = append(args, "--exclude="+p)
 	}
 	args = append(args, ".")
 	cmd := exec.Command("tar", args...) //nolint:gosec // args are internally constructed (PIDs/paths), not user input

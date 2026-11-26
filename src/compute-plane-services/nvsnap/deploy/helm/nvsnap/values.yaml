@@ -101,6 +101,13 @@ agent:
   # tier (--kv-offloading-size 600) is one 600 GiB file in /dev/shm. A dump
   # saves it whole, so the checkpoint grows by that much. Empty is 1 TiB.
   criuGhostLimit: ""
+  # Share of the checkpoint filesystem, in percent, a capture must leave
+  # free. A capture writes its pods' memory there (about 570 GB per rank of
+  # a large model); below the kubelet's eviction threshold (15% by default)
+  # the kubelet evicts every pod on the node. A capture that would not leave
+  # this much free is skipped before any member suspends. 0 turns the check
+  # off; empty is the default, 20.
+  captureDiskKeepPercent: 20
 
   # Oldest NVIDIA driver major CRIU captures and restores on. Each agent
   # reports its node's driver; when any GPU node's is older, or the GPU

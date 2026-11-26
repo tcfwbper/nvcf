@@ -68,6 +68,10 @@ type Config struct {
 	// CRIUGhostLimit bounds, in bytes, the contents of one deleted file a
 	// dump saves (criu --ghost-limit); 0 is defaultGhostLimit.
 	CRIUGhostLimit int64
+	// CaptureDiskKeepPercent is the share of the checkpoint filesystem, in
+	// percent, a capture must leave free (capture_disk.go); 0 turns the
+	// check off.
+	CaptureDiskKeepPercent int
 	// CRIUMinDriverMajor is the oldest NVIDIA driver major CRIU serves on;
 	// 0 is DefaultCRIUMinDriverMajor (driver_gate.go).
 	CRIUMinDriverMajor int
@@ -983,6 +987,18 @@ func (a *Agent) deleteCheckpointHandler(w http.ResponseWriter, r *http.Request) 
 	dir := filepath.Join(a.config.CheckpointDir, id)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		http.Error(w, "checkpoint not found", http.StatusNotFound)
+		return
+	}
+	// A copy a pod on this node restores from, or restored from, stays: a
+	// delete cascaded from another node's reaper (dropCatalogRow) must not
+	// pull it from under a restore. Its own node retires it once no pod
+	// holds it.
+	if pod, err := a.podRestoringFrom(r.Context(), id); err != nil || pod != "" {
+		why := "pod " + pod + " on this node restores from it"
+		if err != nil {
+			why = "cannot tell whether a pod on this node restores from it: " + err.Error()
+		}
+		http.Error(w, "checkpoint kept: "+why, http.StatusConflict)
 		return
 	}
 	if err := os.RemoveAll(dir); err != nil {
