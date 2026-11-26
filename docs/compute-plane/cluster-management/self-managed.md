@@ -769,8 +769,11 @@ Cleanup Script appendix in the self-hosted troubleshooting guide.
   done
   ```
 
-  If either line does not end in `OK`, force a rollout. The operator rewrites the
-  certificate Secrets and both webhook configurations from one certificate and CA:
+  The operator repairs a mismatch on a periodic sync, which can take up to
+  about 30 minutes, and records a Warning event on the NVCFBackend. To repair
+  it immediately, or if either line still does not end in `OK`, force a
+  rollout. The operator rewrites the certificate Secrets and both webhook
+  configurations from one certificate and CA:
 
   ```bash
   kubectl annotate -n nvca-operator --overwrite --all nvcfbackends \

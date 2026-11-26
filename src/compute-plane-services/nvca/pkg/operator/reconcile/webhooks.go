@@ -106,17 +106,20 @@ func newTLSCertSecret(nb *nvidiaiov1.NVCFBackend, wc WebhookCert) *v1.Secret {
 }
 
 func (bc *BackendK8sCache) setupTLSCASecret(ctx context.Context, nb *nvidiaiov1.NVCFBackend, wc WebhookCert) error {
-	tlsSec := &v1.Secret{
+	return bc.createOrUpdateSecret(ctx, newTLSCASecret(nb, wc.CACertBytes))
+}
+
+func newTLSCASecret(nb *nvidiaiov1.NVCFBackend, ca []byte) *v1.Secret {
+	return &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        NVCAWebhookTLSCASecretName,
 			Namespace:   getSystemNamespace(nb),
 			Annotations: getNBAnnotations(nb),
 		},
 		Data: map[string][]byte{
-			TLSCAName: wc.CACertBytes,
+			TLSCAName: ca,
 		},
 	}
-	return bc.createOrUpdateSecret(ctx, tlsSec)
 }
 
 func generateWebhookCerts(nb *nvidiaiov1.NVCFBackend, now time.Time) (webhookCert WebhookCert, err error) {

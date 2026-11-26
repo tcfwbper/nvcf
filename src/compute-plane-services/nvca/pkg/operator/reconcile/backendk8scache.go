@@ -1417,6 +1417,14 @@ func (bc *BackendK8sCache) syncNVCFBackend(ctx context.Context, nb *nvidiaiov1.N
 		}
 	} else {
 		log.Debugf("Backend already updated, skipping sync")
+		repaired, err := bc.repairWebhookCAMismatch(ctx, nbMerged, bc.now())
+		if err != nil {
+			return fmt.Errorf("failed to repair webhook CA for NVCFBackend %v/%v, err: %w", nbMerged.Namespace, nbMerged.Name, err)
+		}
+		if repaired {
+			bc.eventRecorder.Eventf(nbMerged, corev1.EventTypeWarning,
+				string(nvcaoptypes.EventCategoryHealth), "Repaired %v webhook CA that did not match the serving cert", AgentName)
+		}
 	}
 
 	return nil
