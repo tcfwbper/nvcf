@@ -171,6 +171,15 @@ func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod, g webhook.
 	} else if why != "" {
 		return false, why
 	}
+	companions := false
+	for _, c := range g.Companion {
+		companions = companions || c
+	}
+	if why, err := a.kubeSharedCompanions(ctx, pod, pods.Items, companions); err != nil {
+		return false, err.Error()
+	} else if why != "" {
+		return false, why
+	}
 	now := time.Now()
 	for i := range pods.Items {
 		p := &pods.Items[i]

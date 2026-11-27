@@ -476,7 +476,7 @@ func gpuContainer(pod *corev1.Pod) string {
 // criuGroupCaptureLeader reports whether pod is rank 0 of a Ready instance
 // that has not been captured from, and returns its cache URI.
 func criuGroupCaptureLeader(pod *corev1.Pod) (uri string, size int, ok bool) {
-	uri = pod.Annotations[cacheURIAnnotation]
+	uri = criuURI(pod)
 	if uri == "" || pod.DeletionTimestamp != nil || pod.Annotations[webhook.CRIURestoreAnnotation] != "" {
 		return "", 0, false
 	}
@@ -749,15 +749,24 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		return c.companionsUnknown(ctx, criuGroupKeyDriver(instanceConfigURI(ranks), scope, drv), leader, len(ranks), err, log)
 	}
 	c.companionFailures.Delete(leader.UID)
+	if why, err := a.kubeSharedCompanions(ctx, leader, pods.Items, len(companions) > 0); err != nil || why != "" {
+		if err != nil {
+			why = err.Error()
+		}
+		log.WithField("reason", why).Info("CRIU group capture: skipped; the instance starts from the caches")
+		return false
+	}
 	for _, r := range ranks {
-		if webhook.DynamoComponent(r) && len(companions) == 0 {
+		// A rank that registers through Kubernetes has no etcd: its
+		// registration is kept with the capture (kube_discovery.go).
+		if webhook.DynamoComponent(r) && !kubeDiscoveryRank(r) && len(companions) == 0 {
 			log.WithField("rank", r.Name).Warn("CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it")
 			return false
 		}
 	}
 	uris := make([]string, 0, len(ranks)+len(companions))
 	for _, r := range ranks {
-		uris = append(uris, r.Annotations[cacheURIAnnotation])
+		uris = append(uris, criuURI(r))
 	}
 	for _, p := range companions {
 		// The identity its replacement is admitted by: the stamp admission
@@ -842,10 +851,24 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		return false
 	}
+	// Read while the ranks serve: their restore writes them again
+	// (kube_discovery.go).
+	registrations, rerr := a.recordRegistrations(ctx, ranks)
+	if rerr != nil {
+		log.WithError(rerr).Warn("CRIU group capture: skipped; cannot keep a rank's Kubernetes registration for its restore")
+		return false
+	}
 	// Again just before the instance is held: the namespace's scaling
 	// groups may have grown while the instance warmed up.
 	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, nil, log); skip {
 		return again
+	}
+	if why, err := a.kubeSharedCompanions(ctx, leader, nil, len(companions) > 0); err != nil {
+		log.WithError(err).Info("CRIU group capture: waiting to read the namespace's pods")
+		return true
+	} else if why != "" {
+		log.WithField("reason", why).Info("CRIU group capture: skipped; the instance starts from the caches")
+		return false
 	}
 	// Held for the capture before it is claimed: a member already
 	// released into service (its hold expired) is not stopped for it.
@@ -939,6 +962,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		if aliases != "" {
 			data["serviceAddrs"] = aliases
+		}
+		for k, v := range registrations {
+			data[k] = v
 		}
 		log.WithField("duration", time.Since(t0).Round(time.Second).String()).Info("CRIU group capture: recorded; the instance restores from it to verify it")
 	}
@@ -1104,10 +1130,16 @@ func (c *criuAutoRestorer) listLeaving(ctx context.Context, key, started string,
 // instanceConfigURI is the configuration of an instance: its ranks' shared
 // configuration, or, when they differ, one derived from all of them in rank
 // order.
+// criuURI is the configuration pod's CRIU records are keyed by: its cache
+// URI qualified by its role (webhook.CRIUURI).
+func criuURI(pod *corev1.Pod) string {
+	return webhook.CRIUURI(pod.Annotations[cacheURIAnnotation], pod)
+}
+
 func instanceConfigURI(ranks []*corev1.Pod) string {
 	uris := make([]string, len(ranks))
 	for i, r := range ranks {
-		uris[i] = r.Annotations[cacheURIAnnotation]
+		uris[i] = criuURI(r)
 	}
 	return instanceConfigURIOf(uris)
 }
@@ -1597,6 +1629,20 @@ func (c *criuAutoRestorer) mayRestoreShared(ctx context.Context, leader *corev1.
 		c.attempted.Delete("restore/" + string(leader.UID))
 		return false
 	}
+	if why == "" && kubeDiscoveryRank(leader) {
+		cm, gerr := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{})
+		if gerr != nil {
+			log.WithError(gerr).Warn("CRIU group restore: cannot read the record; trying again on the leader's next event")
+			c.attempted.Delete("restore/" + string(leader.UID))
+			return false
+		}
+		why, err = c.a.kubeSharedCompanions(ctx, leader, nil, recordHasCompanions(cm.Data))
+		if err != nil {
+			log.WithError(err).Warn("CRIU group restore: trying again on the leader's next event")
+			c.attempted.Delete("restore/" + string(leader.UID))
+			return false
+		}
+	}
 	if why != "" {
 		c.failGroup(ctx, leader, key, false, errors.New(why), log)
 		return false
@@ -1704,6 +1750,13 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		log.WithError(err).Warn("CRIU group restore: cannot claim the companions yet; trying again on the leader's next event")
 		c.attempted.Delete("restore/" + string(leader.UID))
+		return
+	}
+	// Before the restore: a rank that registers through Kubernetes is
+	// routed to only once its registration names its placeholder. Not
+	// written, the instance starts cold rather than restore unreachable.
+	if err := c.writeGroupRegistrations(ctx, key, ranks); err != nil {
+		c.failGroup(ctx, leader, key, false, fmt.Errorf("registrations: %w", err), log)
 		return
 	}
 	log.Info("CRIU group restore: every placeholder runs; restoring the instance")

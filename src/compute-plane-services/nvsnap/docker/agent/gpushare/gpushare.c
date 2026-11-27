@@ -2626,7 +2626,12 @@ static const char nixl_py[] =
     "        c._nvsnap_kv, c._nvsnap_cls = w.device_kv_caches, type(w)\n"
     "        try:\n"
     "            w._handshake_initiation_executor.shutdown(wait=True)\n"
-    "            w._finish_shutdown()\n"
+    "            if hasattr(w, '_finish_shutdown'):\n"
+    "                w._finish_shutdown()\n"
+    "            else:\n"
+    "                # vLLM before 0.31: one shutdown() releases the same handles\n"
+    "                # (no host buffer: refused above; its executor is stopped).\n"
+    "                w.shutdown()\n"
     "        finally:\n"
     "            # Dropped even after a failed shutdown, so every worker comes back\n"
     "            # under the same new engine id; \"released\" is set only once the\n"
@@ -2781,11 +2786,11 @@ static const char nixl_py[] =
     "        return True, ('resumed as engine %s, side channel %s:%s, %d request(s) prefilled here'\n"
     "                      % (new_id or kc.engine_id, s.side_channel_host, s.side_channel_port, n))\n"
     "\n"
-    "    # Restored into another pod, only UCX 1.22 reads its routes again (see\n"
+    "    # Restored into another pod, only UCX 1.21 and 1.22 read their routes again (see\n"
     "    # ucs_netlink_route_exists in gpushare.c): refuse the pause for another.\n"
     "    def ucx_ok():\n"
-    "        if op == 'pause' and ucx and not ucx.startswith('1.22.'):\n"
-    "            raise RuntimeError('UCX %s is not 1.22: restored into another pod, it would keep the old '\n"
+    "        if op == 'pause' and ucx and not ucx.startswith(('1.21.', '1.22.')):\n"
+    "            raise RuntimeError('UCX %s is not 1.21 or 1.22: restored into another pod, it would keep the old '\n"
     "                               'pod\\'s routes, and NIXL would reach no peer' % ucx)\n"
     "        return ', UCX ' + ucx if op == 'pause' and ucx else ''\n"
     "\n"
@@ -3062,8 +3067,8 @@ static int find_exporter(const char *req, int fd, unsigned long long *key, int *
  * they call UCX's; in another one, they read the routes again on each call
  * and match them as UCX does: every table (policy rules, as in pods whose
  * RoCE interfaces have their own tables, are ignored), longest prefix on the
- * interface. Only for UCX 1.22, whose signatures these are; other versions
- * keep UCX's table. */
+ * interface. Only for UCX 1.21 and 1.22, whose signatures these are; other
+ * versions keep UCX's table. */
 
 struct ucx_find { const char *stem; char path[512]; };
 
@@ -3109,7 +3114,13 @@ static int ucx_loaded(void)
     return 1;
 }
 
-static int ucx_122(void) { return ucx_loaded() && ucx_ver[0] == 1 && ucx_ver[1] == 22; }
+/* UCX 1.21 and 1.22: ucs_netlink_route_exists and ucs_netlink_is_best_route
+ * are the same in both (1.22 adds ucs_netlink_get_local_route_ndev_index,
+ * which 1.21's transports never call). */
+static int ucx_routes_known(void)
+{
+    return ucx_loaded() && ucx_ver[0] == 1 && (ucx_ver[1] == 21 || ucx_ver[1] == 22);
+}
 
 static unsigned long first_netns;
 
@@ -3124,10 +3135,10 @@ static int kernel_routes(void)
     if (__atomic_compare_exchange_n(&first_netns, &want, (unsigned long)st.st_ino, 0, __ATOMIC_SEQ_CST,
                                     __ATOMIC_SEQ_CST) || want == st.st_ino)
         return 0;
-    int k = ucx_122();
+    int k = ucx_routes_known();
     if (!__atomic_exchange_n(&said, 1, __ATOMIC_SEQ_CST)) {
         if (k) logf_("network namespace changed since UCX read its routes: UCX route checks read the routes again");
-        else logf_("network namespace changed since UCX read its routes, but UCX %u.%u.%u is not 1.22: "
+        else logf_("network namespace changed since UCX read its routes, but UCX %u.%u.%u is not 1.21 or 1.22: "
                    "UCX keeps the old routes, and RoCE peers may look unreachable", ucx_ver[0], ucx_ver[1], ucx_ver[2]);
     }
     return k;

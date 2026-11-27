@@ -14,7 +14,7 @@ again. The test checks that
   * in the namespace of the first call, UCX's own functions answer;
   * in a new one, the routes are read again, from every table (loopback is
     local, a TEST-NET address has no route, and one with a route only in
-    table 200, as the RoCE interfaces in a pod have, has one), for UCX 1.22;
+    table 200, as the RoCE interfaces in a pod have, has one), for UCX 1.21 and 1.22;
   * any other UCX version keeps UCX's answers;
   * a route the kernel lists after more than 1,024 others still counts;
   * a dump the kernel marks interrupted (the tables changed during it) is
@@ -210,10 +210,15 @@ class UcxRoutes(unittest.TestCase):
         self.assertEqual((out["then_tbl"], out["then_tbl_len"]), ("1", "24"), out)
         self.assertEqual((out["then_lo"], out["then_lo_len"], out["then_local"]), ("1", "32", "1"), out)
 
-    def test_other_ucx_version_keeps_ucx_answers(self):
+    def test_ucx_121_reads_routes_again(self):
         out, err = self.run_probe(21, True)
+        self.assertEqual((out["then_tbl"], out["then_tbl_len"]), ("1", "24"), out)
+        self.assertIn("UCX route checks read the routes again", err)
+
+    def test_other_ucx_version_keeps_ucx_answers(self):
+        out, err = self.run_probe(20, True)
         self.assert_ucx(out, "then")
-        self.assertIn("is not 1.22", err)
+        self.assertIn("is not 1.21 or 1.22", err)
 
 
 # Calls the route lookup in the library's own code, with recv wrapped: the

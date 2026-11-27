@@ -110,3 +110,56 @@ func TestSharedCompanionsReasonListsPodsWhenGivenNone(t *testing.T) {
 		t.Fatalf("no pods given, alone in its namespace: why %q err %v", why, err)
 	}
 }
+
+// kubeWorker is dynamoWorker registering through Kubernetes.
+func kubeWorker(name string, ctrl types.UID) corev1.Pod {
+	p := dynamoWorker(name, ctrl)
+	p.Spec.Containers[0].Env = append(p.Spec.Containers[0].Env, corev1.EnvVar{Name: "DYN_DISCOVERY_BACKEND", Value: "kubernetes"})
+	return p
+}
+
+// A disaggregated deployment that registers through Kubernetes: its
+// prefill and decode workers share no etcd or NATS, so each is captured
+// and restored alone, unless its capture took companions another worker
+// may use.
+func TestSharedCompanionsKubernetesDiscovery(t *testing.T) {
+	prefill := kubeWorker("prefill-0", "dep-prefill")
+	decode := kubeWorker("decode-0", "dep-decode")
+	pods := []corev1.Pod{prefill, decode}
+	a := &Agent{kubeClient: fake.NewSimpleClientset(&prefill, &decode)}
+	if why, err := a.sharedCompanionsReason(context.Background(), &prefill, pods); err != nil || why != "" {
+		t.Fatalf("prefill beside a decode, Kubernetes discovery: why %q err %v; want allowed", why, err)
+	}
+	if why, err := a.kubeSharedCompanions(context.Background(), &prefill, pods, false); err != nil || why != "" {
+		t.Fatalf("no companions: why %q err %v; want allowed", why, err)
+	}
+	why, err := a.kubeSharedCompanions(context.Background(), &prefill, pods, true)
+	if err != nil || !strings.Contains(why, "decode-0") {
+		t.Fatalf("companions beside a decode: why %q err %v; want refused, naming the other worker", why, err)
+	}
+	// Listed when not given: a restore checks the namespace as it is now.
+	if why, err := a.kubeSharedCompanions(context.Background(), &prefill, nil, true); err != nil || !strings.Contains(why, "decode-0") {
+		t.Fatalf("listed pods: why %q err %v; want refused", why, err)
+	}
+	// Alone in its namespace, companions or not.
+	if why, err := a.kubeSharedCompanions(context.Background(), &prefill, []corev1.Pod{prefill}, true); err != nil || why != "" {
+		t.Fatalf("alone with companions: why %q err %v; want allowed", why, err)
+	}
+	// An etcd worker is unchanged: still refused beside another instance.
+	etcd := dynamoWorker("prefill-0", "dep-prefill")
+	if why, _ := a.sharedCompanionsReason(context.Background(), &etcd, []corev1.Pod{etcd, dynamoWorker("decode-0", "dep-decode")}); why == "" {
+		t.Fatal("etcd prefill beside a decode: allowed; want refused")
+	}
+	if why, _ := a.kubeSharedCompanions(context.Background(), &etcd, []corev1.Pod{etcd, decode}, true); why != "" {
+		t.Fatalf("kubeSharedCompanions on an etcd worker: %q; want \"\" (sharedCompanionsReason decides)", why)
+	}
+}
+
+func TestRecordHasCompanions(t *testing.T) {
+	if recordHasCompanions(map[string]string{"checkpoint.0": "x", "size": "1"}) {
+		t.Fatal("ranks only: has companions")
+	}
+	if !recordHasCompanions(map[string]string{"checkpoint.0": "x", "companion.1": "true"}) {
+		t.Fatal("companion.1: none")
+	}
+}

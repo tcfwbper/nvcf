@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -163,7 +164,10 @@ func (a *Agent) groveInstanceCount(ctx context.Context, ns string, pods []corev1
 // now, so a worker that started since an earlier list is seen.
 func (a *Agent) sharedCompanionsReason(ctx context.Context, pod *corev1.Pod, pods []corev1.Pod) (string, error) {
 	if groveInstance(pod) == "" {
-		if webhook.DynamoComponent(pod) {
+		// A rank that registers through Kubernetes shares no etcd or NATS:
+		// its group is checked by the companions it captured
+		// (kubeSharedCompanions).
+		if webhook.DynamoComponent(pod) && !kubeDiscoveryRank(pod) {
 			if pods == nil {
 				list, err := a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
 				if err != nil {
@@ -185,6 +189,41 @@ func (a *Agent) sharedCompanionsReason(ctx context.Context, pod *corev1.Pod, pod
 		return fmt.Sprintf("the namespace runs %d Grove scaling group replicas, which share their companions (etcd, NATS, frontend); a group capture or restore of one would stop or restore what the others use", n), nil
 	}
 	return "", nil
+}
+
+// kubeSharedCompanions says why the group of pod, a rank that registers
+// through Kubernetes and is of no scaling group, may not be captured or
+// restored: it has companions (pods without GPUs it connects to) and the
+// namespace runs a Dynamo GPU worker of another instance, which may use
+// them. "" when the group has no companion: each worker of a
+// disaggregated deployment (prefill, decode) registers through its own
+// DynamoWorkerMetadata, so it is captured and restored apart from the
+// others. With no pods given the namespace's pods are listed now.
+func (a *Agent) kubeSharedCompanions(ctx context.Context, pod *corev1.Pod, pods []corev1.Pod, companions bool) (string, error) {
+	if !companions || groveInstance(pod) != "" || !kubeDiscoveryRank(pod) {
+		return "", nil
+	}
+	if pods == nil {
+		list, err := a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return "", fmt.Errorf("list the namespace's pods: %w", err)
+		}
+		pods = list.Items
+	}
+	if other := otherDynamoWorker(pod, pods); other != "" {
+		return fmt.Sprintf("the namespace also runs Dynamo worker %s of another instance, which may use this instance's companions; a group capture or restore of one would stop or restore what the other uses", other), nil
+	}
+	return "", nil
+}
+
+// recordHasCompanions reports a group record that captured companions.
+func recordHasCompanions(d map[string]string) bool {
+	for k, v := range d {
+		if strings.HasPrefix(k, "companion.") && v == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 // namespaceSharesCompanions says why a companion in ns may not restore

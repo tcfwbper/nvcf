@@ -123,6 +123,13 @@ rules:
   - apiGroups: ["grove.io"]
     resources: ["podcliquescalinggroups"]
     verbs: ["list"]
+  # A Dynamo worker that registers through Kubernetes: its capture keeps
+  # its DynamoWorkerMetadata, and its restore writes it again for the pod
+  # it restores into; a placeholder that starts cold in place has it
+  # removed (internal/agent/kube_discovery.go).
+  - apiGroups: ["nvidia.com"]
+    resources: ["dynamoworkermetadatas"]
+    verbs: ["get", "list", "create", "update", "delete"]
   # An instance's companions (instance companion capture): the pods its
   # GPU ranks hold connections to, directly or through a Service.
   - apiGroups: [""]

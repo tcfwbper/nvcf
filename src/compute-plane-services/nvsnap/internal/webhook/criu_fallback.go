@@ -106,7 +106,7 @@ func (m *Mutator) criuFallback(ctx context.Context, pod *corev1.Pod) (CRIUFallba
 	if !ok {
 		return CRIUFallback{}, false
 	}
-	fb, ok := m.CRIUFallback(ctx, pod.Namespace, uri, podOrdinal(pod), ProcessConfig(pod))
+	fb, ok := m.CRIUFallback(ctx, pod.Namespace, CRIUURI(uri, pod), podOrdinal(pod), ProcessConfig(pod))
 	if !ok || fb.Reason == "" {
 		return CRIUFallback{}, false
 	}

@@ -218,7 +218,7 @@ func (c *criuAutoRestorer) checkpointHash(ctx context.Context, id string) (strin
 // own configuration's record names (an instance whose ranks differ in
 // configuration).
 func (c *criuAutoRestorer) groupKeyRefusal(ctx context.Context, pod *corev1.Pod, key string) (string, error) {
-	uri := pod.Annotations[cacheURIAnnotation]
+	uri := criuURI(pod)
 	if uri == "" {
 		return "the pod carries no configuration", nil
 	}

@@ -291,7 +291,7 @@ func autoRestoreKeepsTheMarker(t *testing.T, verb string) {
 		return nil, notServingWithRelease(pod.Namespace, pod.Name, pod.UID, released)
 	}
 	t.Cleanup(func() { restoreForRequest = prev })
-	a.criuRestorer().restore(context.Background(), pod.Namespace, pod.Name, pod.UID, "abc__20261008-101010", "inference", "")
+	a.criuRestorer().restore(context.Background(), pod.Namespace, pod.Name, pod.UID, "abc__20261008-101010", "inference", "", false)
 	if !restored.Load() {
 		t.Fatal("the restore did not run")
 	}

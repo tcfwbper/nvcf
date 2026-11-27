@@ -53,7 +53,7 @@ SPDX-License-Identifier: Apache-2.0
  *                 flight, and drops its NIXL agent and RDMA state. Fails, as
  *                 mx-pause does, while any RDMA device file is left other
  *                 than NCCL's through libnvsnap_ibv (which suspend
- *                 releases), or when the process's UCX is not 1.22
+ *                 releases), or when the process's UCX is not 1.21 or 1.22
  *                 (restored into another pod, it would keep the old pod's
  *                 routes); then every pid is resumed. The reply names the
  *                 UCX ("..., UCX 1.22.0").

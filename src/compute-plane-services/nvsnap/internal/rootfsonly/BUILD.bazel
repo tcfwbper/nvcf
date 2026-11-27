@@ -41,6 +41,7 @@ go_test(
         "enumerate_test.go",
         "orchestrator_test.go",
         "pidresolver_test.go",
+        "role_test.go",
         "watcher_test.go",
     ],
     embed = [":rootfsonly"],

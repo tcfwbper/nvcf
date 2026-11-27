@@ -313,3 +313,37 @@ func TestCRIUGroupRestore_PlaceholderGetsTheLandingsEnvironment(t *testing.T) {
 		t.Errorf("HF_MODULES_CACHE = %q, want %q off the read-only landing", modules, criuHFModulesCache)
 	}
 }
+
+// A CRIU record is of a process: prefill and decode, which share a cache
+// URI, never share a record; a pod of no role keeps its key.
+func TestCRIUURIRole(t *testing.T) {
+	pod := func(mode string) *corev1.Pod {
+		args := []string{"--model", "m"}
+		if mode != "" {
+			args = append(args, "--disaggregation-mode", mode)
+		}
+		return &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main",
+			Command: []string{"python3", "-m", "dynamo.vllm"}, Args: args}}}}
+	}
+	p, d := CRIUURI("cache://abc", pod("prefill")), CRIUURI("cache://abc", pod("decode"))
+	if p == d || p != "cache://abc/role=prefill" || d != "cache://abc/role=decode" {
+		t.Fatalf("prefill %q decode %q", p, d)
+	}
+	if got := CRIUURI("cache://abc", pod("")); got != "cache://abc" {
+		t.Fatalf("no role: %q, want the cache URI unchanged", got)
+	}
+	if got := CRIUURI("", pod("decode")); got != "" {
+		t.Fatalf("no configuration: %q, want \"\"", got)
+	}
+}
+
+// A single-rank record that restores companions is checked by the group
+// admission guard too; one without companions restores alone.
+func TestHasCompanion(t *testing.T) {
+	if hasCompanion(CRIUGroup{Companion: []bool{false}}) || hasCompanion(CRIUGroup{}) {
+		t.Error("a record of ranks only has companions")
+	}
+	if !hasCompanion(CRIUGroup{Companion: []bool{false, true}}) {
+		t.Error("a record with a companion slot has none")
+	}
+}

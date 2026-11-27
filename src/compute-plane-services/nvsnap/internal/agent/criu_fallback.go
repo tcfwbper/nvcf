@@ -260,7 +260,7 @@ func (a *Agent) groupRecordData(ctx context.Context, key string) (map[string]str
 // stamped. The scope is the agent's to read, so a pod names only a key of
 // its own tenant.
 func (a *Agent) podFallbackKey(ctx context.Context, pod *corev1.Pod) (key string, ordinal int, err error) {
-	uri := pod.Annotations[cacheURIAnnotation]
+	uri := criuURI(pod)
 	if uri == "" {
 		return "", 0, errors.New("the pod carries no configuration")
 	}

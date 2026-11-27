@@ -373,3 +373,39 @@ func stripRoleFlags(args []string) []string {
 	}
 	return out
 }
+
+// roleInArgs finds the flags of a disaggregated worker that name its role
+// (not its rank) in a command line, token or shell-string form.
+var roleInArgs = regexp.MustCompile(
+	`\s--(is-prefill-worker|is-decode-worker)\b|\s--disaggregation-mode(?:=|\s+)(?:'([^']*)'|"([^"]*)"|(\S+))`)
+
+// PodRole names the role of a disaggregated worker (prefill, decode, ...)
+// from the role flags of its containers' commands and args, which the cache
+// identity leaves out so that the roles share one download: "" for none.
+// A checkpoint is of a process, whose role it keeps, so the CRIU record of
+// one role is never another's (webhook.CRIUURI).
+func PodRole(pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	var roles []string
+	seen := map[string]bool{}
+	for _, c := range pod.Spec.Containers {
+		line := " " + strings.Join(append(append([]string{}, c.Command...), c.Args...), " ")
+		for _, m := range roleInArgs.FindAllStringSubmatch(line, -1) {
+			r := strings.TrimPrefix(m[1], "is-")
+			r = strings.TrimSuffix(r, "-worker")
+			for _, v := range m[2:] {
+				if v != "" {
+					r = v
+				}
+			}
+			if r != "" && !seen[r] {
+				seen[r] = true
+				roles = append(roles, r)
+			}
+		}
+	}
+	sort.Strings(roles)
+	return strings.Join(roles, ",")
+}

@@ -413,7 +413,7 @@ func TestCRIUAutoRestore_NIXLNodeRefusalStartsColdInPlace(t *testing.T) {
 	t.Cleanup(func() { restoreForRequest = prev })
 	ctx := context.Background()
 
-	a.criuRestorer().restore(ctx, pod.Namespace, pod.Name, pod.UID, "abc__20261008-101010", "inference", "")
+	a.criuRestorer().restore(ctx, pod.Namespace, pod.Name, pod.UID, "abc__20261008-101010", "inference", "", false)
 
 	got, err := kc.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
