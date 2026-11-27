@@ -26,3 +26,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
+
+{{- define "nvcf-otel-collector.image" -}}
+{{- $registry := required "A valid image registry (.Values.image.registry) is required!" .Values.image.registry -}}
+{{- $repository := required "A valid image repository (.Values.image.repository) is required!" .Values.image.repository -}}
+{{- $tag := required "A valid image tag (.Values.image.tag) is required!" .Values.image.tag | toString -}}
+{{- printf "%s/%s:%s" $registry $repository $tag -}}
+{{- end -}}

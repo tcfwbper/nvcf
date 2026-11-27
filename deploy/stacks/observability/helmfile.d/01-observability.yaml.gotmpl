@@ -114,6 +114,37 @@ environments:
 {{- $_ := set $prometheusRemoteWrite "endpoint" $remoteWriteEndpoint }}
 {{- $_ := set $collectorExporters "prometheusremotewrite" $prometheusRemoteWrite }}
 {{- $_ := set $collectorConfig "exporters" $collectorExporters }}
+{{- /* #3208 changed these image keys. Fail on the old shape instead of
+       ignoring the value or rendering a wrong image reference. */}}
+{{- $collectorImage := dig "collector" "image" dict .Values | default dict }}
+{{- if kindIs "string" $collectorImage }}
+{{- fail "collector.image must be a map: set collector.image.registry, collector.image.repository and collector.image.tag" }}
+{{- end }}
+{{- if not (empty (dig "opentelemetryOperator" "manager" "collectorImage" dict .Values)) }}
+{{- fail "opentelemetryOperator.manager.collectorImage is no longer read: the operator default collector image follows collector.image" }}
+{{- end }}
+{{- /* The upstream opentelemetry-operator chart has no registry key and
+       expects the registry host inside repository, so join the base.yaml
+       registry and repository here. path names the values key in errors.
+       requireTag is set for images whose tag base.yaml declares: the chart
+       renders the collector and target allocator image arguments only when
+       a tag is set, so an empty tag would silently fall back to an operator
+       default. Other images leave an empty tag to the chart default.
+       Keys are read with index because Helmfile renders with
+       missingkey=error, which would fail before required can name the key. */}}
+{{- define "observability.operatorImage" -}}
+{{- $image := .image | default dict -}}
+{{- $registry := required (printf "%s.registry is required" .path) (index $image "registry") -}}
+{{- $repository := required (printf "%s.repository is required" .path) (index $image "repository") -}}
+repository: {{ printf "%s/%s" $registry $repository | quote }}
+{{- if index . "requireTag" }}
+tag: {{ required (printf "%s.tag is required" .path) (index $image "tag") | toString | quote }}
+{{- else }}
+{{- with index $image "tag" }}
+tag: {{ . | toString | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- $defaultMonitors := deepCopy (dig "defaultMonitors" dict .Values) }}
 {{- $controlPlaneMonitors := deepCopy (dig "controlPlane" dict $defaultMonitors) }}
 {{- $controlPlaneMonitorsEnabled := dig "defaultMonitors" "controlPlane" "enabled" $controlEnabled .Values }}
@@ -239,14 +270,17 @@ releases:
             enabled: {{ not (dig "opentelemetryOperator" "admissionWebhooks" "certManager" "enabled" false .Values) }}
             recreate: {{ dig "opentelemetryOperator" "admissionWebhooks" "autoGenerateCert" "recreate" false .Values }}
         manager:
-          {{- with dig "opentelemetryOperator" "manager" "collectorImage" dict .Values }}
+          image:
+            {{- include "observability.operatorImage" (dict "path" "opentelemetryOperator.manager.image" "image" (dig "opentelemetryOperator" "manager" "image" dict .Values)) | nindent 12 }}
+          # The collector CR sets its own image. Pass the same image as the
+          # operator --collector-image default so the two cannot drift.
           collectorImage:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with dig "opentelemetryOperator" "manager" "targetAllocatorImage" dict .Values }}
+            {{- include "observability.operatorImage" (dict "path" "collector.image" "image" $collectorImage "requireTag" true) | nindent 12 }}
           targetAllocatorImage:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- include "observability.operatorImage" (dict "path" "opentelemetryOperator.manager.targetAllocatorImage" "image" (dig "opentelemetryOperator" "manager" "targetAllocatorImage" dict .Values) "requireTag" true) | nindent 12 }}
+        testFramework:
+          image:
+            {{- include "observability.operatorImage" (dict "path" "opentelemetryOperator.testFramework.image" "image" (dig "opentelemetryOperator" "testFramework" "image" dict .Values)) | nindent 12 }}
         {{- if .Values.global.imagePullSecrets }}
         imagePullSecrets:
           {{- toYaml .Values.global.imagePullSecrets | nindent 10 }}
@@ -288,7 +322,8 @@ releases:
     {{- end }}
     values:
       - collectorName: {{ dig "collector" "collectorName" "nvcf-observability" .Values | quote }}
-        image: {{ dig "collector" "image" "" .Values | quote }}
+        image:
+          {{- toYaml $collectorImage | nindent 10 }}
         {{- if .Values.global.imagePullSecrets }}
         imagePullSecrets:
           {{- toYaml .Values.global.imagePullSecrets | nindent 10 }}

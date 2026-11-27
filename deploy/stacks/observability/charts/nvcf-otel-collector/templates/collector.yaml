@@ -24,9 +24,7 @@ metadata:
     {{- include "nvcf-otel-collector.labels" . | nindent 4 }}
 spec:
   mode: statefulset
-  {{- with .Values.image }}
-  image: {{ . | quote }}
-  {{- end }}
+  image: {{ include "nvcf-otel-collector.image" . | quote }}
   serviceAccount: {{ .Values.collectorName }}-collector
   {{- if .Values.targetAllocator.enabled }}
   targetAllocator:

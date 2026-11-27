@@ -74,7 +74,6 @@ deploy/helm/openbao/helm: {reason: pending-fix, issue: https://github.com/dsx-ai
 deploy/helm/ratelimiter/nvcf-ratelimiter: {reason: pending-fix}
 deploy/helm/vanity-gateway/helm-nvcf-vanity-gateway: {reason: pending-fix}
 deploy/helm/worker-callback-proxy/worker-callback-proxy: {reason: pending-fix}
-deploy/stacks/observability/charts/nvcf-otel-collector: {reason: pending-fix}
 deploy/stacks/self-managed/charts/nvcf-upgrade-receipt: {reason: pending-fix}
 src/compute-plane-services/nvsnap/deploy/helm/nvsnap: {reason: pending-fix}
 src/compute-plane-services/nvstor/deploy/helm/nvstor: {reason: pending-fix}

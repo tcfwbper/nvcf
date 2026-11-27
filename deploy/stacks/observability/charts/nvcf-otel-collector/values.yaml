@@ -13,8 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# CI indexes the image settings below. A chart must not choose an image
+# source: the observability stack base.yaml, or a values file for a direct
+# install, supplies registry, repository and tag. A render fails while any of
+# them is empty.
+thirdPartyImages:
+  otelCollector: image
+
 collectorName: nvcf-observability
-image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.160.0
+image:
+  registry: ""
+  repository: ""
+  tag: ""
 imagePullSecrets: []
 
 targetAllocatorRbac:

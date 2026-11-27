@@ -44,3 +44,4 @@ scenarios:
   - {chart: deploy/helm/worker-callback-proxy/worker-callback-proxy, values: worker-callback-proxy.yaml}
   - {chart: deploy/stacks/nvcf-compute-plane/charts/nvcf-cluster-topology, values: nvcf-cluster-topology-all-enabled.yaml}
   - {chart: deploy/stacks/observability/charts/nvcf-default-monitors, values: nvcf-default-monitors-all-enabled.yaml}
+  - {chart: deploy/stacks/observability/charts/nvcf-otel-collector, values: nvcf-otel-collector.yaml}

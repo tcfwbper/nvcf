@@ -70,14 +70,28 @@ opentelemetryOperator:
       enabled: false
     autoGenerateCert:
       recreate: false
+  # The operator image tag follows the chart appVersion. The operator default
+  # collector image follows collector.image.
   manager:
-    collectorImage:
-      repository: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib
-      tag: "0.160.0"
+    image:
+      registry: ghcr.io
+      repository: open-telemetry/opentelemetry-operator/opentelemetry-operator
+    targetAllocatorImage:
+      registry: ghcr.io
+      repository: open-telemetry/opentelemetry-operator/target-allocator
+      tag: "0.158.0"
+  # Helm test Pods. They run only on helm test.
+  testFramework:
+    image:
+      registry: docker.io
+      repository: busybox
 
 collector:
   collectorName: nvcf-observability
-  image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.160.0
+  image:
+    registry: ghcr.io
+    repository: open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib
+    tag: "0.160.0"
   targetAllocator:
     allocationStrategy: consistent-hashing
     prometheusCR:
@@ -117,6 +131,10 @@ victoriaMetrics:
     oci: false
   version: "0.45.0"
   server:
+    # The image tag follows the chart appVersion.
+    image:
+      registry: docker.io
+      repository: victoriametrics/victoria-metrics
     retentionPeriod: "1"
     persistentVolume:
       enabled: true

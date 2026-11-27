@@ -96,6 +96,41 @@ metricsBackend:
 Invalid dependency combinations fail during Helmfile rendering. A disabled
 profile cannot install individual components.
 
+## Image settings
+
+`environments/base.yaml` declares the source of every image the stack
+deploys. Each image sets `registry` and `repository` as separate keys. To use
+a mirror, override them in a layered environment file:
+
+| Image | Values key | Tag |
+| --- | --- | --- |
+| Collector | `collector.image` | `collector.image.tag` |
+| OpenTelemetry Operator | `opentelemetryOperator.manager.image` | Chart `appVersion` |
+| Target Allocator | `opentelemetryOperator.manager.targetAllocatorImage` | `tag` in the same map |
+| Operator Helm test | `opentelemetryOperator.testFramework.image` | Chart default (`latest`) |
+| VictoriaMetrics | `victoriaMetrics.server.image` | Chart `appVersion` |
+
+The operator default collector image follows `collector.image`. Rendering
+fails when `collector.image` is a single string or when
+`opentelemetryOperator.manager.collectorImage` is set; both are earlier
+forms of these settings. A `repository` must not contain the registry host.
+Quote tags so YAML keeps them as strings; unquoted `1.10` reads as `1.1`.
+
+```yaml
+collector:
+  image:
+    registry: registry.example.com
+    repository: mirror/opentelemetry-collector-contrib
+victoriaMetrics:
+  server:
+    image:
+      registry: registry.example.com
+      repository: mirror/victoria-metrics
+```
+
+The `nvcf-otel-collector` chart has no image defaults. A direct Helm install
+sets `image.registry`, `image.repository` and `image.tag`.
+
 ## Metrics backend and autoscaler
 
 With the default `monitoring` namespace, the bundled VictoriaMetrics endpoints

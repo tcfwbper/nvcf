@@ -25,7 +25,6 @@
 
 # pending-fix
 deploy/stacks/nvcf-compute-plane: {reason: pending-fix}
-deploy/stacks/observability: {reason: pending-fix}
 deploy/stacks/self-managed: {reason: pending-fix}
 
 # dev-only

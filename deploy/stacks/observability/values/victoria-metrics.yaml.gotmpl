@@ -1,6 +1,8 @@
 {{- $vm := .Values.victoriaMetrics | default dict }}
 server:
   fullnameOverride: vmsingle
+  image:
+{{ toYaml (dig "server" "image" dict $vm) | indent 4 }}
   retentionPeriod: {{ dig "server" "retentionPeriod" "1" $vm | quote }}
   persistentVolume:
     enabled: {{ dig "server" "persistentVolume" "enabled" true $vm }}

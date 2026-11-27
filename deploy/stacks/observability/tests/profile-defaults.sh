@@ -569,8 +569,26 @@ assert_yaml_value "$autoscaler_monitor_manifest" \
 assert_yaml_value "$autoscaler_monitor_manifest" \
   '.spec.endpoints[0].interval' 30s 'function autoscaler scrape interval'
 
+# The collector chart has no image defaults, so render it with the values the
+# stack passes.
+collector_values="$work_dir/control-collector-values.yaml"
+write_release_values control otel-collector "$collector_values"
 helm template otel-collector "$stack_dir/charts/nvcf-otel-collector" \
+  --values "$collector_values" \
   >"$work_dir/collector-manifests.yaml"
+
+# The operator --collector-image default follows collector.image, so the two
+# cannot drift. The operator chart renders the collector and Target Allocator
+# image arguments only when both repository and tag are set.
+operator_values="$work_dir/control-operator-values.yaml"
+write_release_values control opentelemetry-operator "$operator_values"
+assert_equal \
+  "$(yq -r '.manager.collectorImage.repository + ":" + .manager.collectorImage.tag' "$operator_values")" \
+  "$(yq -r '.image.registry + "/" + .image.repository + ":" + .image.tag' "$collector_values")" \
+  'operator default collector image follows collector.image'
+yq -e '(.manager.targetAllocatorImage.repository // "") != "" and (.manager.targetAllocatorImage.tag // "") != ""' \
+  "$operator_values" >/dev/null ||
+  fail "operator values must set the Target Allocator image repository and tag"
 collector_name="$(yq -r '.collectorName' "$stack_dir/charts/nvcf-otel-collector/values.yaml")"
 NVCF_TARGET_ALLOCATOR_ROLE="$collector_name-otel" yq -e '
   select(.kind == "ClusterRole" and .metadata.name == strenv(NVCF_TARGET_ALLOCATOR_ROLE)) |
@@ -699,9 +717,28 @@ assert_yaml_value "$custom_namespace_values" \
   'http://vmsingle.metrics-store.svc.cluster.local:8428/api/v1/write' \
   'custom VictoriaMetrics namespace remote-write endpoint'
 
-# The table covers every fail branch in 01-observability.yaml.gotmpl. Each
+# Layered values cannot clear a key with an empty string, so these files set
+# image fields to null to reach the image guards.
+printf 'collector:\n  image:\n    tag: null\n' >"$work_dir/collector-tag-null.yaml"
+printf 'opentelemetryOperator:\n  manager:\n    image:\n      registry: null\n' \
+  >"$work_dir/operator-registry-null.yaml"
+printf 'opentelemetryOperator:\n  manager:\n    targetAllocatorImage:\n      repository: null\n' \
+  >"$work_dir/target-allocator-repository-null.yaml"
+printf 'opentelemetryOperator:\n  manager:\n    targetAllocatorImage:\n      tag: null\n' \
+  >"$work_dir/target-allocator-tag-null.yaml"
+printf 'collector:\n  image: null\n' >"$work_dir/collector-image-null.yaml"
+
+# Validation fail branches in 01-observability.yaml.gotmpl that mode_cases and
+# auth_cases do not exercise. The chart repository URL checks have no case. Each
 # argument is a single Cobra flag so URLs and paths remain shell-safe.
 validation_cases=(
+  "collector-tag-null|collector.image.tag is required|--state-values-set=observability.profile=compute --state-values-file=$work_dir/collector-tag-null.yaml"
+  "operator-registry-null|opentelemetryOperator.manager.image.registry is required|--state-values-set=observability.profile=compute --state-values-file=$work_dir/operator-registry-null.yaml"
+  "target-allocator-repository-null|opentelemetryOperator.manager.targetAllocatorImage.repository is required|--state-values-set=observability.profile=compute --state-values-file=$work_dir/target-allocator-repository-null.yaml"
+  "target-allocator-tag-null|opentelemetryOperator.manager.targetAllocatorImage.tag is required|--state-values-set=observability.profile=compute --state-values-file=$work_dir/target-allocator-tag-null.yaml"
+  "collector-image-null|collector.image.registry is required|--state-values-set=observability.profile=compute --state-values-file=$work_dir/collector-image-null.yaml"
+  'collector-image-string|collector.image must be a map|--state-values-set=observability.profile=compute --state-values-set-string=collector.image=ghcr.io/example/collector:1'
+  'operator-collector-image|opentelemetryOperator.manager.collectorImage is no longer read|--state-values-set=observability.profile=compute --state-values-set-string=opentelemetryOperator.manager.collectorImage.repository=ghcr.io/example/collector'
   'invalid-profile|observability.profile must be disabled, control, compute, or all|--state-values-set=observability.profile=invalid'
   'invalid-crd-mode|observability.components.prometheusOperatorCrds.mode must be install, existing, or disabled|--state-values-set=observability.profile=control --state-values-set=observability.components.prometheusOperatorCrds.mode=invalid'
   'invalid-operator-mode|observability.components.otelOperator.mode must be install, existing, or disabled|--state-values-set=observability.profile=control --state-values-set=observability.components.otelOperator.mode=invalid'
