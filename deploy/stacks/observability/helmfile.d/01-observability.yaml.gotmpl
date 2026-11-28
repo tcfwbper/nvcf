@@ -114,8 +114,10 @@ environments:
 {{- $_ := set $prometheusRemoteWrite "endpoint" $remoteWriteEndpoint }}
 {{- $_ := set $collectorExporters "prometheusremotewrite" $prometheusRemoteWrite }}
 {{- $_ := set $collectorConfig "exporters" $collectorExporters }}
-{{- /* #3208 changed these image keys. Fail on the old shape instead of
-       ignoring the value or rendering a wrong image reference. */}}
+{{- /* #3208 changed these image keys. Without these checks a string
+       collector.image fails with an unclear template error, and
+       manager.collectorImage is silently ignored, so a mirror set there would
+       fall back to the upstream registry. */}}
 {{- $collectorImage := dig "collector" "image" dict .Values | default dict }}
 {{- if kindIs "string" $collectorImage }}
 {{- fail "collector.image must be a map: set collector.image.registry, collector.image.repository and collector.image.tag" }}
